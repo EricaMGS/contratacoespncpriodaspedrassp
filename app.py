@@ -1777,198 +1777,179 @@ def consultar_detalhes_contrato(
 # EXPORTAÇÃO - WORD
 # ============================================================
 
+def descricao_modalidade_exportacao(tipo_consulta: str, modalidade_nome: Optional[str] = None) -> str:
+    """Retorna uma descrição amigável para aparecer nos arquivos exportados."""
+    if tipo_consulta != "Editais e Avisos de Contratações":
+        return tipo_consulta
+
+    if modalidade_nome:
+        nome = modalidade_nome
+        nome = re.sub(r"\s*\(\d+\)\s*$", "", nome).strip()
+        return nome
+
+    return "Editais e Avisos de Contratações"
+
+
+def nome_arquivo_modalidade(tipo_consulta: str, modalidade_nome: Optional[str] = None) -> str:
+    """Nome seguro para os arquivos baixados."""
+    nome = descricao_modalidade_exportacao(
+        tipo_consulta,
+        modalidade_nome,
+    )
+
+    substituicoes = {
+        "ã": "a", "á": "a", "â": "a", "à": "a",
+        "é": "e", "ê": "e", "í": "i", "ó": "o",
+        "ô": "o", "õ": "o", "ú": "u", "ç": "c",
+        "Ã": "A", "Á": "A", "Â": "A", "À": "A",
+        "É": "E", "Ê": "E", "Í": "I", "Ó": "O",
+        "Ô": "O", "Õ": "O", "Ú": "U", "Ç": "C",
+    }
+    for origem, destino in substituicoes.items():
+        nome = nome.replace(origem, destino)
+
+    nome = re.sub(r"[^A-Za-z0-9]+", "_", nome).strip("_")
+    return nome
+
+
+def _configurar_celula_word(cell, negrito=False, tamanho=9):
+    for paragraph in cell.paragraphs:
+        for run in paragraph.runs:
+            run.font.size = Pt(tamanho)
+            run.bold = negrito
+
+
 def gerar_word(
     df: pd.DataFrame,
     tipo_consulta: str,
     data_inicio,
     data_fim,
+    modalidade_nome: Optional[str] = None,
 ) -> bytes:
+    """Gera Word com apresentação profissional e identificação da modalidade."""
 
     doc = Document()
-
     section = doc.sections[0]
+    section.top_margin = Pt(42)
+    section.bottom_margin = Pt(42)
+    section.left_margin = Pt(42)
+    section.right_margin = Pt(42)
 
-    section.top_margin = Pt(40)
-    section.bottom_margin = Pt(40)
-    section.left_margin = Pt(45)
-    section.right_margin = Pt(45)
-
-    # --------------------------------------------------------
-    # TÍTULO
-    # --------------------------------------------------------
-
-    p_titulo = doc.add_paragraph()
-    p_titulo.alignment = 1
-
-    run = p_titulo.add_run(
-        f"RELATÓRIO DE {tipo_consulta.upper()}"
+    modalidade = descricao_modalidade_exportacao(
+        tipo_consulta,
+        modalidade_nome,
     )
 
-    run.bold = True
-    run.font.size = Pt(16)
-    run.font.color.rgb = RGBColor(
-        0,
-        51,
-        102,
-    )
+    # Cabeçalho
+    header = section.header
+    p_header = header.paragraphs[0]
+    p_header.alignment = 1
+    r = p_header.add_run("PORTAL NACIONAL DE CONTRATAÇÕES PÚBLICAS – PNCP")
+    r.bold = True
+    r.font.size = Pt(8)
+    r.font.color.rgb = RGBColor(80, 80, 80)
 
-    p_subtitulo = doc.add_paragraph()
-    p_subtitulo.alignment = 1
+    # Título
+    p = doc.add_paragraph()
+    p.alignment = 1
+    r = p.add_run("RELATÓRIO DE CONSULTA")
+    r.bold = True
+    r.font.size = Pt(18)
+    r.font.color.rgb = RGBColor(0, 51, 102)
 
-    run = p_subtitulo.add_run(
-        NOME_PREFEITURA
-    )
+    p = doc.add_paragraph()
+    p.alignment = 1
+    r = p.add_run(tipo_consulta.upper())
+    r.bold = True
+    r.font.size = Pt(13)
+    r.font.color.rgb = RGBColor(0, 51, 102)
 
-    run.bold = True
-    run.font.size = Pt(11)
+    if tipo_consulta == "Editais e Avisos de Contratações":
+        p = doc.add_paragraph()
+        p.alignment = 1
+        r = p.add_run(f"Modalidade: {modalidade}")
+        r.bold = True
+        r.font.size = Pt(12)
+        r.font.color.rgb = RGBColor(0, 102, 51)
 
-    doc.add_paragraph(
-        "Portal Nacional de Contratações Públicas – PNCP"
-    )
+    p = doc.add_paragraph()
+    p.alignment = 1
+    r = p.add_run(NOME_PREFEITURA)
+    r.bold = True
+    r.font.size = Pt(11)
 
-    doc.add_paragraph(
-        f"Período da consulta: "
-        f"{data_inicio.strftime('%d/%m/%Y')} "
-        f"a "
-        f"{data_fim.strftime('%d/%m/%Y')}"
-    )
+    # Caixa de informações
+    tabela_info = doc.add_table(rows=0, cols=2)
+    tabela_info.style = "Light Shading Accent 1"
 
-    doc.add_paragraph(
-        f"Total de registros encontrados: "
-        f"{len(df)}"
-    )
+    informacoes = [
+        ("Período da consulta", f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"),
+        ("Quantidade de registros", str(len(df))),
+        ("Fonte", "Portal Nacional de Contratações Públicas – PNCP"),
+    ]
 
-    doc.add_paragraph("")
+    if tipo_consulta == "Editais e Avisos de Contratações":
+        informacoes.insert(1, ("Modalidade", modalidade))
 
-    doc.add_heading(
-        "Principais Registros",
-        level=2,
-    )
+    for chave, valor in informacoes:
+        cells = tabela_info.add_row().cells
+        cells[0].text = chave
+        cells[1].text = texto_valido(valor)
+        _configurar_celula_word(cells[0], True, 9)
+        _configurar_celula_word(cells[1], False, 9)
 
-    # --------------------------------------------------------
-    # REGISTROS
-    # --------------------------------------------------------
+    doc.add_paragraph()
+    doc.add_heading("Registros da Consulta", level=2)
 
-    for pos, (_, row) in enumerate(
-        df.head(100).iterrows(),
-        start=1,
-    ):
+    for pos, (_, row) in enumerate(df.head(100).iterrows(), start=1):
+        dados = obter_dados_registro(row, tipo_consulta)
 
-        dados = obter_dados_registro(
-            row,
-            tipo_consulta,
-        )
+        p = doc.add_paragraph()
+        r = p.add_run(f"Registro {pos}")
+        r.bold = True
+        r.font.size = Pt(11)
+        r.font.color.rgb = RGBColor(0, 51, 102)
 
-        tabela = doc.add_table(
-            rows=0,
-            cols=2,
-        )
-
+        tabela = doc.add_table(rows=0, cols=2)
         tabela.style = "Table Grid"
 
         campos = [
-            ("Registro", str(pos)),
-            (
-                "Número",
-                dados["numero"],
-            ),
-            (
-                "Controle PNCP",
-                dados["id_pncp"],
-            ),
-            (
-                "Processo",
-                dados["processo"],
-            ),
-            (
-                "Objeto",
-                dados["objeto"],
-            ),
-            (
-                "Fornecedor",
-                dados["fornecedor"],
-            ),
-            (
-                "CNPJ/CPF Fornecedor",
-                dados["cnpj_fornecedor"],
-            ),
-            (
-                "Valor",
-                dados["valor"],
-            ),
-            (
-                "Data de Assinatura/Publicação",
-                dados["data_assinatura"],
-            ),
-            (
-                "Início da Vigência",
-                dados["vigencia_inicio"],
-            ),
-            (
-                "Fim da Vigência",
-                dados["vigencia_fim"],
-            ),
-            (
-                "Situação",
-                dados["situacao"],
-            ),
-            (
-                "Órgão",
-                dados["orgao"],
-            ),
-            (
-                "Unidade",
-                dados["unidade"],
-            ),
+            ("Número", dados["numero"]),
+            ("Controle PNCP", dados["id_pncp"]),
+            ("Processo", dados["processo"]),
+            ("Objeto", dados["objeto"]),
+            ("Fornecedor", dados["fornecedor"]),
+            ("CNPJ/CPF Fornecedor", dados["cnpj_fornecedor"]),
+            ("Valor", dados["valor"]),
+            ("Data de Assinatura/Publicação", dados["data_assinatura"]),
+            ("Início da Vigência", dados["vigencia_inicio"]),
+            ("Fim da Vigência", dados["vigencia_fim"]),
+            ("Situação", dados["situacao"]),
+            ("Órgão", dados["orgao"]),
+            ("Unidade", dados["unidade"]),
         ]
 
         for nome_campo, valor_campo in campos:
-
             cells = tabela.add_row().cells
+            cells[0].text = nome_campo
+            cells[1].text = texto_valido(valor_campo)
+            _configurar_celula_word(cells[0], True, 8)
+            _configurar_celula_word(cells[1], False, 8)
 
-            cells[0].text = str(
-                nome_campo
-            )
-
-            cells[1].text = texto_valido(
-                valor_campo
-            )
-
-            for run in (
-                cells[0]
-                .paragraphs[0]
-                .runs
-            ):
-                run.bold = True
-                run.font.size = Pt(9)
-
-            for run in (
-                cells[1]
-                .paragraphs[0]
-                .runs
-            ):
-                run.font.size = Pt(9)
-
-        doc.add_paragraph("")
+        doc.add_paragraph()
 
     footer = section.footer
-
     p_footer = footer.paragraphs[0]
     p_footer.alignment = 1
-
-    run = p_footer.add_run(
-        "Consulta realizada no Portal Nacional "
-        "de Contratações Públicas – PNCP"
+    r = p_footer.add_run(
+        "Fonte: PNCP | Prefeitura Municipal de Rio das Pedras/SP | "
+        f"Consulta de {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
     )
-
-    run.font.size = Pt(8)
+    r.font.size = Pt(7)
 
     buffer = io.BytesIO()
-
     doc.save(buffer)
-
     buffer.seek(0)
-
     return buffer.getvalue()
 
 
@@ -2002,235 +1983,108 @@ def gerar_pdf(
     tipo_consulta: str,
     data_inicio,
     data_fim,
+    modalidade_nome: Optional[str] = None,
 ) -> bytes:
+    """Gera PDF com cabeçalho, modalidade e registros bem organizados."""
 
     pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(15, 15, 15)
 
-    pdf.set_auto_page_break(
-        auto=True,
-        margin=15,
+    modalidade = descricao_modalidade_exportacao(
+        tipo_consulta,
+        modalidade_nome,
     )
+
+    def titulo_pagina():
+        pdf.set_font("Arial", "B", 8)
+        pdf.cell(0, 5, texto_pdf("PORTAL NACIONAL DE CONTRATACOES PUBLICAS - PNCP"), ln=True, align="C")
+        pdf.ln(2)
 
     pdf.add_page()
+    titulo_pagina()
 
-    # --------------------------------------------------------
-    # TÍTULO
-    # --------------------------------------------------------
+    pdf.set_font("Arial", "B", 17)
+    pdf.cell(0, 10, texto_pdf("RELATORIO DE CONSULTA"), ln=True, align="C")
 
-    pdf.set_font(
-        "Arial",
-        "B",
-        15,
-    )
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 8, texto_pdf(tipo_consulta.upper()), ln=True, align="C")
 
-    titulo = texto_pdf(
-        f"RELATORIO DE {tipo_consulta.upper()}"
-    )
+    if tipo_consulta == "Editais e Avisos de Contratações":
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 8, texto_pdf(f"Modalidade: {modalidade}"), ln=True, align="C")
 
-    pdf.cell(
-        0,
-        10,
-        txt=titulo,
-        ln=True,
-        align="C",
-    )
-
-    pdf.set_font(
-        "Arial",
-        "B",
-        10,
-    )
-
-    pdf.cell(
-        0,
-        7,
-        txt=texto_pdf(
-            NOME_PREFEITURA
-        ),
-        ln=True,
-        align="C",
-    )
-
-    pdf.ln(3)
-
-    pdf.set_font(
-        "Arial",
-        size=9,
-    )
-
-    pdf.cell(
-        0,
-        6,
-        txt=texto_pdf(
-            "Portal Nacional de "
-            "Contratacoes Publicas - PNCP"
-        ),
-        ln=True,
-        align="C",
-    )
-
-    pdf.cell(
-        0,
-        6,
-        txt=texto_pdf(
-            f"Periodo: "
-            f"{data_inicio.strftime('%d/%m/%Y')} "
-            f"a "
-            f"{data_fim.strftime('%d/%m/%Y')}"
-        ),
-        ln=True,
-    )
-
-    pdf.cell(
-        0,
-        6,
-        txt=texto_pdf(
-            f"Total de registros: {len(df)}"
-        ),
-        ln=True,
-    )
+    pdf.set_font("Arial", "B", 10)
+    pdf.cell(0, 7, texto_pdf(NOME_PREFEITURA), ln=True, align="C")
 
     pdf.ln(5)
 
-    # --------------------------------------------------------
-    # REGISTROS
-    # --------------------------------------------------------
+    # Resumo visual
+    pdf.set_font("Arial", "B", 9)
+    pdf.cell(0, 7, texto_pdf("INFORMACOES DA CONSULTA"), ln=True)
+    pdf.set_font("Arial", size=8)
 
-    for pos, (_, row) in enumerate(
-        df.head(100).iterrows(),
-        start=1,
-    ):
+    informacoes = [
+        ("Periodo", f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"),
+        ("Quantidade de registros", str(len(df))),
+        ("Fonte", "Portal Nacional de Contratacoes Publicas - PNCP"),
+    ]
+    if tipo_consulta == "Editais e Avisos de Contratações":
+        informacoes.insert(1, ("Modalidade", modalidade))
 
-        dados = obter_dados_registro(
-            row,
-            tipo_consulta,
-        )
+    for chave, valor in informacoes:
+        pdf.set_font("Arial", "B", 8)
+        pdf.cell(48, 6, texto_pdf(chave), border=1)
+        pdf.set_font("Arial", size=8)
+        pdf.multi_cell(0, 6, texto_pdf(valor), border=1)
 
-        pdf.set_font(
-            "Arial",
-            "B",
-            10,
-        )
+    pdf.ln(6)
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 7, texto_pdf("REGISTROS DA CONSULTA"), ln=True)
+    pdf.ln(2)
 
-        pdf.cell(
-            0,
-            7,
-            txt=texto_pdf(
-                f"Registro {pos}"
-            ),
-            ln=True,
-        )
+    for pos, (_, row) in enumerate(df.head(100).iterrows(), start=1):
+        dados = obter_dados_registro(row, tipo_consulta)
 
-        pdf.set_font(
-            "Arial",
-            size=8,
-        )
+        pdf.set_font("Arial", "B", 10)
+        pdf.cell(0, 7, texto_pdf(f"Registro {pos}"), ln=True)
 
         campos = [
-            (
-                "Numero",
-                dados["numero"],
-            ),
-            (
-                "Controle PNCP",
-                dados["id_pncp"],
-            ),
-            (
-                "Processo",
-                dados["processo"],
-            ),
-            (
-                "Objeto",
-                dados["objeto"],
-            ),
-            (
-                "Fornecedor",
-                dados["fornecedor"],
-            ),
-            (
-                "CNPJ/CPF Fornecedor",
-                dados["cnpj_fornecedor"],
-            ),
-            (
-                "Valor",
-                dados["valor"],
-            ),
-            (
-                "Data de Assinatura/Publicacao",
-                dados["data_assinatura"],
-            ),
-            (
-                "Inicio da Vigencia",
-                dados["vigencia_inicio"],
-            ),
-            (
-                "Fim da Vigencia",
-                dados["vigencia_fim"],
-            ),
-            (
-                "Situacao",
-                dados["situacao"],
-            ),
-            (
-                "Orgao",
-                dados["orgao"],
-            ),
-            (
-                "Unidade",
-                dados["unidade"],
-            ),
+            ("Numero", dados["numero"]),
+            ("Controle PNCP", dados["id_pncp"]),
+            ("Processo", dados["processo"]),
+            ("Objeto", dados["objeto"]),
+            ("Fornecedor", dados["fornecedor"]),
+            ("CNPJ/CPF Fornecedor", dados["cnpj_fornecedor"]),
+            ("Valor", dados["valor"]),
+            ("Data de Assinatura/Publicacao", dados["data_assinatura"]),
+            ("Inicio da Vigencia", dados["vigencia_inicio"]),
+            ("Fim da Vigencia", dados["vigencia_fim"]),
+            ("Situacao", dados["situacao"]),
+            ("Orgao", dados["orgao"]),
+            ("Unidade", dados["unidade"]),
         ]
 
         for nome_campo, valor_campo in campos:
+            pdf.set_font("Arial", "B", 8)
+            pdf.cell(48, 5, texto_pdf(nome_campo), border=1)
+            pdf.set_font("Arial", size=8)
+            pdf.multi_cell(0, 5, texto_pdf(valor_campo), border=1)
 
-            texto = (
-                f"{nome_campo}: "
-                f"{texto_valido(valor_campo)}"
-            )
+        pdf.ln(5)
 
-            pdf.multi_cell(
-                0,
-                5,
-                txt=texto_pdf(
-                    texto
-                ),
-            )
-
-        pdf.ln(4)
-
-    # --------------------------------------------------------
-    # RODAPÉ
-    # --------------------------------------------------------
-
-    pdf.set_font(
-        "Arial",
-        "I",
-        7,
-    )
-
+    pdf.set_y(-14)
+    pdf.set_font("Arial", "I", 7)
     pdf.cell(
         0,
         5,
-        txt=texto_pdf(
-            "Consulta realizada no Portal Nacional "
-            "de Contratacoes Publicas - PNCP"
-        ),
-        ln=True,
+        texto_pdf("Fonte: PNCP | Prefeitura Municipal de Rio das Pedras/SP"),
         align="C",
     )
 
-    resultado = pdf.output(
-        dest="S"
-    )
-
-    if isinstance(
-        resultado,
-        str,
-    ):
-        resultado = resultado.encode(
-            "latin-1"
-        )
-
+    resultado = pdf.output(dest="S")
+    if isinstance(resultado, str):
+        resultado = resultado.encode("latin-1")
     return bytes(resultado)
 
 
@@ -2282,6 +2136,7 @@ tipo_consulta = st.sidebar.selectbox(
 # ============================================================
 
 modalidade_codigo = None
+modalidade_nome_exportacao = None
 
 if (
     tipo_consulta
@@ -2307,6 +2162,8 @@ if (
             mod_escolhida
         ]
     )
+
+    modalidade_nome_exportacao = mod_escolhida
 
 
 # ============================================================
@@ -2770,24 +2627,9 @@ if (
 
     cols = st.columns(4)
 
-    nome_arquivo = (
-        tipo_consulta
-        .replace(
-            " ",
-            "_",
-        )
-        .replace(
-            "/",
-            "_",
-        )
-        .replace(
-            "ç",
-            "c",
-        )
-        .replace(
-            "ã",
-            "a",
-        )
+    nome_arquivo = nome_arquivo_modalidade(
+        tipo_consulta,
+        modalidade_nome_exportacao,
     )
 
     # --------------------------------------------------------
@@ -2840,6 +2682,7 @@ if (
             tipo_consulta,
             data_inicio,
             data_fim,
+            modalidade_nome_exportacao,
         )
 
         cols[2].download_button(
@@ -2870,6 +2713,7 @@ if (
             tipo_consulta,
             data_inicio,
             data_fim,
+            modalidade_nome_exportacao,
         )
 
         cols[3].download_button(
