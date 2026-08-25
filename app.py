@@ -1,142 +1,445 @@
 import io
 import datetime
 import time
-from concurrent.futures import ThreadPoolExecutor
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
+
 from docx import Document
 from docx.shared import Pt, RGBColor
 from fpdf import FPDF
 
 
 # ============================================================
-# FUNÇÃO DE FORMATAÇÃO BR
+# CONFIGURAÇÃO DA PÁGINA
 # ============================================================
 
-def formatar_moeda_br(valor):
-    """Formata número para o padrão brasileiro."""
+st.set_page_config(
+    page_title="Portal PNCP - Rio das Pedras/SP",
+    page_icon="🏛️",
+    layout="wide",
+)
+
+
+# ============================================================
+# DADOS DO MUNICÍPIO
+# ============================================================
+
+CNPJ_RIO_DAS_PEDRAS = "44826840000183"
+CODIGO_IBGE_RIO_DAS_PEDRAS = "3544004"
+UF = "SP"
+
+BASE_URL = "https://pncp.gov.br/api/consulta/v1"
+
+NOME_MUNICIPIO = "Rio das Pedras/SP"
+NOME_PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
+
+
+# ============================================================
+# CONFIGURAÇÕES DA API
+# ============================================================
+
+# O PNCP trabalha com limites diferentes conforme o endpoint.
+# Mantemos valores seguros para evitar HTTP 400.
+TAMANHO_PAGINA_CONTRATOS = 100
+TAMANHO_PAGINA_ATAS = 100
+TAMANHO_PAGINA_EDITAIS = 50
+
+# Segurança contra consultas excessivamente grandes.
+MAX_PAGINAS = 100
+
+# Número de tentativas para erros transitórios.
+MAX_TENTATIVAS = 4
+
+# Timeouts:
+# conexão relativamente curta + leitura mais longa.
+TIMEOUT_CONEXAO = 20
+TIMEOUT_LEITURA = 90
+
+
+# ============================================================
+# HEADERS
+# ============================================================
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Connection": "keep-alive",
+}
+
+
+# ============================================================
+# FUNÇÕES GERAIS DE FORMATAÇÃO
+# ============================================================
+
+def texto_valido(valor: Any, padrao: str = "N/D") -> str:
+    """
+    Converte qualquer valor para texto seguro.
+    """
+    if valor is None:
+        return padrao
+
     try:
-        valor = float(valor)
-        valor_fmt = "{:,.2f}".format(valor)
-        return f"R$ {valor_fmt.replace(',', 'X').replace('.', ',').replace('X', '.')}"
-    except (ValueError, TypeError):
-        return "N/D"
+        if pd.isna(valor):
+            return padrao
+    except Exception:
+        pass
+
+    if isinstance(valor, dict):
+        for chave in (
+            "nome",
+            "razaoSocial",
+            "descricao",
+            "valor",
+            "nomeUnidade",
+            "municipioNome",
+        ):
+            if chave in valor:
+                resultado = texto_valido(valor.get(chave), "")
+                if resultado:
+                    return resultado
+
+        return str(valor)
+
+    if isinstance(valor, list):
+        if not valor:
+            return padrao
+
+        partes = [
+            texto_valido(item, "")
+            for item in valor
+        ]
+
+        partes = [
+            item for item in partes
+            if item
+        ]
+
+        return ", ".join(partes) if partes else padrao
+
+    texto = str(valor).strip()
+
+    if texto.lower() in {
+        "",
+        "none",
+        "nan",
+        "null",
+        "n/d",
+        "nd",
+        "nat",
+    }:
+        return padrao
+
+    return texto
 
 
-def valor_numerico(valor):
-    """Converte valores numéricos do PNCP de forma segura."""
+def valor_numerico(valor: Any) -> Optional[float]:
+    """
+    Converte valores monetários/númericos vindos do PNCP.
+    Aceita:
+      1234.56
+      "1234.56"
+      "1.234,56"
+      "R$ 1.234,56"
+    """
+
     if valor is None:
         return None
 
+    if isinstance(valor, bool):
+        return None
+
     if isinstance(valor, (int, float)):
-        return float(valor)
+        try:
+            if pd.isna(valor):
+                return None
+            return float(valor)
+        except Exception:
+            return None
+
+    if isinstance(valor, dict):
+        for chave in (
+            "valor",
+            "value",
+            "valorTotal",
+            "valorGlobal",
+            "valorInicial",
+        ):
+            if chave in valor:
+                resultado = valor_numerico(valor[chave])
+                if resultado is not None:
+                    return resultado
+
+        return None
 
     texto = str(valor).strip()
 
     if not texto:
         return None
 
+    texto = (
+        texto
+        .replace("R$", "")
+        .replace("r$", "")
+        .replace(" ", "")
+    )
+
+    # Primeiro tenta como número normal.
     try:
         return float(texto)
-    except ValueError:
+    except Exception:
         pass
 
+    # Formato brasileiro.
     try:
-        texto = texto.replace("R$", "").replace(" ", "")
-
         if "," in texto and "." in texto:
-            texto = texto.replace(".", "").replace(",", ".")
+            texto = texto.replace(".", "")
+            texto = texto.replace(",", ".")
         elif "," in texto:
             texto = texto.replace(",", ".")
 
         return float(texto)
-    except (ValueError, TypeError):
+    except Exception:
         return None
 
 
-def texto_valido(valor):
-    """Retorna texto válido ou N/D."""
-    if valor is None:
-        return "N/D"
-
-    if isinstance(valor, float) and pd.isna(valor):
-        return "N/D"
-
-    texto = str(valor).strip()
-
-    if texto.lower() in ["", "none", "nan", "null", "n/d", "nd"]:
-        return "N/D"
-
-    return texto
-
-
-def obter_primeiro_valor(row, campos, padrao="N/D"):
+def formatar_moeda_br(valor: Any) -> str:
     """
-    Procura o primeiro campo disponível no registro.
-    Permite trabalhar com diferentes nomes de campos retornados pelo PNCP.
+    Formata valor no padrão brasileiro.
     """
-    for campo in campos:
-        if campo in row:
-            valor = row.get(campo)
 
-            if isinstance(valor, dict):
-                valor = (
-                    valor.get("nome")
-                    or valor.get("razaoSocial")
-                    or valor.get("descricao")
-                    or valor.get("valor")
-                )
+    numero = valor_numerico(valor)
 
-            if valor is not None and str(valor).strip() not in [
-                "",
-                "None",
-                "nan",
-                "null",
-            ]:
-                return valor
+    if numero is None:
+        return "N/D"
 
-    return padrao
+    texto = f"{numero:,.2f}"
+
+    texto = (
+        texto
+        .replace(",", "X")
+        .replace(".", ",")
+        .replace("X", ".")
+    )
+
+    return f"R$ {texto}"
 
 
-def formatar_data(valor):
-    """Converte datas do PNCP para DD/MM/AAAA."""
+def formatar_data(valor: Any) -> str:
+    """
+    Converte datas do PNCP para DD/MM/AAAA.
+    """
+
     if valor is None:
         return "N/D"
 
     texto = str(valor).strip()
 
-    if not texto or texto.lower() in ["none", "nan", "null", "n/d"]:
+    if not texto:
+        return "N/D"
+
+    if texto.lower() in {
+        "none",
+        "nan",
+        "null",
+        "n/d",
+        "nat",
+    }:
         return "N/D"
 
     try:
-        data = pd.to_datetime(valor, errors="coerce")
+        data = pd.to_datetime(
+            valor,
+            errors="coerce",
+        )
 
         if pd.isna(data):
             return texto
 
         return data.strftime("%d/%m/%Y")
+
     except Exception:
         return texto
 
 
-# ============================================================
-# DADOS PRINCIPAIS DO REGISTRO
-# ============================================================
-
-def obter_dados_registro(row, tipo):
+def normalizar_cnpj(valor: Any) -> str:
     """
-    Extrai os principais dados para Word e PDF.
-
-    A função foi ampliada principalmente para ATAS DE REGISTRO
-    DE PREÇOS, pois os nomes dos campos podem variar conforme
-    o retorno do PNCP.
+    Remove máscara de CNPJ/CPF.
     """
 
-    # --------------------------------------------------------
-    # IDENTIFICAÇÃO PNCP
-    # --------------------------------------------------------
+    return re.sub(
+        r"\D",
+        "",
+        texto_valido(valor, ""),
+    )
+
+
+# ============================================================
+# EXTRAÇÃO ROBUSTA DE CAMPOS
+# ============================================================
+
+def extrair_valor_recursivo(
+    valor: Any,
+    profundidade: int = 0,
+) -> Any:
+    """
+    Tenta extrair texto útil de estruturas aninhadas.
+    """
+
+    if profundidade > 4:
+        return valor
+
+    if valor is None:
+        return None
+
+    if isinstance(valor, dict):
+
+        # Chaves prioritárias.
+        chaves_prioritarias = [
+            "nome",
+            "razaoSocial",
+            "descricao",
+            "descricaoObjeto",
+            "valor",
+            "numero",
+            "cnpj",
+            "ni",
+            "numeroDocumento",
+            "nomeUnidade",
+            "municipioNome",
+            "ufSigla",
+        ]
+
+        for chave in chaves_prioritarias:
+
+            if chave in valor:
+
+                resultado = extrair_valor_recursivo(
+                    valor[chave],
+                    profundidade + 1,
+                )
+
+                if resultado not in (
+                    None,
+                    "",
+                    "N/D",
+                ):
+                    return resultado
+
+        return valor
+
+    if isinstance(valor, list):
+
+        resultados = []
+
+        for item in valor:
+
+            resultado = extrair_valor_recursivo(
+                item,
+                profundidade + 1,
+            )
+
+            if resultado not in (
+                None,
+                "",
+                "N/D",
+            ):
+                resultados.append(
+                    str(resultado)
+                )
+
+        if resultados:
+            return ", ".join(resultados)
+
+        return None
+
+    return valor
+
+
+def obter_primeiro_valor(
+    row: Any,
+    campos: List[str],
+    padrao: Any = "N/D",
+) -> Any:
+    """
+    Procura o primeiro campo realmente preenchido.
+
+    Permite trabalhar com diferentes versões/
+    estruturas retornadas pelo PNCP.
+    """
+
+    if row is None:
+        return padrao
+
+    for campo in campos:
+
+        try:
+
+            if isinstance(row, pd.Series):
+                if campo not in row.index:
+                    continue
+
+                valor = row.get(campo)
+
+            elif isinstance(row, dict):
+                if campo not in row:
+                    continue
+
+                valor = row.get(campo)
+
+            else:
+                continue
+
+        except Exception:
+            continue
+
+        if valor is None:
+            continue
+
+        try:
+            if pd.isna(valor):
+                continue
+        except Exception:
+            pass
+
+        valor = extrair_valor_recursivo(valor)
+
+        if valor is None:
+            continue
+
+        texto = texto_valido(
+            valor,
+            "",
+        )
+
+        if texto:
+            return valor
+
+    return padrao
+
+
+# ============================================================
+# EXTRAÇÃO DE DADOS DO REGISTRO
+# ============================================================
+
+def obter_dados_registro(
+    row: Any,
+    tipo: str,
+) -> Dict[str, str]:
+    """
+    Extrai os principais campos de Contratos,
+    Atas e Editais.
+
+    A função utiliza vários nomes alternativos
+    para reduzir a ocorrência de N/D.
+    """
 
     id_pncp = obter_primeiro_valor(
         row,
@@ -145,23 +448,24 @@ def obter_dados_registro(row, tipo):
             "numeroControlePNCPAta",
             "numeroControlePNCPCompra",
             "numeroControlePncp",
-            "numeroControlePNCPAta",
+            "idContratoPNCP",
+            "idContratacaoPNCP",
         ],
     )
 
-    # --------------------------------------------------------
-    # ATA DE REGISTRO DE PREÇOS
-    # --------------------------------------------------------
+    # ========================================================
+    # ATAS
+    # ========================================================
 
     if tipo == "Atas de Registro de Preços":
 
-        numero_ata = obter_primeiro_valor(
+        numero = obter_primeiro_valor(
             row,
             [
                 "numeroAtaRegistroPreco",
+                "numeroAtaRegistroPrecos",
                 "numeroAta",
                 "numeroRegistroPreco",
-                "numeroAtaRegistroPrecos",
                 "numero",
             ],
         )
@@ -173,6 +477,7 @@ def obter_dados_registro(row, tipo):
                 "numeroProcesso",
                 "processoAdministrativo",
                 "numeroProcessoAdministrativo",
+                "numeroProcessoCompra",
             ],
         )
 
@@ -184,6 +489,7 @@ def obter_dados_registro(row, tipo):
                 "objeto",
                 "descricaoObjeto",
                 "descricao",
+                "objetoContratacao",
             ],
         )
 
@@ -196,6 +502,7 @@ def obter_dados_registro(row, tipo):
                 "fornecedorNome",
                 "razaoSocial",
                 "nomeRazaoSocial",
+                "fornecedor",
             ],
         )
 
@@ -207,6 +514,7 @@ def obter_dados_registro(row, tipo):
                 "numeroDocumentoFornecedor",
                 "documentoFornecedor",
                 "cpfCnpjFornecedor",
+                "ni",
             ],
         )
 
@@ -222,13 +530,6 @@ def obter_dados_registro(row, tipo):
                 "valor",
             ],
             padrao=None,
-        )
-
-        valor_num = valor_numerico(valor)
-        valor_formatado = (
-            formatar_moeda_br(valor_num)
-            if valor_num is not None
-            else "N/D"
         )
 
         data_assinatura = obter_primeiro_valor(
@@ -268,6 +569,7 @@ def obter_dados_registro(row, tipo):
                 "situacaoAta",
                 "status",
                 "situacaoRegistro",
+                "cancelado",
             ],
         )
 
@@ -278,6 +580,7 @@ def obter_dados_registro(row, tipo):
                 "nomeOrgao",
                 "razaoSocialOrgao",
                 "orgao",
+                "orgaoNome",
             ],
         )
 
@@ -287,30 +590,49 @@ def obter_dados_registro(row, tipo):
                 "unidadeOrgao",
                 "nomeUnidade",
                 "unidade",
+                "unidadeAdministrativa",
             ],
         )
 
         return {
             "id_pncp": texto_valido(id_pncp),
-            "numero": texto_valido(numero_ata),
+            "numero": texto_valido(numero),
             "processo": texto_valido(processo),
             "objeto": texto_valido(objeto),
             "fornecedor": texto_valido(fornecedor),
-            "cnpj_fornecedor": texto_valido(cnpj_fornecedor),
-            "valor": valor_formatado,
-            "data_assinatura": formatar_data(data_assinatura),
-            "vigencia_inicio": formatar_data(vigencia_inicio),
-            "vigencia_fim": formatar_data(vigencia_fim),
+            "cnpj_fornecedor": texto_valido(
+                cnpj_fornecedor
+            ),
+            "valor": formatar_moeda_br(valor),
+            "data_assinatura": formatar_data(
+                data_assinatura
+            ),
+            "vigencia_inicio": formatar_data(
+                vigencia_inicio
+            ),
+            "vigencia_fim": formatar_data(
+                vigencia_fim
+            ),
             "situacao": texto_valido(situacao),
             "orgao": texto_valido(orgao),
             "unidade": texto_valido(unidade),
         }
 
-    # --------------------------------------------------------
+    # ========================================================
     # CONTRATOS
-    # --------------------------------------------------------
+    # ========================================================
 
-    elif tipo == "Contratos":
+    if tipo == "Contratos":
+
+        numero = obter_primeiro_valor(
+            row,
+            [
+                "numeroContratoEmpenho",
+                "numeroContrato",
+                "numeroContratoPncp",
+                "numero",
+            ],
+        )
 
         processo = obter_primeiro_valor(
             row,
@@ -339,6 +661,18 @@ def obter_dados_registro(row, tipo):
                 "nomeFornecedor",
                 "fornecedorNome",
                 "razaoSocial",
+                "nomeRazaoSocial",
+            ],
+        )
+
+        cnpj_fornecedor = obter_primeiro_valor(
+            row,
+            [
+                "niFornecedor",
+                "cnpjFornecedor",
+                "numeroDocumentoFornecedor",
+                "documentoFornecedor",
+                "cpfCnpjFornecedor",
             ],
         )
 
@@ -353,879 +687,1105 @@ def obter_dados_registro(row, tipo):
             padrao=None,
         )
 
-        valor_num = valor_numerico(valor)
+        data_assinatura = obter_primeiro_valor(
+            row,
+            [
+                "dataAssinatura",
+                "dataCelebracao",
+            ],
+        )
+
+        vigencia_inicio = obter_primeiro_valor(
+            row,
+            [
+                "dataVigenciaInicio",
+                "vigenciaInicio",
+            ],
+        )
+
+        vigencia_fim = obter_primeiro_valor(
+            row,
+            [
+                "dataVigenciaFim",
+                "vigenciaFim",
+            ],
+        )
+
+        situacao = obter_primeiro_valor(
+            row,
+            [
+                "situacao",
+                "status",
+            ],
+        )
+
+        orgao = obter_primeiro_valor(
+            row,
+            [
+                "orgaoEntidade",
+                "nomeOrgao",
+                "orgao",
+            ],
+        )
+
+        unidade = obter_primeiro_valor(
+            row,
+            [
+                "unidadeOrgao",
+                "nomeUnidade",
+                "unidade",
+            ],
+        )
 
         return {
             "id_pncp": texto_valido(id_pncp),
-            "numero": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    ["numeroContrato", "numeroContratoPncp", "numero"],
-                )
-            ),
+            "numero": texto_valido(numero),
             "processo": texto_valido(processo),
             "objeto": texto_valido(objeto),
             "fornecedor": texto_valido(fornecedor),
             "cnpj_fornecedor": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "niFornecedor",
-                        "cnpjFornecedor",
-                        "numeroDocumentoFornecedor",
-                    ],
-                )
+                cnpj_fornecedor
             ),
-            "valor": (
-                formatar_moeda_br(valor_num)
-                if valor_num is not None
-                else "N/D"
-            ),
+            "valor": formatar_moeda_br(valor),
             "data_assinatura": formatar_data(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "dataAssinatura",
-                        "dataCelebracao",
-                    ],
-                )
+                data_assinatura
             ),
             "vigencia_inicio": formatar_data(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "dataVigenciaInicio",
-                        "vigenciaInicio",
-                    ],
-                )
+                vigencia_inicio
             ),
             "vigencia_fim": formatar_data(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "dataVigenciaFim",
-                        "vigenciaFim",
-                    ],
-                )
+                vigencia_fim
             ),
-            "situacao": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "situacao",
-                        "status",
-                    ],
-                )
-            ),
-            "orgao": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "orgaoEntidade",
-                        "nomeOrgao",
-                        "orgao",
-                    ],
-                )
-            ),
-            "unidade": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "unidadeOrgao",
-                        "nomeUnidade",
-                        "unidade",
-                    ],
-                )
-            ),
+            "situacao": texto_valido(situacao),
+            "orgao": texto_valido(orgao),
+            "unidade": texto_valido(unidade),
         }
 
-    # --------------------------------------------------------
-    # EDITAIS
-    # --------------------------------------------------------
+    # ========================================================
+    # EDITAIS / CONTRATAÇÕES
+    # ========================================================
 
-    else:
-
-        processo = obter_primeiro_valor(
-            row,
-            [
-                "processo",
-                "numeroProcesso",
-                "processoAdministrativo",
-            ],
-        )
-
-        objeto = obter_primeiro_valor(
-            row,
-            [
-                "objetoCompra",
-                "objeto",
-                "descricaoObjeto",
-            ],
-        )
-
-        valor = obter_primeiro_valor(
-            row,
-            [
-                "valorTotalHomologado",
-                "valorTotalEstimado",
-                "valorEstimado",
-                "valorTotal",
-            ],
-            padrao=None,
-        )
-
-        valor_num = valor_numerico(valor)
-
-        return {
-            "id_pncp": texto_valido(id_pncp),
-            "numero": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "numeroCompra",
-                        "numeroEdital",
-                        "numero",
-                    ],
-                )
-            ),
-            "processo": texto_valido(processo),
-            "objeto": texto_valido(objeto),
-            "fornecedor": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "nomeRazaoSocialFornecedor",
-                        "razaoSocialFornecedor",
-                        "nomeFornecedor",
-                    ],
-                )
-            ),
-            "cnpj_fornecedor": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "niFornecedor",
-                        "cnpjFornecedor",
-                    ],
-                )
-            ),
-            "valor": (
-                formatar_moeda_br(valor_num)
-                if valor_num is not None
-                else "N/D"
-            ),
-            "data_assinatura": formatar_data(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "dataPublicacao",
-                        "dataPublicacaoPncp",
-                        "dataAberturaProposta",
-                    ],
-                )
-            ),
-            "vigencia_inicio": "N/D",
-            "vigencia_fim": "N/D",
-            "situacao": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "situacaoCompra",
-                        "situacao",
-                        "status",
-                    ],
-                )
-            ),
-            "orgao": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "orgaoEntidade",
-                        "nomeOrgao",
-                        "orgao",
-                    ],
-                )
-            ),
-            "unidade": texto_valido(
-                obter_primeiro_valor(
-                    row,
-                    [
-                        "unidadeOrgao",
-                        "nomeUnidade",
-                        "unidade",
-                    ],
-                )
-            ),
-        }
-
-
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
-
-st.set_page_config(
-    page_title="Portal PNCP - Rio das Pedras/SP",
-    layout="wide"
-)
-
-st.title("Contratações de Rio das Pedras/SP")
-
-st.markdown(
-    "Consulta integrada de Contratos, Atas e Editais "
-    "direto do Portal Nacional de Contratações Públicas."
-)
-
-
-# ============================================================
-# DADOS DO MUNICÍPIO
-# ============================================================
-
-CNPJ_RIO_DAS_PEDRAS = "44826840000183"
-CODIGO_IBGE_RIO_DAS_PEDRAS = "3544004"
-UF = "SP"
-BASE_URL = "https://pncp.gov.br/api/consulta/v1"
-
-
-# ============================================================
-# BARRA LATERAL
-# ============================================================
-
-st.sidebar.header("Parâmetros da Consulta")
-
-tipo_consulta = st.sidebar.selectbox(
-    "Selecione:",
-    [
-        "Contratos",
-        "Atas de Registro de Preços",
-        "Editais e Avisos de Contratações"
-    ]
-)
-
-
-# ============================================================
-# MODALIDADE — EDITAIS
-# ============================================================
-
-modalidade_codigo = None
-
-if tipo_consulta == "Editais e Avisos de Contratações":
-
-    modalidade_opcoes = {
-        "Pregão - Eletrônico (6)": 6,
-        "Dispensa de Licitação (8)": 8,
-        "Inexigibilidade (9)": 9,
-        "Concorrência - Eletrônica (2)": 2
-    }
-
-    mod_escolhida = st.sidebar.selectbox(
-        "Modalidade:",
-        list(modalidade_opcoes.keys())
+    processo = obter_primeiro_valor(
+        row,
+        [
+            "processo",
+            "numeroProcesso",
+            "processoAdministrativo",
+        ],
     )
 
-    modalidade_codigo = modalidade_opcoes[mod_escolhida]
-
-
-# ============================================================
-# DATAS
-# ============================================================
-
-data_inicio = st.sidebar.date_input(
-    "Data Inicial",
-    value=pd.to_datetime("2026-01-01")
-)
-
-data_fim = st.sidebar.date_input(
-    "Data Final",
-    value=datetime.date.today()
-)
-
-
-# ============================================================
-# VALIDAÇÕES
-# ============================================================
-
-if data_fim < data_inicio:
-    st.sidebar.error(
-        "⚠️ A Data Final não pode ser anterior à Data Inicial."
+    objeto = obter_primeiro_valor(
+        row,
+        [
+            "objetoCompra",
+            "objeto",
+            "descricaoObjeto",
+            "descricao",
+        ],
     )
-    st.stop()
 
-if (data_fim - data_inicio).days > 365:
-    st.sidebar.error(
-        "⚠️ O período não pode ser maior que 365 dias."
+    valor = obter_primeiro_valor(
+        row,
+        [
+            "valorTotalHomologado",
+            "valorTotalEstimado",
+            "valorEstimado",
+            "valorTotal",
+            "valor",
+        ],
+        padrao=None,
     )
-    st.stop()
 
+    numero = obter_primeiro_valor(
+        row,
+        [
+            "numeroCompra",
+            "numeroEdital",
+            "numero",
+        ],
+    )
 
-# ============================================================
-# SESSION STATE
-# ============================================================
+    fornecedor = obter_primeiro_valor(
+        row,
+        [
+            "nomeRazaoSocialFornecedor",
+            "razaoSocialFornecedor",
+            "nomeFornecedor",
+        ],
+    )
 
-if "df_resultado" not in st.session_state:
-    st.session_state.df_resultado = None
+    cnpj_fornecedor = obter_primeiro_valor(
+        row,
+        [
+            "niFornecedor",
+            "cnpjFornecedor",
+        ],
+    )
 
-if "tipo_anterior" not in st.session_state:
-    st.session_state.tipo_anterior = tipo_consulta
+    data_publicacao = obter_primeiro_valor(
+        row,
+        [
+            "dataPublicacao",
+            "dataPublicacaoPncp",
+            "dataAberturaProposta",
+            "dataInclusao",
+        ],
+    )
 
-if st.session_state.tipo_anterior != tipo_consulta:
-    st.session_state.df_resultado = None
-    st.session_state.tipo_anterior = tipo_consulta
+    situacao = obter_primeiro_valor(
+        row,
+        [
+            "situacaoCompra",
+            "situacao",
+            "status",
+        ],
+    )
 
+    orgao = obter_primeiro_valor(
+        row,
+        [
+            "orgaoEntidade",
+            "nomeOrgao",
+            "orgao",
+        ],
+    )
 
-# ============================================================
-# CONSULTA PNCP
-# ============================================================
+    unidade = obter_primeiro_valor(
+        row,
+        [
+            "unidadeOrgao",
+            "nomeUnidade",
+            "unidade",
+        ],
+    )
 
-def consultar_pncp(url, params, max_tentativas=5):
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/151.0 Safari/537.36"
+    return {
+        "id_pncp": texto_valido(id_pncp),
+        "numero": texto_valido(numero),
+        "processo": texto_valido(processo),
+        "objeto": texto_valido(objeto),
+        "fornecedor": texto_valido(fornecedor),
+        "cnpj_fornecedor": texto_valido(
+            cnpj_fornecedor
         ),
-        "Accept": "application/json",
-        "Connection": "keep-alive"
+        "valor": formatar_moeda_br(valor),
+        "data_assinatura": formatar_data(
+            data_publicacao
+        ),
+        "vigencia_inicio": "N/D",
+        "vigencia_fim": "N/D",
+        "situacao": texto_valido(situacao),
+        "orgao": texto_valido(orgao),
+        "unidade": texto_valido(unidade),
     }
 
-    for tentativa in range(1, max_tentativas + 1):
+
+# ============================================================
+# IDENTIFICAÇÃO DE CAMPOS PNCP
+# ============================================================
+
+def obter_identificador_contrato(
+    row: Any,
+) -> Tuple[Optional[str], Optional[int], Optional[int]]:
+    """
+    Tenta recuperar:
+      CNPJ
+      ano
+      sequencial
+
+    necessários para consultar um contrato específico.
+    """
+
+    cnpj = obter_primeiro_valor(
+        row,
+        [
+            "cnpjOrgao",
+            "cnpj",
+            "cnpjCompra",
+            "cnpjOrgaoEntidade",
+        ],
+        padrao=None,
+    )
+
+    ano = obter_primeiro_valor(
+        row,
+        [
+            "anoContrato",
+            "anoContratoEmpenho",
+            "ano",
+        ],
+        padrao=None,
+    )
+
+    sequencial = obter_primeiro_valor(
+        row,
+        [
+            "sequencialContrato",
+            "sequencialContratoEmpenho",
+            "sequencial",
+        ],
+        padrao=None,
+    )
+
+    cnpj_limpo = normalizar_cnpj(cnpj)
+
+    try:
+        ano_int = int(ano)
+    except Exception:
+        ano_int = None
+
+    try:
+        seq_int = int(sequencial)
+    except Exception:
+        seq_int = None
+
+    if len(cnpj_limpo) != 14:
+        cnpj_limpo = None
+
+    return (
+        cnpj_limpo,
+        ano_int,
+        seq_int,
+    )
+
+
+# ============================================================
+# EXTRAÇÃO DO ENVELOPE DA API
+# ============================================================
+
+def extrair_registros(
+    data: Any,
+) -> List[Dict[str, Any]]:
+    """
+    Extrai a lista de registros de diferentes formatos
+    possíveis de resposta do PNCP.
+    """
+
+    if data is None:
+        return []
+
+    if isinstance(data, list):
+        return data
+
+    if not isinstance(data, dict):
+        return []
+
+    # Formato paginado padrão.
+    for chave in (
+        "data",
+        "items",
+        "content",
+        "dados",
+        "registros",
+    ):
+
+        valor = data.get(chave)
+
+        if isinstance(valor, list):
+            return valor
+
+    # Alguns retornos podem trazer uma lista em agrupadores.
+    for valor in data.values():
+
+        if isinstance(valor, list):
+            return valor
+
+    return []
+
+
+def obter_informacoes_paginacao(
+    data: Any,
+) -> Dict[str, Any]:
+    """
+    Recupera metadados de paginação.
+    """
+
+    if not isinstance(data, dict):
+        return {
+            "totalRegistros": None,
+            "totalPaginas": None,
+            "numeroPagina": None,
+            "paginasRestantes": None,
+            "empty": False,
+        }
+
+    def numero(chave):
+        valor = data.get(chave)
+
+        try:
+            return int(valor)
+        except Exception:
+            return None
+
+    return {
+        "totalRegistros": numero(
+            "totalRegistros"
+        ),
+        "totalPaginas": numero(
+            "totalPaginas"
+        ),
+        "numeroPagina": numero(
+            "numeroPagina"
+        ),
+        "paginasRestantes": numero(
+            "paginasRestantes"
+        ),
+        "empty": bool(
+            data.get("empty", False)
+        ),
+    }
+
+
+# ============================================================
+# TRATAMENTO DO DATAFRAME
+# ============================================================
+
+def tratar_dataframe(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df_tratado = df.copy()
+
+    for coluna in df_tratado.columns:
+
+        def converter(valor):
+
+            if isinstance(valor, dict):
+
+                resultado = extrair_valor_recursivo(
+                    valor
+                )
+
+                if isinstance(
+                    resultado,
+                    (dict, list),
+                ):
+                    return str(resultado)
+
+                return texto_valido(
+                    resultado
+                )
+
+            if isinstance(valor, list):
+
+                resultado = extrair_valor_recursivo(
+                    valor
+                )
+
+                return texto_valido(
+                    resultado
+                )
+
+            return valor
+
+        try:
+            df_tratado[coluna] = (
+                df_tratado[coluna]
+                .map(converter)
+            )
+        except Exception:
+            pass
+
+    return df_tratado
+
+
+# ============================================================
+# CLIENTE HTTP PNCP
+# ============================================================
+
+@st.cache_resource
+def criar_sessao_http():
+
+    sessao = requests.Session()
+
+    sessao.headers.update(
+        HEADERS
+    )
+
+    return sessao
+
+
+def mensagem_erro_http(
+    response: requests.Response,
+) -> str:
+
+    try:
+        data = response.json()
+
+        if isinstance(data, dict):
+
+            mensagem = (
+                data.get("message")
+                or data.get("error")
+                or data.get("detail")
+            )
+
+            if mensagem:
+                return str(mensagem)
+
+    except Exception:
+        pass
+
+    texto = response.text.strip()
+
+    if not texto:
+        texto = "Sem detalhes fornecidos pela API."
+
+    return texto[:500]
+
+
+def consultar_pncp(
+    url: str,
+    params: Dict[str, Any],
+    max_tentativas: int = MAX_TENTATIVAS,
+) -> Any:
+    """
+    Consulta o PNCP com:
+      - timeout controlado
+      - retry
+      - backoff
+      - tratamento de 204
+      - tratamento diferenciado de 400/422
+    """
+
+    sessao = criar_sessao_http()
+
+    ultimo_erro = None
+
+    for tentativa in range(
+        1,
+        max_tentativas + 1,
+    ):
 
         try:
 
-            resp = requests.get(
+            response = sessao.get(
                 url,
                 params=params,
-                headers=headers,
-                timeout=(15, 90)
+                timeout=(
+                    TIMEOUT_CONEXAO,
+                    TIMEOUT_LEITURA,
+                ),
             )
 
-            if resp.status_code == 200:
+            # ------------------------------------------------
+            # SUCESSO
+            # ------------------------------------------------
+
+            if response.status_code == 200:
 
                 try:
-                    return resp.json()
+                    return response.json()
 
-                except ValueError:
-                    raise Exception(
-                        "Resposta da API não é um JSON válido."
-                    )
+                except ValueError as erro:
+                    raise RuntimeError(
+                        "O PNCP respondeu HTTP 200, "
+                        "mas o conteúdo não é um JSON válido."
+                    ) from erro
 
-            if resp.status_code == 204:
+            # ------------------------------------------------
+            # SEM RESULTADOS
+            # ------------------------------------------------
+
+            if response.status_code == 204:
                 return []
 
-            if resp.status_code in [
+            # ------------------------------------------------
+            # ERROS DE PARÂMETROS
+            # Não adianta repetir a requisição.
+            # ------------------------------------------------
+
+            if response.status_code in (
+                400,
+                422,
+            ):
+
+                detalhe = mensagem_erro_http(
+                    response
+                )
+
+                raise RuntimeError(
+                    f"PNCP rejeitou os parâmetros "
+                    f"(HTTP {response.status_code}). "
+                    f"{detalhe}"
+                )
+
+            # ------------------------------------------------
+            # NÃO ENCONTRADO
+            # ------------------------------------------------
+
+            if response.status_code == 404:
+
+                raise RuntimeError(
+                    "Endpoint ou recurso não encontrado "
+                    "no PNCP (HTTP 404)."
+                )
+
+            # ------------------------------------------------
+            # RATE LIMIT / SERVIDOR
+            # ------------------------------------------------
+
+            if response.status_code in (
+                408,
                 429,
                 500,
                 502,
                 503,
-                504
-            ]:
+                504,
+            ):
+
+                detalhe = mensagem_erro_http(
+                    response
+                )
+
+                ultimo_erro = RuntimeError(
+                    f"HTTP {response.status_code}: "
+                    f"{detalhe}"
+                )
 
                 if tentativa < max_tentativas:
 
-                    espera = 2 ** tentativa
+                    espera = min(
+                        2 ** tentativa,
+                        20,
+                    )
 
-                    time.sleep(espera)
+                    time.sleep(
+                        espera
+                    )
 
                     continue
 
-            raise Exception(
-                f"API retornou HTTP {resp.status_code}: "
-                f"{resp.text[:300]}"
+                raise ultimo_erro
+
+            # ------------------------------------------------
+            # OUTROS
+            # ------------------------------------------------
+
+            detalhe = mensagem_erro_http(
+                response
+            )
+
+            raise RuntimeError(
+                f"PNCP retornou HTTP "
+                f"{response.status_code}: "
+                f"{detalhe}"
             )
 
         except (
             requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError
-        ) as e:
+            requests.exceptions.ConnectionError,
+        ) as erro:
+
+            ultimo_erro = erro
 
             if tentativa < max_tentativas:
 
-                espera = 2 ** tentativa
+                espera = min(
+                    2 ** tentativa,
+                    20,
+                )
 
-                time.sleep(espera)
+                time.sleep(
+                    espera
+                )
 
                 continue
 
-            raise e
+            raise RuntimeError(
+                "Não foi possível obter resposta do PNCP "
+                "após várias tentativas. "
+                "O portal pode estar lento ou temporariamente "
+                "indisponível."
+            ) from erro
 
-    raise Exception(
-        "Falha de conexão com o PNCP após várias tentativas."
+    raise RuntimeError(
+        "Falha inesperada na comunicação com o PNCP."
     )
+
+
+# ============================================================
+# PAGINAÇÃO CONTROLADA
+# ============================================================
+
+def consultar_paginas(
+    url: str,
+    params: Dict[str, Any],
+    max_paginas: int = MAX_PAGINAS,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Paginação sequencial e controlada.
+
+    Usa totalPaginas/paginasRestantes quando disponíveis.
+    Não dispara várias requisições simultaneamente.
+    """
+
+    todos_registros = []
+
+    pagina = 1
+    paginas_consultadas = 0
+
+    while pagina <= max_paginas:
+
+        params_pagina = params.copy()
+
+        params_pagina["pagina"] = pagina
+
+        dados = consultar_pncp(
+            url,
+            params_pagina,
+        )
+
+        paginas_consultadas += 1
+
+        registros = extrair_registros(
+            dados
+        )
+
+        if not registros:
+            break
+
+        todos_registros.extend(
+            registros
+        )
+
+        info = obter_informacoes_paginacao(
+            dados
+        )
+
+        total_paginas = info.get(
+            "totalPaginas"
+        )
+
+        paginas_restantes = info.get(
+            "paginasRestantes"
+        )
+
+        numero_pagina = info.get(
+            "numeroPagina"
+        )
+
+        # ----------------------------------------------------
+        # Melhor situação:
+        # API informa total de páginas.
+        # ----------------------------------------------------
+
+        if total_paginas is not None:
+
+            if pagina >= total_paginas:
+                break
+
+        # ----------------------------------------------------
+        # Algumas respostas informam páginas restantes.
+        # ----------------------------------------------------
+
+        elif paginas_restantes is not None:
+
+            if paginas_restantes <= 0:
+                break
+
+        # ----------------------------------------------------
+        # Se a API informa número da página atual.
+        # ----------------------------------------------------
+
+        elif (
+            numero_pagina is not None
+            and numero_pagina < pagina
+        ):
+            break
+
+        # ----------------------------------------------------
+        # Fallback:
+        # se veio menos que o tamanho solicitado,
+        # normalmente acabou a paginação.
+        # ----------------------------------------------------
+
+        else:
+
+            tamanho = int(
+                params.get(
+                    "tamanhoPagina",
+                    50,
+                )
+            )
+
+            if len(registros) < tamanho:
+                break
+
+        pagina += 1
+
+        # Pequeno intervalo para evitar rajadas.
+        if pagina <= max_paginas:
+            time.sleep(0.15)
+
+    return (
+        todos_registros,
+        paginas_consultadas,
+    )
+
+
+# ============================================================
+# CACHE DE CONSULTAS
+# ============================================================
+
+@st.cache_data(
+    ttl=600,
+    show_spinner=False,
+)
+def executar_consulta_cacheada(
+    url: str,
+    params_tuple: Tuple[Tuple[str, str], ...],
+    max_paginas: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+
+    params = dict(
+        params_tuple
+    )
+
+    return consultar_paginas(
+        url,
+        params,
+        max_paginas,
+    )
+
+
+def executar_consulta(
+    url: str,
+    params: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], int]:
+
+    params_serializados = tuple(
+        sorted(
+            (
+                str(chave),
+                str(valor),
+            )
+            for chave, valor
+            in params.items()
+        )
+    )
+
+    return executar_consulta_cacheada(
+        url,
+        params_serializados,
+        MAX_PAGINAS,
+    )
+
+
+# ============================================================
+# REMOVER DUPLICIDADES
+# ============================================================
+
+def remover_duplicidades(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if df.empty:
+        return df
+
+    resultado = df.copy()
+
+    colunas_identificacao = [
+        "numeroControlePNCP",
+        "numeroControlePNCPAta",
+        "numeroControlePNCPCompra",
+        "numeroContratoEmpenho",
+        "numeroContrato",
+        "numeroAtaRegistroPreco",
+        "idContratoPNCP",
+    ]
+
+    for coluna in colunas_identificacao:
+
+        if coluna in resultado.columns:
+
+            serie = (
+                resultado[coluna]
+                .astype(str)
+                .str.strip()
+            )
+
+            validos = (
+                serie
+                .replace(
+                    {
+                        "nan": "",
+                        "None": "",
+                        "N/D": "",
+                    }
+                )
+                != ""
+            )
+
+            if validos.any():
+
+                resultado = (
+                    resultado
+                    .loc[
+                        ~validos
+                        | ~serie.duplicated(
+                            keep="first"
+                        )
+                    ]
+                )
+
+                return resultado.reset_index(
+                    drop=True
+                )
+
+    return (
+        resultado
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# FILTRO EXTRA DE SEGURANÇA
+# ============================================================
+
+def filtrar_por_cnpj(
+    df: pd.DataFrame,
+    cnpj: str,
+) -> pd.DataFrame:
+
+    if df.empty:
+        return df
+
+    cnpj_limpo = normalizar_cnpj(
+        cnpj
+    )
+
+    if not cnpj_limpo:
+        return df
+
+    possiveis_colunas = [
+        "cnpjOrgao",
+        "cnpj",
+        "cnpjCompra",
+        "cnpjOrgaoEntidade",
+        "orgaoEntidade",
+        "orgao",
+        "unidadeOrgao",
+    ]
+
+    encontrou_coluna = False
+
+    for coluna in possiveis_colunas:
+
+        if coluna not in df.columns:
+            continue
+
+        encontrou_coluna = True
+
+        serie = (
+            df[coluna]
+            .astype(str)
+            .map(normalizar_cnpj)
+        )
+
+        mascara = (
+            serie == cnpj_limpo
+        )
+
+        if mascara.any():
+
+            return (
+                df.loc[mascara]
+                .reset_index(drop=True)
+            )
+
+    # Se não foi possível identificar
+    # uma coluna de CNPJ, mantém os dados.
+    if not encontrou_coluna:
+        return df
+
+    return df
 
 
 # ============================================================
 # DETALHES DO CONTRATO
 # ============================================================
 
-def consultar_detalhes_contrato(id_contrato):
+def consultar_detalhes_contrato(
+    row: Any,
+) -> List[Dict[str, Any]]:
 
-    url = f"{BASE_URL}/contratos/{id_contrato}"
+    cnpj, ano, sequencial = (
+        obter_identificador_contrato(
+            row
+        )
+    )
+
+    if not all(
+        [
+            cnpj,
+            ano,
+            sequencial,
+        ]
+    ):
+        return []
+
+    url = (
+        f"{BASE_URL}/orgaos/"
+        f"{cnpj}/contratos/"
+        f"{ano}/"
+        f"{sequencial}"
+    )
 
     try:
 
-        resp = requests.get(
+        contrato = consultar_pncp(
             url,
-            timeout=15
+            {},
+            max_tentativas=3,
         )
 
-        if resp.status_code == 200:
+        if not isinstance(
+            contrato,
+            dict,
+        ):
+            return []
 
-            contrato = resp.json()
+        documentos = []
 
-            aditivos = contrato.get(
-                "termosAditivos",
-                []
-            )
+        # ----------------------------------------------------
+        # Termos
+        # ----------------------------------------------------
 
-            apostilamentos = contrato.get(
-                "termosApostilamentos",
-                []
-            )
+        termos = contrato.get(
+            "termos",
+            [],
+        )
 
-            lista_final = []
+        if isinstance(
+            termos,
+            list,
+        ):
+
+            for item in termos:
+
+                item = dict(item)
+
+                item[
+                    "tipoDocumentoNome"
+                ] = (
+                    item.get(
+                        "tipoDocumentoNome"
+                    )
+                    or item.get(
+                        "tipoTermoNome"
+                    )
+                    or "Termo de Contrato"
+                )
+
+                documentos.append(
+                    item
+                )
+
+        # ----------------------------------------------------
+        # Compatibilidade com estruturas antigas.
+        # ----------------------------------------------------
+
+        aditivos = contrato.get(
+            "termosAditivos",
+            [],
+        )
+
+        if isinstance(
+            aditivos,
+            list,
+        ):
 
             for item in aditivos:
 
-                item["tipoDocumentoNome"] = (
-                    "Termo Aditivo"
+                item = dict(item)
+
+                item[
+                    "tipoDocumentoNome"
+                ] = "Termo Aditivo"
+
+                documentos.append(
+                    item
                 )
 
-                lista_final.append(item)
+        apostilamentos = contrato.get(
+            "termosApostilamentos",
+            [],
+        )
+
+        if isinstance(
+            apostilamentos,
+            list,
+        ):
 
             for item in apostilamentos:
 
-                item["tipoDocumentoNome"] = (
+                item = dict(item)
+
+                item[
+                    "tipoDocumentoNome"
+                ] = (
                     "Termo de Apostilamento"
                 )
 
-                lista_final.append(item)
+                documentos.append(
+                    item
+                )
 
-            return lista_final
+        # ----------------------------------------------------
+        # Histórico, quando disponível.
+        # ----------------------------------------------------
 
-        return []
+        historico = contrato.get(
+            "historico",
+            [],
+        )
+
+        if isinstance(
+            historico,
+            list,
+        ):
+
+            for item in historico:
+
+                item = dict(item)
+
+                item[
+                    "tipoDocumentoNome"
+                ] = (
+                    item.get(
+                        "tipoEventoNome"
+                    )
+                    or "Histórico"
+                )
+
+                documentos.append(
+                    item
+                )
+
+        return documentos
 
     except Exception:
         return []
 
 
 # ============================================================
-# EXTRAÇÃO
+# EXPORTAÇÃO - WORD
 # ============================================================
 
-def extrair_registros(data):
-
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-
-        for chave in [
-            "data",
-            "items",
-            "content",
-            "dados"
-        ]:
-
-            if (
-                chave in data
-                and isinstance(data[chave], list)
-            ):
-                return data[chave]
-
-    return []
-
-
-# ============================================================
-# TRATAMENTO DATAFRAME
-# ============================================================
-
-def tratar_dataframe(df):
-
-    if df.empty:
-        return df
-
-    df_tratado = df.copy()
-
-    for col in df_tratado.columns:
-
-        sample = df_tratado[col].dropna()
-
-        if (
-            not sample.empty
-            and isinstance(sample.iloc[0], dict)
-        ):
-
-            df_tratado[col] = df_tratado[col].apply(
-                lambda x:
-                    x.get("nome")
-                    or x.get("razaoSocial")
-                    or x.get("descricao")
-                    or str(x)
-                    if isinstance(x, dict)
-                    else str(x)
-            )
-
-    return df_tratado
-
-
-# ============================================================
-# PAGINAÇÃO
-# ============================================================
-
-def consultar_paginas_rapido(
-    url,
-    params,
-    max_paginas=20
-):
-
-    params_primeira = params.copy()
-
-    params_primeira["pagina"] = 1
-
-    data_inicial = consultar_pncp(
-        url,
-        params_primeira
-    )
-
-    registros = extrair_registros(
-        data_inicial
-    )
-
-    if not registros:
-        return []
-
-    todos_registros = list(registros)
-
-    tamanho = params.get(
-        "tamanhoPagina",
-        50
-    )
-
-    if len(registros) < tamanho:
-        return todos_registros
-
-    def buscar_pagina(p):
-
-        params_p = params.copy()
-
-        params_p["pagina"] = p
-
-        try:
-
-            dados = consultar_pncp(
-                url,
-                params_p
-            )
-
-            return extrair_registros(
-                dados
-            )
-
-        except Exception:
-            return []
-
-    with ThreadPoolExecutor(
-        max_workers=5
-    ) as executor:
-
-        resultados = list(
-            executor.map(
-                buscar_pagina,
-                range(
-                    2,
-                    max_paginas + 1
-                )
-            )
-        )
-
-    for res in resultados:
-
-        if res:
-
-            todos_registros.extend(res)
-
-            if len(res) < tamanho:
-                break
-
-    return todos_registros
-
-
-# ============================================================
-# CONSULTA
-# ============================================================
-
-if st.sidebar.button(
-    "🔎 Gerar Consulta",
-    type="primary"
-):
-
-    endpoints = {
-
-        "Contratos":
-            f"{BASE_URL}/contratos",
-
-        "Atas de Registro de Preços":
-            f"{BASE_URL}/atas",
-
-        "Editais e Avisos de Contratações":
-            f"{BASE_URL}/contratacoes/publicacao"
-    }
-
-    endpoint = endpoints[tipo_consulta]
-
-    tamanho_pagina = (
-        50
-        if tipo_consulta
-        == "Editais e Avisos de Contratações"
-        else 100
-    )
-
-    params = {
-
-        "dataInicial":
-            data_inicio.strftime("%Y%m%d"),
-
-        "dataFinal":
-            data_fim.strftime("%Y%m%d"),
-
-        "pagina": 1,
-
-        "tamanhoPagina":
-            tamanho_pagina
-    }
-
-    if tipo_consulta == "Editais e Avisos de Contratações":
-
-        params.update({
-
-            "codigoModalidadeContratacao":
-                modalidade_codigo,
-
-            "uf":
-                UF,
-
-            "codigoMunicipioIbge":
-                CODIGO_IBGE_RIO_DAS_PEDRAS,
-
-            "cnpj":
-                CNPJ_RIO_DAS_PEDRAS
-        })
-
-    elif tipo_consulta == "Contratos":
-
-        params["cnpjOrgao"] = (
-            CNPJ_RIO_DAS_PEDRAS
-        )
-
-    elif tipo_consulta == "Atas de Registro de Preços":
-
-        params["cnpj"] = (
-            CNPJ_RIO_DAS_PEDRAS
-        )
-
-    try:
-
-        with st.spinner(
-            "🔄 Buscando dados no PNCP..."
-        ):
-
-            registros = consultar_paginas_rapido(
-                endpoint,
-                params
-            )
-
-            df_temp = pd.DataFrame(
-                registros
-            )
-
-            df_temp = tratar_dataframe(
-                df_temp
-            )
-
-            # ------------------------------------------------
-            # FILTRO EXTRA PARA CONTRATOS
-            # ------------------------------------------------
-
-            if (
-                tipo_consulta == "Contratos"
-                and not df_temp.empty
-            ):
-
-                possiveis_colunas = [
-                    "cnpjOrgao",
-                    "orgaoEntidade",
-                    "orgao",
-                    "unidadeOrgao"
-                ]
-
-                for coluna in possiveis_colunas:
-
-                    if coluna in df_temp.columns:
-
-                        serie = (
-                            df_temp[coluna]
-                            .astype(str)
-                            .str.replace(
-                                r"\D",
-                                "",
-                                regex=True
-                            )
-                        )
-
-                        mask = serie.str.contains(
-                            CNPJ_RIO_DAS_PEDRAS,
-                            na=False
-                        )
-
-                        if mask.any():
-
-                            df_temp = (
-                                df_temp[mask]
-                            )
-
-                            break
-
-            st.session_state.df_resultado = (
-                df_temp
-            )
-
-    except Exception as e:
-
-        st.session_state.df_resultado = None
-
-        st.error(
-            f"❌ Erro: {str(e)}"
-        )
-
-
-# ============================================================
-# EXIBIÇÃO
-# ============================================================
-
-if (
-    st.session_state.df_resultado
-    is not None
-    and not st.session_state.df_resultado.empty
-):
-
-    df = st.session_state.df_resultado
-
-    st.success(
-        f"📊 Exibindo {len(df)} registros "
-        "para Rio das Pedras/SP."
-    )
-
-    # --------------------------------------------------------
-    # MÉTRICAS
-    # --------------------------------------------------------
-
-    col_m1, col_m2 = st.columns(2)
-
-    col_m1.metric(
-        "Total de Registros",
-        len(df)
-    )
-
-    coluna_valor = next(
-        (
-            c
-            for c in [
-                "valorGlobal",
-                "valorInicial",
-                "valorTotal",
-                "valorTotalHomologado",
-                "valorTotalEstimado",
-                "valorAta"
-            ]
-            if c in df.columns
-        ),
-        None
-    )
-
-    if coluna_valor:
-
-        total_valor = pd.to_numeric(
-            df[coluna_valor],
-            errors="coerce"
-        ).sum()
-
-        col_m2.metric(
-            "Valor Total Envolvido",
-            formatar_moeda_br(
-                total_valor
-            )
-        )
-
-    else:
-
-        col_m2.metric(
-            "Status da Consulta",
-            "Concluída com Sucesso"
-        )
-
-    st.markdown("---")
-
-
-    # ========================================================
-    # EXPORTAÇÃO
-    # ========================================================
-
-    st.markdown(
-        "### 📥 Opções de Exportação"
-    )
-
-    cols = st.columns(4)
-
-    nome = (
-        tipo_consulta
-        .replace(" ", "_")
-        .replace("/", "_")
-    )
-
-    # --------------------------------------------------------
-    # EXCEL
-    # --------------------------------------------------------
-
-    buffer_xlsx = io.BytesIO()
-
-    df.to_excel(
-        buffer_xlsx,
-        index=False
-    )
-
-    cols[0].download_button(
-        "📊 Excel (.xlsx)",
-        buffer_xlsx.getvalue(),
-        f"{nome}_Rio_Das_Pedras.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        )
-    )
-
-    # --------------------------------------------------------
-    # CSV
-    # --------------------------------------------------------
-
-    csv_data = df.to_csv(
-        index=False,
-        encoding="utf-8-sig"
-    )
-
-    cols[1].download_button(
-        "📄 CSV (.csv)",
-        csv_data,
-        f"{nome}_Rio_Das_Pedras.csv",
-        mime="text/csv"
-    )
-
-
-    # ========================================================
-    # WORD
-    # ========================================================
+def gerar_word(
+    df: pd.DataFrame,
+    tipo_consulta: str,
+    data_inicio,
+    data_fim,
+) -> bytes:
 
     doc = Document()
 
-    # Margens
     section = doc.sections[0]
 
     section.top_margin = Pt(40)
@@ -1233,35 +1793,39 @@ if (
     section.left_margin = Pt(45)
     section.right_margin = Pt(45)
 
-    # Título
-    p_titulo = doc.add_paragraph()
+    # --------------------------------------------------------
+    # TÍTULO
+    # --------------------------------------------------------
 
+    p_titulo = doc.add_paragraph()
     p_titulo.alignment = 1
 
-    r_titulo = p_titulo.add_run(
+    run = p_titulo.add_run(
         f"RELATÓRIO DE {tipo_consulta.upper()}"
     )
 
-    r_titulo.bold = True
-    r_titulo.font.size = Pt(16)
-    r_titulo.font.color.rgb = RGBColor(
+    run.bold = True
+    run.font.size = Pt(16)
+    run.font.color.rgb = RGBColor(
         0,
         51,
-        102
+        102,
     )
 
     p_subtitulo = doc.add_paragraph()
-
     p_subtitulo.alignment = 1
 
-    r = p_subtitulo.add_run(
-        "Prefeitura Municipal de Rio das Pedras/SP"
+    run = p_subtitulo.add_run(
+        NOME_PREFEITURA
     )
 
-    r.bold = True
-    r.font.size = Pt(11)
+    run.bold = True
+    run.font.size = Pt(11)
 
-    # Informações gerais
+    doc.add_paragraph(
+        "Portal Nacional de Contratações Públicas – PNCP"
+    )
+
     doc.add_paragraph(
         f"Período da consulta: "
         f"{data_inicio.strftime('%d/%m/%Y')} "
@@ -1278,119 +1842,173 @@ if (
 
     doc.add_heading(
         "Principais Registros",
-        level=2
+        level=2,
     )
 
     # --------------------------------------------------------
-    # DADOS DOS REGISTROS
+    # REGISTROS
     # --------------------------------------------------------
 
     for pos, (_, row) in enumerate(
-        df.head(50).iterrows(),
-        start=1
+        df.head(100).iterrows(),
+        start=1,
     ):
 
         dados = obter_dados_registro(
             row,
-            tipo_consulta
+            tipo_consulta,
         )
 
         tabela = doc.add_table(
             rows=0,
-            cols=2
+            cols=2,
         )
 
         tabela.style = "Table Grid"
 
-        campos_word = [
-            ("Registro", f"{pos}"),
-            ("Número", dados["numero"]),
-            ("Controle PNCP", dados["id_pncp"]),
-            ("Processo", dados["processo"]),
-            ("Objeto", dados["objeto"]),
-            ("Fornecedor", dados["fornecedor"]),
+        campos = [
+            ("Registro", str(pos)),
+            (
+                "Número",
+                dados["numero"],
+            ),
+            (
+                "Controle PNCP",
+                dados["id_pncp"],
+            ),
+            (
+                "Processo",
+                dados["processo"],
+            ),
+            (
+                "Objeto",
+                dados["objeto"],
+            ),
+            (
+                "Fornecedor",
+                dados["fornecedor"],
+            ),
             (
                 "CNPJ/CPF Fornecedor",
-                dados["cnpj_fornecedor"]
+                dados["cnpj_fornecedor"],
             ),
-            ("Valor", dados["valor"]),
             (
-                "Data de Assinatura",
-                dados["data_assinatura"]
+                "Valor",
+                dados["valor"],
+            ),
+            (
+                "Data de Assinatura/Publicação",
+                dados["data_assinatura"],
             ),
             (
                 "Início da Vigência",
-                dados["vigencia_inicio"]
+                dados["vigencia_inicio"],
             ),
             (
                 "Fim da Vigência",
-                dados["vigencia_fim"]
+                dados["vigencia_fim"],
             ),
-            ("Situação", dados["situacao"]),
-            ("Órgão", dados["orgao"]),
-            ("Unidade", dados["unidade"]),
+            (
+                "Situação",
+                dados["situacao"],
+            ),
+            (
+                "Órgão",
+                dados["orgao"],
+            ),
+            (
+                "Unidade",
+                dados["unidade"],
+            ),
         ]
 
-        for nome_campo, valor_campo in campos_word:
+        for nome_campo, valor_campo in campos:
 
             cells = tabela.add_row().cells
 
-            cells[0].text = nome_campo
-            cells[1].text = str(
+            cells[0].text = str(
+                nome_campo
+            )
+
+            cells[1].text = texto_valido(
                 valor_campo
             )
 
-            for run in cells[0].paragraphs[0].runs:
-
+            for run in (
+                cells[0]
+                .paragraphs[0]
+                .runs
+            ):
                 run.bold = True
                 run.font.size = Pt(9)
 
-            for run in cells[1].paragraphs[0].runs:
-
+            for run in (
+                cells[1]
+                .paragraphs[0]
+                .runs
+            ):
                 run.font.size = Pt(9)
 
         doc.add_paragraph("")
 
-    # Rodapé
-    section = doc.sections[0]
-
     footer = section.footer
 
     p_footer = footer.paragraphs[0]
-
     p_footer.alignment = 1
 
-    p_footer.add_run(
+    run = p_footer.add_run(
         "Consulta realizada no Portal Nacional "
         "de Contratações Públicas – PNCP"
-    ).font.size = Pt(8)
+    )
 
-    buffer_docx = io.BytesIO()
+    run.font.size = Pt(8)
 
-    doc.save(buffer_docx)
+    buffer = io.BytesIO()
 
-    buffer_docx.seek(0)
+    doc.save(buffer)
 
-    cols[2].download_button(
-        "📝 Word (.docx)",
-        buffer_docx.getvalue(),
-        f"Relatorio_{nome}.docx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "wordprocessingml.document"
+    buffer.seek(0)
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# PDF
+# ============================================================
+
+def texto_pdf(valor: Any) -> str:
+    """
+    Converte texto para latin-1 sem quebrar o PDF.
+    """
+
+    texto = texto_valido(
+        valor
+    )
+
+    return (
+        texto
+        .encode(
+            "latin-1",
+            "replace",
+        )
+        .decode(
+            "latin-1"
         )
     )
 
 
-    # ========================================================
-    # PDF
-    # ========================================================
+def gerar_pdf(
+    df: pd.DataFrame,
+    tipo_consulta: str,
+    data_inicio,
+    data_fim,
+) -> bytes:
 
     pdf = FPDF()
 
     pdf.set_auto_page_break(
         auto=True,
-        margin=15
+        margin=15,
     )
 
     pdf.add_page()
@@ -1402,70 +2020,74 @@ if (
     pdf.set_font(
         "Arial",
         "B",
-        15
+        15,
     )
 
-    titulo_pdf = (
+    titulo = texto_pdf(
         f"RELATORIO DE {tipo_consulta.upper()}"
-    )
-
-    titulo_pdf = (
-        titulo_pdf
-        .encode("latin-1", "replace")
-        .decode("latin-1")
     )
 
     pdf.cell(
         0,
         10,
-        txt=titulo_pdf,
+        txt=titulo,
         ln=True,
-        align="C"
+        align="C",
     )
 
     pdf.set_font(
         "Arial",
         "B",
-        10
+        10,
     )
 
     pdf.cell(
         0,
         7,
-        txt=(
-            "Prefeitura Municipal de "
-            "Rio das Pedras / SP"
+        txt=texto_pdf(
+            NOME_PREFEITURA
         ),
         ln=True,
-        align="C"
+        align="C",
     )
 
-    pdf.ln(5)
+    pdf.ln(3)
 
     pdf.set_font(
         "Arial",
-        size=9
-    )
-
-    periodo_pdf = (
-        f"Periodo: "
-        f"{data_inicio.strftime('%d/%m/%Y')} "
-        f"a "
-        f"{data_fim.strftime('%d/%m/%Y')}"
+        size=9,
     )
 
     pdf.cell(
         0,
         6,
-        txt=periodo_pdf,
-        ln=True
+        txt=texto_pdf(
+            "Portal Nacional de "
+            "Contratacoes Publicas - PNCP"
+        ),
+        ln=True,
+        align="C",
     )
 
     pdf.cell(
         0,
         6,
-        txt=f"Total de registros: {len(df)}",
-        ln=True
+        txt=texto_pdf(
+            f"Periodo: "
+            f"{data_inicio.strftime('%d/%m/%Y')} "
+            f"a "
+            f"{data_fim.strftime('%d/%m/%Y')}"
+        ),
+        ln=True,
+    )
+
+    pdf.cell(
+        0,
+        6,
+        txt=texto_pdf(
+            f"Total de registros: {len(df)}"
+        ),
+        ln=True,
     )
 
     pdf.ln(5)
@@ -1475,105 +2097,103 @@ if (
     # --------------------------------------------------------
 
     for pos, (_, row) in enumerate(
-        df.head(50).iterrows(),
-        start=1
+        df.head(100).iterrows(),
+        start=1,
     ):
 
         dados = obter_dados_registro(
             row,
-            tipo_consulta
+            tipo_consulta,
         )
 
         pdf.set_font(
             "Arial",
             "B",
-            10
+            10,
         )
 
         pdf.cell(
             0,
             7,
-            txt=f"Registro {pos}",
-            ln=True
+            txt=texto_pdf(
+                f"Registro {pos}"
+            ),
+            ln=True,
         )
 
         pdf.set_font(
             "Arial",
-            size=8
+            size=8,
         )
 
-        campos_pdf = [
+        campos = [
             (
                 "Numero",
-                dados["numero"]
+                dados["numero"],
             ),
             (
                 "Controle PNCP",
-                dados["id_pncp"]
+                dados["id_pncp"],
             ),
             (
                 "Processo",
-                dados["processo"]
+                dados["processo"],
             ),
             (
                 "Objeto",
-                dados["objeto"]
+                dados["objeto"],
             ),
             (
                 "Fornecedor",
-                dados["fornecedor"]
+                dados["fornecedor"],
             ),
             (
                 "CNPJ/CPF Fornecedor",
-                dados["cnpj_fornecedor"]
+                dados["cnpj_fornecedor"],
             ),
             (
                 "Valor",
-                dados["valor"]
+                dados["valor"],
             ),
             (
-                "Data de Assinatura",
-                dados["data_assinatura"]
+                "Data de Assinatura/Publicacao",
+                dados["data_assinatura"],
             ),
             (
                 "Inicio da Vigencia",
-                dados["vigencia_inicio"]
+                dados["vigencia_inicio"],
             ),
             (
                 "Fim da Vigencia",
-                dados["vigencia_fim"]
+                dados["vigencia_fim"],
             ),
             (
                 "Situacao",
-                dados["situacao"]
+                dados["situacao"],
             ),
             (
                 "Orgao",
-                dados["orgao"]
+                dados["orgao"],
             ),
             (
                 "Unidade",
-                dados["unidade"]
+                dados["unidade"],
             ),
         ]
 
-        for nome_campo, valor_campo in campos_pdf:
+        for nome_campo, valor_campo in campos:
 
             texto = (
                 f"{nome_campo}: "
                 f"{texto_valido(valor_campo)}"
             )
 
-            texto = (
-                texto
-                .encode("latin-1", "replace")
-                .decode("latin-1")
-            )
-
             pdf.multi_cell(
                 0,
                 5,
-                txt=texto
+                txt=texto_pdf(
+                    texto
+                ),
             )
 
         pdf.ln(4)
@@ -1585,43 +2205,686 @@ if (
     pdf.set_font(
         "Arial",
         "I",
-        7
-    )
-
-    rodape = (
-        "Consulta realizada no Portal Nacional "
-        "de Contratacoes Publicas - PNCP"
+        7,
     )
 
     pdf.cell(
         0,
         5,
-        txt=rodape,
+        txt=texto_pdf(
+            "Consulta realizada no Portal Nacional "
+            "de Contratacoes Publicas - PNCP"
+        ),
         ln=True,
-        align="C"
+        align="C",
     )
 
-    pdf_bytes = pdf.output(
+    resultado = pdf.output(
         dest="S"
     )
 
     if isinstance(
-        pdf_bytes,
-        str
+        resultado,
+        str,
     ):
-        pdf_bytes = pdf_bytes.encode(
+        resultado = resultado.encode(
             "latin-1"
         )
 
-    cols[3].download_button(
-        "📕 PDF (.pdf)",
-        pdf_bytes,
-        f"Relatorio_{nome}.pdf",
-        mime="application/pdf"
+    return bytes(resultado)
+
+
+# ============================================================
+# TELA PRINCIPAL
+# ============================================================
+
+st.title(
+    "🏛️ Contratações de Rio das Pedras/SP"
+)
+
+st.markdown(
+    "Consulta integrada de **Contratos, Atas de Registro "
+    "de Preços e Editais/Avisos de Contratações** "
+    "diretamente do Portal Nacional de Contratações "
+    "Públicas – PNCP."
+)
+
+st.warning(
+    "⚠️ **Atenção:** o Portal Nacional de Contratações "
+    "Públicas (PNCP) pode apresentar lentidão, timeout "
+    "ou indisponibilidade temporária. Consultas com "
+    "períodos maiores podem levar alguns minutos. "
+    "O sistema possui tentativas automáticas para erros "
+    "temporários."
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.header(
+    "⚙️ Parâmetros da Consulta"
+)
+
+tipo_consulta = st.sidebar.selectbox(
+    "Selecione o tipo:",
+    [
+        "Contratos",
+        "Atas de Registro de Preços",
+        "Editais e Avisos de Contratações",
+    ],
+)
+
+
+# ============================================================
+# MODALIDADES
+# ============================================================
+
+modalidade_codigo = None
+
+if (
+    tipo_consulta
+    == "Editais e Avisos de Contratações"
+):
+
+    modalidade_opcoes = {
+        "Pregão - Eletrônico (6)": 6,
+        "Dispensa de Licitação (8)": 8,
+        "Inexigibilidade (9)": 9,
+        "Concorrência - Eletrônica (2)": 2,
+    }
+
+    mod_escolhida = st.sidebar.selectbox(
+        "Modalidade:",
+        list(
+            modalidade_opcoes.keys()
+        ),
+    )
+
+    modalidade_codigo = (
+        modalidade_opcoes[
+            mod_escolhida
+        ]
     )
 
 
+# ============================================================
+# DATAS
+# ============================================================
+
+data_inicio = st.sidebar.date_input(
+    "📅 Data Inicial",
+    value=pd.to_datetime(
+        "2026-01-01"
+    ).date(),
+)
+
+data_fim = st.sidebar.date_input(
+    "📅 Data Final",
+    value=datetime.date.today(),
+)
+
+
+# ============================================================
+# VALIDAÇÃO
+# ============================================================
+
+if data_fim < data_inicio:
+
+    st.sidebar.error(
+        "⚠️ A Data Final não pode ser anterior "
+        "à Data Inicial."
+    )
+
+    st.stop()
+
+
+quantidade_dias = (
+    data_fim - data_inicio
+).days
+
+
+if quantidade_dias > 365:
+
+    st.sidebar.error(
+        "⚠️ O período não pode ser superior "
+        "a 365 dias."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if (
+    "df_resultado"
+    not in st.session_state
+):
+    st.session_state.df_resultado = None
+
+
+if (
+    "tipo_anterior"
+    not in st.session_state
+):
+    st.session_state.tipo_anterior = (
+        tipo_consulta
+    )
+
+
+if (
+    st.session_state.tipo_anterior
+    != tipo_consulta
+):
+
+    st.session_state.df_resultado = None
+
+    st.session_state.tipo_anterior = (
+        tipo_consulta
+    )
+
+
+if (
+    "paginas_consultadas"
+    not in st.session_state
+):
+    st.session_state.paginas_consultadas = 0
+
+
+if (
+    "ultima_consulta"
+    not in st.session_state
+):
+    st.session_state.ultima_consulta = None
+
+
+# ============================================================
+# BOTÃO DE CONSULTA
+# ============================================================
+
+if st.sidebar.button(
+    "🔎 Gerar Consulta",
+    type="primary",
+    use_container_width=True,
+):
+
+    # --------------------------------------------------------
+    # ENDPOINT
+    # --------------------------------------------------------
+
+    endpoints = {
+
+        "Contratos":
+            f"{BASE_URL}/contratos",
+
+        "Atas de Registro de Preços":
+            f"{BASE_URL}/atas",
+
+        "Editais e Avisos de Contratações":
+            f"{BASE_URL}/contratacoes/publicacao",
+    }
+
+    endpoint = endpoints[
+        tipo_consulta
+    ]
+
+    # --------------------------------------------------------
+    # TAMANHO DA PÁGINA
+    # --------------------------------------------------------
+
+    if tipo_consulta == "Contratos":
+
+        tamanho_pagina = (
+            TAMANHO_PAGINA_CONTRATOS
+        )
+
+    elif (
+        tipo_consulta
+        == "Atas de Registro de Preços"
+    ):
+
+        tamanho_pagina = (
+            TAMANHO_PAGINA_ATAS
+        )
+
+    else:
+
+        tamanho_pagina = (
+            TAMANHO_PAGINA_EDITAIS
+        )
+
+    # --------------------------------------------------------
+    # PARÂMETROS BASE
+    # --------------------------------------------------------
+
+    params = {
+
+        "dataInicial":
+            data_inicio.strftime(
+                "%Y%m%d"
+            ),
+
+        "dataFinal":
+            data_fim.strftime(
+                "%Y%m%d"
+            ),
+
+        "pagina": 1,
+
+        "tamanhoPagina":
+            tamanho_pagina,
+    }
+
+    # --------------------------------------------------------
+    # EDITAIS
+    # --------------------------------------------------------
+
+    if (
+        tipo_consulta
+        == "Editais e Avisos de Contratações"
+    ):
+
+        params.update(
+            {
+                "codigoModalidadeContratacao":
+                    modalidade_codigo,
+
+                "uf":
+                    UF,
+
+                "codigoMunicipioIbge":
+                    CODIGO_IBGE_RIO_DAS_PEDRAS,
+
+                "cnpj":
+                    CNPJ_RIO_DAS_PEDRAS,
+            }
+        )
+
+    # --------------------------------------------------------
+    # CONTRATOS
+    # --------------------------------------------------------
+
+    elif tipo_consulta == "Contratos":
+
+        params[
+            "cnpjOrgao"
+        ] = CNPJ_RIO_DAS_PEDRAS
+
+    # --------------------------------------------------------
+    # ATAS
+    # --------------------------------------------------------
+
+    elif (
+        tipo_consulta
+        == "Atas de Registro de Preços"
+    ):
+
+        params[
+            "cnpj"
+        ] = CNPJ_RIO_DAS_PEDRAS
+
+    # --------------------------------------------------------
+    # EXECUÇÃO
+    # --------------------------------------------------------
+
+    st.session_state.df_resultado = None
+
+    try:
+
+        inicio_execucao = time.time()
+
+        with st.spinner(
+            "🔄 Consultando o PNCP. "
+            "Isso pode levar alguns segundos..."
+        ):
+
+            registros, paginas = (
+                executar_consulta(
+                    endpoint,
+                    params,
+                )
+            )
+
+        # ----------------------------------------------------
+        # DATAFRAME
+        # ----------------------------------------------------
+
+        df_temp = pd.DataFrame(
+            registros
+        )
+
+        df_temp = tratar_dataframe(
+            df_temp
+        )
+
+        # ----------------------------------------------------
+        # FILTRO DE SEGURANÇA
+        # ----------------------------------------------------
+
+        if (
+            tipo_consulta
+            == "Contratos"
+            and not df_temp.empty
+        ):
+
+            df_filtrado = (
+                filtrar_por_cnpj(
+                    df_temp,
+                    CNPJ_RIO_DAS_PEDRAS,
+                )
+            )
+
+            # Só substitui se realmente encontrou.
+            if not df_filtrado.empty:
+                df_temp = df_filtrado
+
+        # ----------------------------------------------------
+        # DUPLICIDADES
+        # ----------------------------------------------------
+
+        df_temp = remover_duplicidades(
+            df_temp
+        )
+
+        # ----------------------------------------------------
+        # SESSION
+        # ----------------------------------------------------
+
+        st.session_state.df_resultado = (
+            df_temp
+        )
+
+        st.session_state.paginas_consultadas = (
+            paginas
+        )
+
+        st.session_state.ultima_consulta = (
+            time.time() - inicio_execucao
+        )
+
+        # ----------------------------------------------------
+        # MENSAGEM
+        # ----------------------------------------------------
+
+        if df_temp.empty:
+
+            st.info(
+                "ℹ️ O PNCP não retornou registros "
+                "para os parâmetros selecionados."
+            )
+
+        else:
+
+            st.success(
+                f"✅ Consulta concluída. "
+                f"{len(df_temp)} registros encontrados "
+                f"em {paginas} página(s)."
+            )
+
+    except Exception as erro:
+
+        st.session_state.df_resultado = None
+
+        mensagem = str(
+            erro
+        )
+
+        if (
+            "Tamanho de página inválido"
+            in mensagem
+        ):
+
+            st.error(
+                "❌ O PNCP rejeitou o tamanho da página. "
+                "O código já utiliza limites específicos "
+                "por endpoint. Verifique se o PNCP alterou "
+                "as regras da API."
+            )
+
+        elif (
+            "timeout"
+            in mensagem.lower()
+        ):
+
+            st.error(
+                "❌ O PNCP demorou demais para responder."
+            )
+
+            st.info(
+                "💡 Tente novamente com um período menor. "
+                "O PNCP pode estar temporariamente lento."
+            )
+
+        else:
+
+            st.error(
+                f"❌ Erro na consulta ao PNCP:\n\n"
+                f"{mensagem}"
+            )
+
+
+# ============================================================
+# RESULTADO
+# ============================================================
+
+df = (
+    st.session_state.df_resultado
+)
+
+
+if (
+    df is not None
+    and not df.empty
+):
+
+    # ========================================================
+    # RESUMO
+    # ========================================================
+
     st.markdown("---")
+
+    st.subheader(
+        "📊 Resumo da Consulta"
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total de Registros",
+        len(df),
+    )
+
+    col2.metric(
+        "Páginas Consultadas",
+        st.session_state.paginas_consultadas,
+    )
+
+    if (
+        st.session_state.ultima_consulta
+        is not None
+    ):
+
+        tempo = (
+            st.session_state.ultima_consulta
+        )
+
+        col3.metric(
+            "Tempo da Consulta",
+            f"{tempo:.1f} s",
+        )
+
+    # ========================================================
+    # VALOR TOTAL
+    # ========================================================
+
+    coluna_valor = next(
+        (
+            coluna
+            for coluna in [
+                "valorGlobal",
+                "valorInicial",
+                "valorTotal",
+                "valorTotalHomologado",
+                "valorTotalEstimado",
+                "valorAta",
+                "valorContrato",
+            ]
+            if coluna in df.columns
+        ),
+        None,
+    )
+
+    if coluna_valor:
+
+        valores = (
+            df[coluna_valor]
+            .map(valor_numerico)
+        )
+
+        total_valor = (
+            valores
+            .fillna(0)
+            .sum()
+        )
+
+        st.metric(
+            "💰 Valor Total Encontrado",
+            formatar_moeda_br(
+                total_valor
+            ),
+        )
+
+    st.markdown("---")
+
+
+    # ========================================================
+    # EXPORTAÇÕES
+    # ========================================================
+
+    st.subheader(
+        "📥 Exportação dos Dados"
+    )
+
+    cols = st.columns(4)
+
+    nome_arquivo = (
+        tipo_consulta
+        .replace(
+            " ",
+            "_",
+        )
+        .replace(
+            "/",
+            "_",
+        )
+        .replace(
+            "ç",
+            "c",
+        )
+        .replace(
+            "ã",
+            "a",
+        )
+    )
+
+    # --------------------------------------------------------
+    # EXCEL
+    # --------------------------------------------------------
+
+    buffer_xlsx = io.BytesIO()
+
+    df.to_excel(
+        buffer_xlsx,
+        index=False,
+    )
+
+    cols[0].download_button(
+        "📊 Excel",
+        buffer_xlsx.getvalue(),
+        f"{nome_arquivo}_Rio_Das_Pedras.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        use_container_width=True,
+    )
+
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
+
+    csv_data = df.to_csv(
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    cols[1].download_button(
+        "📄 CSV",
+        csv_data,
+        f"{nome_arquivo}_Rio_Das_Pedras.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    # --------------------------------------------------------
+    # WORD
+    # --------------------------------------------------------
+
+    try:
+
+        word_bytes = gerar_word(
+            df,
+            tipo_consulta,
+            data_inicio,
+            data_fim,
+        )
+
+        cols[2].download_button(
+            "📝 Word",
+            word_bytes,
+            f"Relatorio_{nome_arquivo}.docx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            use_container_width=True,
+        )
+
+    except Exception as erro_word:
+
+        cols[2].error(
+            f"Erro Word: {erro_word}"
+        )
+
+    # --------------------------------------------------------
+    # PDF
+    # --------------------------------------------------------
+
+    try:
+
+        pdf_bytes = gerar_pdf(
+            df,
+            tipo_consulta,
+            data_inicio,
+            data_fim,
+        )
+
+        cols[3].download_button(
+            "📕 PDF",
+            pdf_bytes,
+            f"Relatorio_{nome_arquivo}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    except Exception as erro_pdf:
+
+        cols[3].error(
+            f"Erro PDF: {erro_pdf}"
+        )
 
 
     # ========================================================
@@ -1630,147 +2893,210 @@ if (
 
     if tipo_consulta == "Contratos":
 
-        st.markdown(
-            "### 🔍 Consultar Aditivos / "
-            "Documentos por Contrato"
+        st.markdown("---")
+
+        st.subheader(
+            "🔍 Aditivos / Termos do Contrato"
         )
 
-        lista_contratos = df.apply(
-            lambda x:
-                f"{x.get('numeroControlePNCP')} "
-                f"- Proc: {x.get('processo')}",
-            axis=1
-        ).tolist()
+        opcoes_contratos = []
 
-        contrato_selecionado = st.selectbox(
-            "Selecione um contrato:",
-            lista_contratos
-        )
-
-        numero_aditivo = st.text_input(
-            "Digite o número do aditivo (opcional):",
-            placeholder="Ex: 01/2026"
-        )
-
-        if st.button(
-            "Buscar Aditivos do Contrato"
+        for indice, (_, row) in enumerate(
+            df.iterrows()
         ):
 
-            id_escolhido = (
-                contrato_selecionado
-                .split(" - ")[0]
+            dados = obter_dados_registro(
+                row,
+                "Contratos",
             )
 
-            with st.spinner(
-                "Buscando aditivos no PNCP..."
+            identificacao = (
+                f"{dados['numero']} "
+                f"| Processo: "
+                f"{dados['processo']} "
+                f"| PNCP: "
+                f"{dados['id_pncp']}"
+            )
+
+            opcoes_contratos.append(
+                (
+                    indice,
+                    identificacao,
+                )
+            )
+
+        if opcoes_contratos:
+
+            mapa_contratos = {
+                texto: indice
+                for indice, texto
+                in opcoes_contratos
+            }
+
+            selecionado = st.selectbox(
+                "Selecione um contrato:",
+                list(
+                    mapa_contratos.keys()
+                ),
+            )
+
+            numero_aditivo = st.text_input(
+                "Número do aditivo (opcional):",
+                placeholder="Ex.: 01/2026",
+            )
+
+            if st.button(
+                "🔎 Buscar Termos / Aditivos",
+                use_container_width=True,
             ):
 
-                aditivos = (
-                    consultar_detalhes_contrato(
-                        id_escolhido
-                    )
+                indice = (
+                    mapa_contratos[
+                        selecionado
+                    ]
                 )
 
-                if aditivos:
+                row = df.iloc[
+                    indice
+                ]
 
-                    if numero_aditivo:
+                with st.spinner(
+                    "Consultando detalhes do contrato..."
+                ):
 
-                        aditivos = [
-                            d
-                            for d in aditivos
-                            if numero_aditivo
+                    documentos = (
+                        consultar_detalhes_contrato(
+                            row
+                        )
+                    )
+
+                if documentos:
+
+                    if numero_aditivo.strip():
+
+                        termo_busca = (
+                            numero_aditivo
+                            .strip()
+                            .lower()
+                        )
+
+                        documentos = [
+                            documento
+                            for documento
+                            in documentos
+                            if termo_busca
                             in str(
-                                d.get(
-                                    "numero",
-                                    ""
-                                )
-                            )
+                                documento
+                            ).lower()
                         ]
 
-                    if aditivos:
+                    if documentos:
 
                         st.success(
                             f"Encontrados "
-                            f"{len(aditivos)} "
-                            "documentos vinculados:"
+                            f"{len(documentos)} "
+                            f"documento(s)."
                         )
 
-                        for doc in aditivos:
+                        for documento in documentos:
 
-                            tipo_doc = doc.get(
-                                "tipoDocumentoNome",
-                                "Outro"
+                            tipo_doc = texto_valido(
+                                documento.get(
+                                    "tipoDocumentoNome"
+                                ),
+                                "Documento",
                             )
 
-                            num_doc = doc.get(
-                                "numero",
-                                "S/N"
+                            numero_doc = texto_valido(
+                                documento.get(
+                                    "numero"
+                                ),
+                                "S/N",
+                            )
+
+                            data_doc = formatar_data(
+                                documento.get(
+                                    "dataPublicacao"
+                                )
+                                or documento.get(
+                                    "dataPublicacaoPncp"
+                                )
+                                or documento.get(
+                                    "dataAssinatura"
+                                )
+                            )
+
+                            objeto_doc = texto_valido(
+                                documento.get(
+                                    "objeto"
+                                ),
+                                "",
                             )
 
                             st.info(
-                                f"**Tipo:** "
-                                f"{tipo_doc} | "
-                                f"**Nº:** "
-                                f"{num_doc} | "
-                                f"**Data:** "
-                                f"{doc.get('dataPublicacao', 'N/D')}"
-                                f"\n\n"
-                                f"{doc.get('objeto', '')}"
+                                f"**Tipo:** {tipo_doc}\n\n"
+                                f"**Número:** {numero_doc}\n\n"
+                                f"**Data:** {data_doc}\n\n"
+                                f"**Objeto:** {objeto_doc}"
                             )
 
                     else:
 
                         st.warning(
-                            "Nenhum aditivo encontrado "
-                            "com este número para este contrato."
+                            "Nenhum documento encontrado "
+                            "com o número informado."
                         )
 
                 else:
 
                     st.warning(
-                        "Nenhum documento/aditivo "
-                        "encontrado para este contrato."
+                        "Nenhum termo/aditivo foi encontrado "
+                        "ou os dados detalhados deste contrato "
+                        "não estão disponíveis no PNCP."
                     )
-
-        st.markdown("---")
 
 
     # ========================================================
     # GRÁFICOS
     # ========================================================
 
-    st.markdown(
-        "### 📈 Análise Gráfica"
+    st.markdown("---")
+
+    st.subheader(
+        "📈 Análise Gráfica"
     )
 
     coluna_data = next(
         (
-            c
-            for c in [
+            coluna
+            for coluna in [
                 "dataPublicacao",
                 "dataAssinatura",
                 "dataInclusao",
-                "dataPublicacaoPncp"
+                "dataPublicacaoPncp",
+                "dataAssinaturaAta",
+                "dataCelebracao",
             ]
-            if c in df.columns
+            if coluna in df.columns
         ),
-        None
+        None,
     )
 
     coluna_valor_grafico = next(
         (
-            c
-            for c in [
+            coluna
+            for coluna in [
                 "valorGlobal",
                 "valorInicial",
                 "valorTotal",
                 "valorTotalHomologado",
                 "valorTotalEstimado",
-                "valorAta"
+                "valorAta",
+                "valorContrato",
             ]
-            if c in df.columns
+            if coluna in df.columns
         ),
-        None
+        None,
     )
 
     if coluna_data:
@@ -1779,83 +3105,115 @@ if (
 
             df_grafico = df.copy()
 
-            df_grafico["mes_ano"] = (
-                pd.to_datetime(
-                    df_grafico[coluna_data],
-                    errors="coerce"
-                )
-                .dt
-                .to_period("M")
-                .astype(str)
+            df_grafico[
+                "data_grafico"
+            ] = pd.to_datetime(
+                df_grafico[
+                    coluna_data
+                ],
+                errors="coerce",
             )
 
-            aba1, aba2 = st.tabs(
-                [
-                    "🔢 Quantidade de Registros",
-                    "💰 Volume Financeiro (R$)"
-                ]
-            )
-
-            with aba1:
-
-                st.markdown(
-                    f"#### Quantidade de "
-                    f"{tipo_consulta} por Mês/Ano"
-                )
-
-                st.bar_chart(
-                    df_grafico[
-                        "mes_ano"
+            df_grafico = (
+                df_grafico
+                .dropna(
+                    subset=[
+                        "data_grafico"
                     ]
-                    .value_counts()
-                    .sort_index()
+                )
+            )
+
+            if not df_grafico.empty:
+
+                df_grafico[
+                    "mes_ano"
+                ] = (
+                    df_grafico[
+                        "data_grafico"
+                    ]
+                    .dt
+                    .to_period("M")
+                    .astype(str)
                 )
 
-            with aba2:
+                aba1, aba2 = st.tabs(
+                    [
+                        "🔢 Quantidade",
+                        "💰 Volume Financeiro",
+                    ]
+                )
 
-                if coluna_valor_grafico:
+                with aba1:
 
-                    st.markdown(
-                        f"#### Volume Financeiro de "
-                        f"{tipo_consulta} por Mês/Ano"
-                    )
-
-                    df_grafico[
-                        coluna_valor_grafico
-                    ] = pd.to_numeric(
+                    quantidade = (
                         df_grafico[
-                            coluna_valor_grafico
-                        ],
-                        errors="coerce"
-                    ).fillna(0)
-
-                    st.bar_chart(
-                        df_grafico
-                        .groupby("mes_ano")[
-                            coluna_valor_grafico
+                            "mes_ano"
                         ]
-                        .sum()
+                        .value_counts()
                         .sort_index()
                     )
 
-                else:
-
-                    st.info(
-                        "ℹ️ Dados financeiros "
-                        "indisponíveis."
+                    st.bar_chart(
+                        quantidade
                     )
 
-        except Exception as e:
+                with aba2:
+
+                    if coluna_valor_grafico:
+
+                        df_grafico[
+                            "_valor_grafico"
+                        ] = (
+                            df_grafico[
+                                coluna_valor_grafico
+                            ]
+                            .map(
+                                valor_numerico
+                            )
+                            .fillna(0)
+                        )
+
+                        financeiro = (
+                            df_grafico
+                            .groupby(
+                                "mes_ano"
+                            )[
+                                "_valor_grafico"
+                            ]
+                            .sum()
+                            .sort_index()
+                        )
+
+                        st.bar_chart(
+                            financeiro
+                        )
+
+                    else:
+
+                        st.info(
+                            "ℹ️ Não há coluna financeira "
+                            "compatível para gerar este gráfico."
+                        )
+
+            else:
+
+                st.info(
+                    "ℹ️ Não foram encontradas datas "
+                    "válidas para gerar o gráfico."
+                )
+
+        except Exception as erro:
 
             st.info(
-                f"ℹ️ Erro ao gerar gráficos: {e}"
+                f"ℹ️ Não foi possível gerar os gráficos: "
+                f"{erro}"
             )
 
     else:
 
         st.info(
-            "ℹ️ Coluna de data não encontrada "
-            "para gerar o gráfico."
+            "ℹ️ Não foi encontrada uma coluna de data "
+            "compatível com a análise gráfica."
         )
 
 
@@ -1863,14 +3221,16 @@ if (
     # TABELA
     # ========================================================
 
-    st.markdown(
-        "### 📋 Tabela de Dados Detalhada"
+    st.markdown("---")
+
+    st.subheader(
+        "📋 Tabela de Dados Detalhada"
     )
 
     st.dataframe(
         df,
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
     )
 
 
@@ -1886,5 +3246,23 @@ elif (
 
     st.warning(
         "⚠️ Nenhum registro encontrado para "
-        "Rio das Pedras/SP no período selecionado."
+        f"{NOME_MUNICIPIO} no período selecionado."
     )
+
+    st.info(
+        "💡 Verifique o período, a modalidade selecionada "
+        "e tente novamente. O PNCP pode eventualmente "
+        "retornar 204 quando não há registros."
+    )
+
+
+# ============================================================
+# RODAPÉ
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "Fonte: Portal Nacional de Contratações Públicas (PNCP) "
+    "— Consulta pública da API."
+)
