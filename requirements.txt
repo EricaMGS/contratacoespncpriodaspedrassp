@@ -5,3 +5,5 @@ xlsxwriter
 openpyxl
 python-docx
 fpdf
+plotly
+fpdf2
