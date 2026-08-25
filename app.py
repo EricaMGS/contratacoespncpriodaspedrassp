@@ -2,10 +2,11 @@ import io
 import datetime
 import time
 import re
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-import requests
+import httpx
 import streamlit as st
 import plotly.express as px
 
@@ -42,13 +43,12 @@ TAMANHO_PAGINA_ATAS = 100
 TAMANHO_PAGINA_EDITAIS = 50
 
 MAX_PAGINAS = 100
-MAX_TENTATIVAS = 4
-TIMEOUT_CONEXAO = 15
-TIMEOUT_LEITURA = 60
+TIMEOUT_HTTP = 25.0
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json",
+    "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
 }
 
@@ -267,86 +267,84 @@ def obter_identificador_contrato(row: Any) -> Tuple[Optional[str], Optional[int]
 
 
 # ============================================================
-# CLIENTE HTTP E PAGINAÇÃO
+# CLIENTE HTTP ASSÍNCRONO ULTRA RÁPIDO
 # ============================================================
 
-@st.cache_resource
-def criar_sessao_http():
-    sessao = requests.Session()
-    sessao.headers.update(HEADERS)
-    return sessao
+async def fetch_page(client: httpx.AsyncClient, url: str, params: Dict[str, Any], page_num: int) -> List[Dict[str, Any]]:
+    """Busca uma página individual de forma assíncrona com retry rápido."""
+    p = params.copy()
+    p["pagina"] = page_num
 
-
-def consultar_pncp(url: str, params: Dict[str, Any], max_tentativas: int = MAX_TENTATIVAS) -> Any:
-    sessao = criar_sessao_http()
-    ultimo_erro = None
-
-    for tentativa in range(1, max_tentativas + 1):
+    for tentativa in range(1, 4):
         try:
-            response = sessao.get(url, params=params, timeout=(TIMEOUT_CONEXAO, TIMEOUT_LEITURA))
-            if response.status_code == 200:
-                return response.json()
-            if response.status_code == 204:
+            resp = await client.get(url, params=p, timeout=TIMEOUT_HTTP)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict):
+                    for k in ("data", "items", "content", "dados", "registros"):
+                        if isinstance(data.get(k), list):
+                            return data[k]
+                elif isinstance(data, list):
+                    return data
                 return []
-            if response.status_code in (400, 422):
-                raise RuntimeError(f"Parâmetros rejeitados pelo PNCP (HTTP {response.status_code}).")
-            if response.status_code == 404:
-                raise RuntimeError("Endpoint ou recurso não encontrado no PNCP (HTTP 404).")
-
-            if tentativa < max_tentativas:
-                time.sleep(min(2 ** tentativa, 15))
+            if resp.status_code in (204, 404):
+                return []
+        except Exception:
+            if tentativa < 3:
+                await asyncio.sleep(0.2 * tentativa)
                 continue
-            raise RuntimeError(f"PNCP retornou HTTP {response.status_code}")
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            ultimo_erro = e
-            if tentativa < max_tentativas:
-                time.sleep(min(2 ** tentativa, 15))
-                continue
-            raise RuntimeError("Não foi possível obter resposta do PNCP após várias tentativas. Portal instável.") from ultimo_erro
+    return []
 
 
-def consultar_paginas(url: str, params: Dict[str, Any], max_paginas: int = MAX_PAGINAS) -> Tuple[List[Dict[str, Any]], int]:
-    todos_registros = []
-    pagina = 1
-    paginas_consultadas = 0
+async def consultar_pncp_turbo(url: str, params: Dict[str, Any], max_paginas: int = MAX_PAGINAS) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    1. Busca a página 1 para descobrir a quantidade total de páginas.
+    2. Dispara TODAS as páginas restantes simultaneamente em paralelo.
+    """
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=30)
+    async with httpx.AsyncClient(headers=HEADERS, limits=limits, timeout=TIMEOUT_HTTP) as client:
+        # Passo 1: Busca a página inicial
+        p1_params = params.copy()
+        p1_params["pagina"] = 1
 
-    while pagina <= max_paginas:
-        params_pagina = params.copy()
-        params_pagina["pagina"] = pagina
-        dados = consultar_pncp(url, params_pagina)
-        paginas_consultadas += 1
+        try:
+            resp = await client.get(url, params=p1_params)
+            if resp.status_code == 204 or resp.status_code != 200:
+                return [], 0
+            dados_p1 = resp.json()
+        except Exception:
+            return [], 0
 
-        registros = []
-        if isinstance(dados, dict):
+        registros_totais = []
+        if isinstance(dados_p1, dict):
             for k in ("data", "items", "content", "dados", "registros"):
-                if isinstance(dados.get(k), list):
-                    registros = dados[k]
+                if isinstance(dados_p1.get(k), list):
+                    registros_totais.extend(dados_p1[k])
                     break
-        elif isinstance(dados, list):
-            registros = dados
+            total_paginas = dados_p1.get("totalPaginas", 1)
+        elif isinstance(dados_p1, list):
+            registros_totais.extend(dados_p1)
+            total_paginas = 1
+        else:
+            total_paginas = 1
 
-        if not registros:
-            break
+        total_paginas = min(int(total_paginas or 1), max_paginas)
 
-        todos_registros.extend(registros)
+        # Passo 2: Disparo paralelo das páginas restantes
+        if total_paginas > 1:
+            tasks = [fetch_page(client, url, params, p) for p in range(2, total_paginas + 1)]
+            resultados = await asyncio.gather(*tasks)
+            for lote in resultados:
+                registros_totais.extend(lote)
 
-        if isinstance(dados, dict):
-            total_paginas = dados.get("totalPaginas")
-            if total_paginas and pagina >= int(total_paginas):
-                break
-
-        if len(registros) < int(params.get("tamanhoPagina", 50)):
-            break
-
-        pagina += 1
-        time.sleep(0.1)
-
-    return todos_registros, paginas_consultadas
+        return registros_totais, total_paginas
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def executar_consulta_cacheada(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_paginas: int) -> Tuple[List[Dict[str, Any]], int]:
-    return consultar_paginas(url, dict(params_tuple), max_paginas)
+    """Envoltório síncrono compatível com o cache nativo do Streamlit."""
+    params = dict(params_tuple)
+    return asyncio.run(consultar_pncp_turbo(url, params, max_paginas))
 
 
 def executar_consulta(url: str, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
@@ -360,18 +358,28 @@ def consultar_detalhes_contrato(row: Any) -> List[Dict[str, Any]]:
         return []
     url = f"{BASE_URL}/orgaos/{cnpj}/contratos/{ano}/{sequencial}"
     try:
-        contrato = consultar_pncp(url, {}, max_tentativas=2)
-        if not isinstance(contrato, dict):
-            return []
-        documentos = []
-        for chave, nome_padrao in [("termos", "Termo de Contrato"), ("termosAditivos", "Termo Aditivo"), ("termosApostilamentos", "Termo de Apostilamento"), ("historico", "Histórico")]:
-            lista = contrato.get(chave, [])
-            if isinstance(lista, list):
-                for item in lista:
-                    it = dict(item)
-                    it["tipoDocumentoNome"] = it.get("tipoDocumentoNome") or it.get("tipoTermoNome") or it.get("tipoEventoNome") or nome_padrao
-                    documentos.append(it)
-        return documentos
+        with httpx.Client(headers=HEADERS, timeout=15.0) as client:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                return []
+            contrato = resp.json()
+            if not isinstance(contrato, dict):
+                return []
+
+            documentos = []
+            for chave, nome_padrao in [
+                ("termos", "Termo de Contrato"),
+                ("termosAditivos", "Termo Aditivo"),
+                ("termosApostilamentos", "Termo de Apostilamento"),
+                ("historico", "Histórico")
+            ]:
+                lista = contrato.get(chave, [])
+                if isinstance(lista, list):
+                    for item in lista:
+                        it = dict(item)
+                        it["tipoDocumentoNome"] = it.get("tipoDocumentoNome") or it.get("tipoTermoNome") or it.get("tipoEventoNome") or nome_padrao
+                        documentos.append(it)
+            return documentos
     except Exception:
         return []
 
@@ -401,19 +409,18 @@ def gerar_word(df: pd.DataFrame, tipo_consulta: str, data_inicio, data_fim, moda
     doc.add_heading("Registros Selecionados", level=2)
 
     for idx, (_, row) in enumerate(df.head(150).iterrows(), start=1):
-        dados = obter_dados_registro(row, tipo_consulta)
         p = doc.add_paragraph()
-        r = p.add_run(f"Item #{idx:03d} - {dados['objeto'][:120]}...")
+        r = p.add_run(f"Item #{idx:03d} - {row['objeto'][:120]}...")
         r.bold = True
         r.font.size = Pt(10)
 
         tabela = doc.add_table(rows=0, cols=2)
         tabela.style = "Table Grid"
         itens = [
-            ("Número / ID PNCP", f"{dados['numero']} ({dados['id_pncp']})"),
-            ("Processo / Situação", f"{dados['processo']} | Status: {dados['situacao']}"),
-            ("Fornecedor / Documento", f"{dados['fornecedor']} ({dados['cnpj_fornecedor']})"),
-            ("Valor / Data", f"{dados['valor']} | Data: {dados['data_referencia']}"),
+            ("Número / ID PNCP", f"{row['numero']} ({row['id_pncp']})"),
+            ("Processo / Situação", f"{row['processo']} | Status: {row['situacao']}"),
+            ("Fornecedor / Documento", f"{row['fornecedor']} ({row['cnpj_fornecedor']})"),
+            ("Valor / Data", f"{row['valor']} | Data: {row['data_referencia']}"),
         ]
         for k, v in itens:
             row_cells = tabela.add_row().cells
@@ -440,11 +447,10 @@ def gerar_pdf(df: pd.DataFrame, tipo_consulta: str, data_inicio, data_fim, modal
     pdf.ln(5)
 
     for idx, (_, row) in enumerate(df.head(100).iterrows(), start=1):
-        dados = obter_dados_registro(row, tipo_consulta)
         pdf.set_font("Arial", "B", 9)
-        pdf.cell(0, 6, f"#{idx:03d} | Doc: {dados['numero']} | Valor: {dados['valor']}".encode("latin-1", "replace").decode("latin-1"), ln=True)
+        pdf.cell(0, 6, f"#{idx:03d} | Doc: {row['numero']} | Valor: {row['valor']}".encode("latin-1", "replace").decode("latin-1"), ln=True)
         pdf.set_font("Arial", size=8)
-        pdf.multi_cell(0, 4, f"Objeto: {dados['objeto']}\nFornecedor: {dados['fornecedor']} ({dados['cnpj_fornecedor']}) | Data: {dados['data_referencia']}".encode("latin-1", "replace").decode("latin-1"), border=1)
+        pdf.multi_cell(0, 4, f"Objeto: {row['objeto']}\nFornecedor: {row['fornecedor']} ({row['cnpj_fornecedor']}) | Data: {row['data_referencia']}".encode("latin-1", "replace").decode("latin-1"), border=1)
         pdf.ln(2)
 
     res = pdf.output(dest="S")
@@ -536,7 +542,7 @@ if btn_executar:
 
     try:
         t0 = time.time()
-        with st.spinner("Consultando dados oficiais no PNCP..."):
+        with st.spinner("Consultando dados oficiais no PNCP em paralelo..."):
             registros, paginas = executar_consulta(endpoints[tipo_consulta], params)
             df_bruto = pd.DataFrame([obter_dados_registro(r, tipo_consulta) for r in registros])
             if not df_bruto.empty:
@@ -565,7 +571,8 @@ if df is not None and not df.empty:
     kpi1.metric("Total de Registros", f"{len(df):,}")
     kpi2.metric("Montante Total", formatar_moeda_br(valor_total))
     kpi3.metric("Ticket Médio", formatar_moeda_br(ticket_medio))
-    kpi4.metric("Fornecedores Únicos", f"{fornecedores_unicos}")
+    tempo_exec = st.session_state.get("tempo_consulta", 0.0)
+    kpi4.metric("Tempo de Consulta", f"{tempo_exec:.2f} s")
 
     # ------------------ AUDITORIA: FRACIONAMENTO / DISPENSAS ------------------
     if tipo_consulta == "Editais e Avisos de Contratações" and modalidade_codigo == 8:
@@ -573,7 +580,7 @@ if df is not None and not df.empty:
         st.subheader("🚩 Trilha de Auditoria: Monitoramento de Dispensas")
         dispensas_fornecedor = df.groupby(["fornecedor", "cnpj_fornecedor"])["valor_num"].agg(["count", "sum"]).reset_index()
         dispensas_alerta = dispensas_fornecedor[(dispensas_fornecedor["count"] > 1) & (dispensas_fornecedor["fornecedor"] != "N/D")]
-        
+
         if not dispensas_alerta.empty:
             st.warning(f"⚠️ Atenção: Detectadas {len(dispensas_alerta)} empresas com múltiplas dispensas diretas no período selecionado.")
             st.dataframe(
@@ -587,7 +594,7 @@ if df is not None and not df.empty:
     # ------------------ VISUALIZAÇÃO GRÁFICA (PLOTLY) ------------------
     st.markdown("---")
     tab_graf1, tab_graf2 = st.tabs(["📊 Evolução Temporal e Status", "🏢 Top Fornecedores / Valores"])
-    
+
     with tab_graf1:
         df_plot = df.copy()
         df_plot["data_dt"] = pd.to_datetime(df_plot["data_referencia"], format="%d/%m/%Y", errors="coerce")
@@ -612,7 +619,7 @@ if df is not None and not df.empty:
     # ------------------ FILTROS EM MEMÓRIA & TABELA ------------------
     st.markdown("---")
     st.subheader("📋 Tabela Analítica de Contratações")
-    
+
     col_busca, _ = st.columns([2, 1])
     termo_busca = col_busca.text_input("🔍 Filtrar tabela por palavra-chave (Objeto, Fornecedor ou CNPJ):", placeholder="Digite para filtrar instantaneamente...")
 
@@ -671,7 +678,7 @@ if df is not None and not df.empty:
         st.subheader("🔍 Investigação de Aditivos e Histórico de Contrato")
         opcoes = [f"{r['numero']} | {r['fornecedor']} | PNCP: {r['id_pncp']}" for _, r in df.iterrows()]
         contrato_escolhido = st.selectbox("Selecione o contrato para auditar aditivos:", opcoes)
-        
+
         if st.button("Buscar Documentos e Termos Aditivos", use_container_width=True):
             idx_sel = opcoes.index(contrato_escolhido)
             row_sel = df.iloc[idx_sel]
