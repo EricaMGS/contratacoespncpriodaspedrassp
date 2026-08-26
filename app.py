@@ -1695,24 +1695,30 @@ def preparar_zip_documentos_pncp(
 
 
 # ============================================================
-# VARREDURA ANUAL DE DOCUMENTOS (EM LOTE)
+# VARREDURA ANUAL DE DOCUMENTOS (EM LOTE) - CORRIGIDA
 # ============================================================
 
 def listar_sequenciais_do_ano_pncp(cnpj: str, ano: int, tipo_recurso: str) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}/contratos" if tipo_recurso == "contrato" else f"{BASE_URL}/contratacoes/publicacao"
-    
-    params = {
-        "dataInicial": f"{ano}0101",
-        "dataFinal": f"{ano}1231",
-        "tamanhoPagina": 100,
-        "pagina": 1,
-    }
     if tipo_recurso == "contrato":
-        params["cnpjOrgao"] = cnpj
+        url = f"{BASE_URL}/contratos"
+        params = {
+            "cnpjOrgao": cnpj,
+            "dataInicial": f"{ano}0101",
+            "dataFinal": f"{ano}1231",
+            "tamanhoPagina": 100,
+            "pagina": 1,
+        }
     else:
-        params["cnpj"] = cnpj
-        params["uf"] = UF
-        params["codigoMunicipioIbge"] = CODIGO_IBGE_RIO_DAS_PEDRAS
+        url = f"{BASE_URL}/contratacoes/publicacao"
+        params = {
+            "cnpj": cnpj,
+            "uf": UF,
+            "codigoMunicipioIbge": CODIGO_IBGE_RIO_DAS_PEDRAS,
+            "dataInicial": f"{ano}0101",
+            "dataFinal": f"{ano}1231",
+            "tamanhoPagina": 50,
+            "pagina": 1,
+        }
 
     try:
         registros, _ = consultar_paginas(url, params, max_paginas=20)
