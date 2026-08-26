@@ -1694,9 +1694,170 @@ def preparar_zip_documentos_pncp(
     return zip_buffer.getvalue(), baixados, erros
 
 
+# ============================================================
+# VARREDURA ANUAL DE DOCUMENTOS (EM LOTE)
+# ============================================================
+
+def listar_sequenciais_do_ano_pncp(cnpj: str, ano: int, tipo_recurso: str) -> List[Dict[str, Any]]:
+    url = f"{BASE_URL}/contratos" if tipo_recurso == "contrato" else f"{BASE_URL}/contratacoes/publicacao"
+    
+    params = {
+        "dataInicial": f"{ano}0101",
+        "dataFinal": f"{ano}1231",
+        "tamanhoPagina": 100,
+        "pagina": 1,
+    }
+    if tipo_recurso == "contrato":
+        params["cnpjOrgao"] = cnpj
+    else:
+        params["cnpj"] = cnpj
+        params["uf"] = UF
+        params["codigoMunicipioIbge"] = CODIGO_IBGE_RIO_DAS_PEDRAS
+
+    try:
+        registros, _ = consultar_paginas(url, params, max_paginas=20)
+        return registros
+    except Exception:
+        return []
+
+
+def preparar_zip_anual_pncp(
+    cnpj: str,
+    ano: int,
+    tipo_recurso: str,
+) -> Tuple[bytes, int, int, List[str]]:
+    registros = listar_sequenciais_do_ano_pncp(cnpj, ano, tipo_recurso)
+    
+    zip_buffer = io.BytesIO()
+    total_baixados = 0
+    total_casos = len(registros)
+    erros = []
+    nomes_usados = set()
+
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for idx, reg in enumerate(registros, start=1):
+            if not isinstance(reg, dict):
+                continue
+
+            seq = reg.get("sequencialContrato") or reg.get("sequencial") or reg.get("sequencialCompra")
+            if not seq:
+                controle = reg.get("numeroControlePNCP") or reg.get("numeroControlePNCPCompra")
+                _, seq_extraido = extrair_ano_sequencial_controle(str(controle))
+                seq = seq_extraido
+
+            if not seq:
+                continue
+
+            try:
+                seq_int = int(seq)
+                documentos = consultar_documentos_pncp(
+                    cnpj=cnpj,
+                    ano=ano,
+                    sequencial=seq_int,
+                    tipo_recurso=tipo_recurso
+                )
+
+                for doc in documentos:
+                    if not isinstance(doc, dict):
+                        continue
+
+                    url_doc = montar_url_documento_pncp(doc, {"cnpj": cnpj, "ano": ano, "sequencial": seq_int, "tipo_recurso": tipo_recurso})
+                    if not url_doc:
+                        continue
+
+                    arquivo_bytes, nome_original = baixar_documento_pncp(
+                        url_doc,
+                        documento=doc,
+                        contexto={"cnpj": cnpj, "ano": ano, "sequencial": seq_int, "tipo_recurso": tipo_recurso}
+                    )
+                    
+                    titulo_seguro = nome_arquivo_seguro(nome_original or f"caso_{seq_int}_{doc.get('sequencialDocumento', 'doc')}")
+                    
+                    caminho_no_zip = f"caso_{seq_int}/{titulo_seguro}"
+                    base, ext = os.path.splitext(caminho_no_zip)
+                    candidato = caminho_no_zip
+                    contador = 2
+                    while candidato.lower() in nomes_usados:
+                        candidato = f"{base}_{contador}{ext}"
+                        contador += 1
+                    nomes_usados.add(candidato.lower())
+                    
+                    zf.writestr(candidato, arquivo_bytes)
+                    total_baixados += 1
+
+            except Exception as e:
+                erros.append(f"Caso {seq}: {e}")
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue(), total_baixados, total_casos, erros
+
+
 def renderizar_aba_arquivos_pncp():
     st.title("📥 Arquivos do PNCP")
-    st.markdown("Localize e baixe os **documentos publicados no PNCP** associados.")
+    st.markdown(
+        "Localize e baixe os **documentos publicados no PNCP** "
+        "associados a uma contratação, contrato ou Ata de Registro de Preços, "
+        "ou faça o **download em lote de todos os arquivos de um ano inteiro**."
+    )
+
+    modo_consulta = st.radio(
+        "Escolha o modo de operação:",
+        ["🔍 Consultar caso específico (por número/sequencial)", "📦 Baixar TODOS os arquivos de um ano inteiro em ZIP"],
+        horizontal=True
+    )
+
+    st.divider()
+
+    if modo_consulta == "📦 Baixar TODOS os arquivos de um ano inteiro em ZIP":
+        st.subheader("📦 Download em Lote por Ano")
+        st.info(
+            "💡 Esta opção varre todas as publicações do ano selecionado, "
+            "baixa todos os anexos disponíveis e os compacta em uma única estrutura de pastas."
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            tipo_lote = st.selectbox(
+                "Tipo de documento para o lote:",
+                ["📄 Editais / Contratações", "📑 Contratos / Empenhos"],
+                key="tipo_lote_anual"
+            )
+        with col_b:
+            ano_lote = st.number_input(
+                "Ano de referência",
+                min_value=2000,
+                max_value=datetime.date.today().year + 1,
+                value=datetime.date.today().year,
+                step=1,
+                key="ano_lote_anual"
+            )
+
+        tipo_recurso_lote = "contrato" if tipo_lote == "📑 Contratos / Empenhos" else "contratacao"
+
+        if st.button("🚀 Gerar e Baixar ZIP Anual", type="primary", use_container_width=True):
+            with st.spinner(f"Varrendo registros e baixando arquivos do ano {ano_lote}... Isso pode levar alguns minutos."):
+                zip_bytes, qtd_baixados, qtd_casos, erros_lote = preparar_zip_anual_pncp(
+                    CNPJ_RIO_DAS_PEDRAS, int(ano_lote), tipo_recurso_lote
+                )
+
+            if qtd_baixados > 0:
+                st.success(f"✅ Processo concluído! {qtd_baixados} arquivo(s) encontrado(s) em {qtd_casos} processo(s).")
+                nome_zip_anual = f"PNCP_{tipo_recurso_lote}_{ano_lote}_Completo.zip"
+                st.download_button(
+                    f"⬇️ Baixar Pacote Completo ({qtd_baixados} arquivos)",
+                    data=zip_bytes,
+                    file_name=nome_zip_anual,
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            else:
+                st.warning("⚠️ Nenhum arquivo foi encontrado para os parâmetros selecionados neste ano.")
+
+            if erros_lote:
+                with st.expander("Ver logs de avisos/erros da varredura"):
+                    for err in erros_lote[:20]:
+                        st.text(err)
+        return
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1741,8 +1902,10 @@ def renderizar_aba_arquivos_pncp():
         st.code(CNPJ_RIO_DAS_PEDRAS, language="text")
 
     tipo_recurso = (
-        "contrato" if tipo_arquivo == "📑 Contrato / Empenho"
-        else "ata" if tipo_arquivo == "📋 Ata de Registro de Preços"
+        "contrato"
+        if tipo_arquivo == "📑 Contrato / Empenho"
+        else "ata"
+        if tipo_arquivo == "📋 Ata de Registro de Preços"
         else "contratacao"
     )
 
@@ -1758,7 +1921,7 @@ def renderizar_aba_arquivos_pncp():
                 st.session_state["atas_pncp_chave"] = (int(ano), int(sequencial))
             except Exception as erro:
                 st.session_state["atas_pncp_disponiveis"] = None
-                st.error(f"❌ Não foi possível localizar as atas: {erro}")
+                st.error(f"❌ Erro ao localizar atas: {erro}")
 
         atas = st.session_state.get("atas_pncp_disponiveis")
         chave_atas = st.session_state.get("atas_pncp_chave")
@@ -1771,7 +1934,7 @@ def renderizar_aba_arquivos_pncp():
             return
 
         if not atas:
-            st.warning("ℹ️ Nenhuma Ata de Registro de Preços encontrada.")
+            st.warning("ℹ️ Nenhuma Ata de Registro de Preços vinculada encontrada.")
             return
 
         mapa_atas = {}
@@ -1803,7 +1966,7 @@ def renderizar_aba_arquivos_pncp():
 
     if st.button("🔎 Localizar arquivos no PNCP", type="primary", use_container_width=True):
         try:
-            with st.spinner("Consultando os documentos publicados..."):
+            with st.spinner("Consultando documentos..."):
                 documentos = consultar_documentos_pncp(
                     CNPJ_RIO_DAS_PEDRAS,
                     int(ano),
@@ -1836,29 +1999,28 @@ def renderizar_aba_arquivos_pncp():
 
     st.success(f"✅ {len(documentos)} documento(s) encontrado(s).")
 
-    if len(documentos) > 1:
-        if st.button(f"📦 Preparar ZIP com os {len(documentos)} documentos", type="primary", use_container_width=True):
-            with st.spinner("Baixando documentos..."):
-                zip_bytes, qtd_baixados, erros_zip = preparar_zip_documentos_pncp(documentos, contexto)
-            st.session_state["zip_documentos_pncp"] = zip_bytes
-            st.session_state["zip_qtd_documentos_pncp"] = qtd_baixados
-            st.session_state["zip_erros_documentos_pncp"] = erros_zip
+    if st.button(f"📦 Preparar ZIP com os {len(documentos)} documento(s) deste caso", type="primary", use_container_width=True):
+        with st.spinner("Baixando documentos..."):
+            zip_bytes, qtd_baixados, erros_zip = preparar_zip_documentos_pncp(documentos, contexto)
+        st.session_state["zip_documentos_pncp"] = zip_bytes
+        st.session_state["zip_qtd_documentos_pncp"] = qtd_baixados
+        st.session_state["zip_erros_documentos_pncp"] = erros_zip
 
-        zip_bytes = st.session_state.get("zip_documentos_pncp")
-        qtd_baixados = st.session_state.get("zip_qtd_documentos_pncp", 0)
-        erros_zip = st.session_state.get("zip_erros_documentos_pncp", [])
-        if zip_bytes:
-            nome_zip = nome_arquivo_seguro(f"PNCP_{tipo_recurso}_{contexto.get('ano')}_{contexto.get('sequencial')}_documentos.zip")
-            st.download_button(
-                f"⬇️ Baixar ZIP ({qtd_baixados} arquivo(s))",
-                data=zip_bytes,
-                file_name=nome_zip,
-                mime="application/zip",
-                use_container_width=True,
-            )
-            if erros_zip:
-                st.warning("⚠️ Alguns documentos não puderam ser baixados:\n" + "\n".join(f"- {e}" for e in erros_zip))
-        st.divider()
+    zip_bytes = st.session_state.get("zip_documentos_pncp")
+    qtd_baixados = st.session_state.get("zip_qtd_documentos_pncp", 0)
+    erros_zip = st.session_state.get("zip_erros_documentos_pncp", [])
+    if zip_bytes:
+        nome_zip = nome_arquivo_seguro(f"PNCP_{tipo_recurso}_{contexto.get('ano')}_{contexto.get('sequencial')}_documentos.zip")
+        st.download_button(
+            f"⬇️ Baixar ZIP ({qtd_baixados} arquivo(s))",
+            data=zip_bytes,
+            file_name=nome_zip,
+            mime="application/zip",
+            use_container_width=True,
+        )
+        if erros_zip:
+            st.warning("⚠️ Alguns documentos não puderam ser baixados:\n" + "\n".join(f"- {e}" for e in erros_zip))
+    st.divider()
 
     for i, documento in enumerate(documentos, start=1):
         if not isinstance(documento, dict):
