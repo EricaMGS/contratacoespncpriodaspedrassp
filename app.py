@@ -2388,6 +2388,41 @@ def consultar_documentos_pncp(
     return extrair_registros(resposta)
 
 
+def consultar_atas_da_contratacao_pncp(
+    cnpj: str,
+    ano: int,
+    sequencial_compra: int,
+) -> List[Dict[str, Any]]:
+    """
+    Lista as Atas de Registro de Preços vinculadas a uma contratação.
+
+    O PNCP exige o sequencial real da contratação e, depois, o
+    sequencial real da ata. Não é seguro assumir que a Ata seja sempre
+    sequencial 1. Esta função existe justamente para descobrir os
+    identificadores reais antes de consultar os documentos.
+    """
+    cnpj = normalizar_cnpj(cnpj)
+    if len(cnpj) != 14:
+        raise ValueError("CNPJ inválido. Informe 14 dígitos.")
+    if not ano or not sequencial_compra:
+        raise ValueError("Informe ano e sequencial da contratação válidos.")
+
+    url = (
+        f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
+        f"{int(ano)}/{int(sequencial_compra)}/atas"
+    )
+
+    resposta = consultar_endpoint_documentos_pncp(url)
+
+    if isinstance(resposta, dict):
+        for chave in ("atas", "data", "items", "content"):
+            valor = resposta.get(chave)
+            if isinstance(valor, list):
+                return valor
+
+    return extrair_registros(resposta)
+
+
 def obter_url_documento(documento: Dict[str, Any]) -> str:
     """Retorna a URL/URI de download informada pelo PNCP."""
     for campo in ("url", "uri", "URL", "URI"):
@@ -2522,11 +2557,11 @@ def renderizar_aba_arquivos_pncp():
         "Localize e baixe os **documentos publicados no PNCP** "
         "associados a uma contratação, contrato ou Ata de Registro de Preços."
     )
+
     st.info(
-        "💡 Esta aba consulta o serviço oficial de documentos do PNCP. "
-        "Para Editais/Avisos a rota é /compras/{ano}/{sequencial}/arquivos; "
-        "para Contratos é /contratos/{ano}/{sequencial}/arquivos; e para Atas "
-        "é /compras/{ano}/{sequencial}/atas/{sequencialAta}/arquivos."
+        "💡 **Importante:** no caso de Ata de Registro de Preços, o PNCP não permite "
+        "assumir que o sequencial da Ata seja 1. Primeiro o sistema consulta as atas "
+        "vinculadas à contratação e mostra somente as atas realmente existentes."
     )
 
     col1, col2 = st.columns(2)
@@ -2544,11 +2579,12 @@ def renderizar_aba_arquivos_pncp():
         controle = st.text_input(
             "Número de Controle PNCP (opcional)",
             placeholder="Ex.: 44826840000183-1-000123/2026",
-            help="Se informado no formato completo, ano e sequencial serão identificados automaticamente.",
+            help="Se informado no formato completo, ano e sequencial da contratação serão identificados automaticamente.",
             key="controle_arquivo_pncp",
         )
 
     ano_auto, seq_auto = extrair_ano_sequencial_controle(controle)
+
     col1, col2, col3 = st.columns(3)
     with col1:
         ano = st.number_input(
@@ -2566,20 +2602,11 @@ def renderizar_aba_arquivos_pncp():
             value=seq_auto or 1,
             step=1,
             key="sequencial_arquivo_pncp",
+            help="É o sequencial da contratação/contrato no PNCP. Para Ata, ele vem antes do sequencial da própria Ata.",
         )
     with col3:
-        if tipo_arquivo == "📋 Ata de Registro de Preços":
-            sequencial_ata = st.number_input(
-                "Sequencial da Ata",
-                min_value=1,
-                value=1,
-                step=1,
-                key="sequencial_ata_arquivo_pncp",
-            )
-        else:
-            sequencial_ata = None
-            st.markdown("**Órgão contratante**")
-            st.code(CNPJ_RIO_DAS_PEDRAS, language="text")
+        st.markdown("**Órgão proprietário**")
+        st.code(CNPJ_RIO_DAS_PEDRAS, language="text")
 
     tipo_recurso = (
         "contrato"
@@ -2589,6 +2616,136 @@ def renderizar_aba_arquivos_pncp():
         else "contratacao"
     )
 
+    # --------------------------------------------------------
+    # FLUXO ESPECIAL PARA ATAS
+    # --------------------------------------------------------
+    sequencial_ata = None
+
+    if tipo_recurso == "ata":
+        st.markdown("### 📋 Seleção da Ata")
+        st.caption(
+            "O sistema primeiro consulta as atas vinculadas à contratação. "
+            "Assim você não precisa adivinhar o sequencial da Ata."
+        )
+
+        if st.button(
+            "🔎 Localizar atas desta contratação",
+            type="secondary",
+            use_container_width=True,
+            key="buscar_atas_vinculadas_pncp",
+        ):
+            try:
+                with st.spinner("Consultando as atas vinculadas à contratação no PNCP..."):
+                    atas = consultar_atas_da_contratacao_pncp(
+                        CNPJ_RIO_DAS_PEDRAS,
+                        int(ano),
+                        int(sequencial),
+                    )
+                st.session_state["atas_pncp_disponiveis"] = atas
+                st.session_state["atas_pncp_chave"] = (int(ano), int(sequencial))
+                st.session_state["documentos_pncp"] = None
+            except Exception as erro:
+                st.session_state["atas_pncp_disponiveis"] = None
+                st.error(f"❌ Não foi possível localizar as atas: {erro}")
+
+        atas = st.session_state.get("atas_pncp_disponiveis")
+        chave_atas = st.session_state.get("atas_pncp_chave")
+
+        if chave_atas != (int(ano), int(sequencial)):
+            atas = None
+
+        if atas is None:
+            st.warning(
+                "⚠️ Primeiro clique em **Localizar atas desta contratação**. "
+                "O sistema irá buscar os sequenciais reais das atas no PNCP."
+            )
+            return
+
+        if not atas:
+            st.warning(
+                "ℹ️ O PNCP não retornou nenhuma Ata de Registro de Preços vinculada "
+                "a essa contratação. Verifique o ano e o sequencial da contratação."
+            )
+            return
+
+        opcoes_atas = []
+        mapa_atas = {}
+
+        for indice, ata in enumerate(atas, start=1):
+            if not isinstance(ata, dict):
+                continue
+
+            seq = (
+                ata.get("sequencialAta")
+                or ata.get("sequencial")
+            )
+            if seq is None:
+                continue
+
+            try:
+                seq_int = int(seq)
+            except Exception:
+                continue
+
+            numero_ata = texto_valido(
+                ata.get("numeroAtaRegistroPreco")
+                or ata.get("numeroAta"),
+                f"Ata {seq_int}",
+            )
+            objeto_ata = texto_valido(
+                ata.get("objetoCompra")
+                or ata.get("objeto"),
+                "Objeto não informado",
+            )
+            data_ata = formatar_data(
+                ata.get("dataPublicacaoPncp")
+                or ata.get("dataAssinatura")
+            )
+            controle_ata = texto_valido(
+                ata.get("numeroControle")
+                or ata.get("numeroControlePNCP"),
+                "N/D",
+            )
+
+            rotulo = (
+                f"Sequencial {seq_int} | {numero_ata} | "
+                f"Publicação: {data_ata}"
+            )
+            opcoes_atas.append(rotulo)
+            mapa_atas[rotulo] = {
+                "sequencial": seq_int,
+                "numero": numero_ata,
+                "objeto": objeto_ata,
+                "data": data_ata,
+                "controle": controle_ata,
+            }
+
+        if not mapa_atas:
+            st.warning(
+                "ℹ️ O PNCP retornou atas, mas não informou um sequencial válido para elas."
+            )
+            return
+
+        escolha_ata = st.selectbox(
+            "Selecione a Ata que deseja consultar",
+            list(mapa_atas.keys()),
+            key="ata_selecionada_pncp",
+        )
+
+        ata_selecionada = mapa_atas[escolha_ata]
+        sequencial_ata = ata_selecionada["sequencial"]
+
+        with st.container(border=True):
+            st.markdown(f"**Ata selecionada:** {ata_selecionada['numero']}")
+            st.write(f"**Sequencial da Ata:** {sequencial_ata}")
+            st.write(f"**Data:** {ata_selecionada['data']}")
+            st.write(f"**Objeto:** {ata_selecionada['objeto']}")
+            if ata_selecionada["controle"] != "N/D":
+                st.write(f"**Controle PNCP da Ata:** {ata_selecionada['controle']}")
+
+    # --------------------------------------------------------
+    # CONSULTA DOS DOCUMENTOS
+    # --------------------------------------------------------
     if st.button(
         "🔎 Localizar arquivos no PNCP",
         type="primary",
@@ -2602,14 +2759,22 @@ def renderizar_aba_arquivos_pncp():
                     int(ano),
                     int(sequencial),
                     tipo_recurso=tipo_recurso,
-                    sequencial_ata=int(sequencial_ata) if sequencial_ata else None,
+                    sequencial_ata=(
+                        int(sequencial_ata)
+                        if sequencial_ata is not None
+                        else None
+                    ),
                 )
             st.session_state["documentos_pncp"] = documentos
             st.session_state["documentos_pncp_contexto"] = {
                 "tipo": tipo_arquivo,
                 "ano": int(ano),
                 "sequencial": int(sequencial),
-                "sequencial_ata": int(sequencial_ata) if sequencial_ata else None,
+                "sequencial_ata": (
+                    int(sequencial_ata)
+                    if sequencial_ata is not None
+                    else None
+                ),
                 "cnpj": CNPJ_RIO_DAS_PEDRAS,
                 "tipo_recurso": tipo_recurso,
             }
@@ -2628,7 +2793,7 @@ def renderizar_aba_arquivos_pncp():
         st.warning(
             "ℹ️ Nenhum arquivo/documento foi retornado para os dados informados. "
             "Isso pode significar que não há anexos publicados ou que o registro "
-            "informado não possui documentos disponíveis na API."
+            "não possui documentos disponíveis na API."
         )
         return
 
@@ -2687,7 +2852,7 @@ def renderizar_aba_arquivos_pncp():
                             file_name=nome_download,
                             mime="application/octet-stream",
                             use_container_width=True,
-                            key=f"download_pncp_{contexto.get('ano')}_{contexto.get('sequencial')}_{sequencial_doc}_{i}",
+                            key=f"download_pncp_{contexto.get('ano')}_{contexto.get('sequencial')}_{contexto.get('sequencial_ata')}_{sequencial_doc}_{i}",
                         )
                     except Exception as erro:
                         st.error(f"Erro no download: {erro}")
@@ -2696,6 +2861,7 @@ def renderizar_aba_arquivos_pncp():
                             url_doc,
                             use_container_width=True,
                         )
+
 
 # ============================================================
 # TELA PRINCIPAL
