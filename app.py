@@ -1710,8 +1710,8 @@ def listar_sequenciais_do_ano_pncp(cnpj: str, ano: int, tipo_recurso: str) -> Li
         }
     else:
         url = f"{BASE_URL}/contratacoes/publicacao"
+        # O endpoint de publicações do PNCP exige obrigatoriamente UF e Código IBGE do município, sem o campo cnpj direto
         params = {
-            "cnpj": cnpj,
             "uf": UF,
             "codigoMunicipioIbge": CODIGO_IBGE_RIO_DAS_PEDRAS,
             "dataInicial": f"{ano}0101",
@@ -1743,6 +1743,11 @@ def preparar_zip_anual_pncp(
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for idx, reg in enumerate(registros, start=1):
             if not isinstance(reg, dict):
+                continue
+
+            # Filtro adicional de segurança para garantir que o registro pertence ao órgão correto (Rio das Pedras)
+            cnpj_reg = normalizar_cnpj(reg.get("cnpjOrgao") or reg.get("cnpj") or reg.get("cnpjCompra") or "")
+            if cnpj_reg and cnpj_reg != cnpj:
                 continue
 
             seq = reg.get("sequencialContrato") or reg.get("sequencial") or reg.get("sequencialCompra")
