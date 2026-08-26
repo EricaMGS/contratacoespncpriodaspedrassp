@@ -1,4 +1,5 @@
 import io
+import zipfile
 import datetime
 import time
 import re
@@ -2550,6 +2551,98 @@ def nome_arquivo_seguro(nome: str) -> str:
     return nome.strip("._") or "documento_pncp"
 
 
+
+def montar_url_documento_pncp(documento: Dict[str, Any], contexto: Dict[str, Any]) -> str:
+    """Obtém a URL do documento ou monta a URL oficial pelo sequencial."""
+    url = obter_url_documento(documento)
+    if url:
+        return url
+
+    seq_doc = documento.get("sequencialDocumento")
+    if not seq_doc:
+        return ""
+
+    cnpj = normalizar_cnpj(contexto.get("cnpj", CNPJ_RIO_DAS_PEDRAS))
+    ano = contexto.get("ano")
+    sequencial = contexto.get("sequencial")
+    tipo_recurso = contexto.get("tipo_recurso", "contratacao")
+    if not ano or not sequencial or len(cnpj) != 14:
+        return ""
+
+    if tipo_recurso == "contrato":
+        return (
+            f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/contratos/"
+            f"{int(ano)}/{int(sequencial)}/arquivos/{int(seq_doc)}"
+        )
+    if tipo_recurso == "ata":
+        seq_ata = contexto.get("sequencial_ata")
+        if not seq_ata:
+            return ""
+        return (
+            f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
+            f"{int(ano)}/{int(sequencial)}/atas/{int(seq_ata)}/"
+            f"arquivos/{int(seq_doc)}"
+        )
+    return (
+        f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
+        f"{int(ano)}/{int(sequencial)}/arquivos/{int(seq_doc)}"
+    )
+
+
+def preparar_zip_documentos_pncp(
+    documentos: List[Dict[str, Any]],
+    contexto: Dict[str, Any],
+) -> Tuple[bytes, int, List[str]]:
+    """Baixa todos os documentos retornados e cria um ZIP único."""
+    zip_buffer = io.BytesIO()
+    baixados = 0
+    erros = []
+    nomes_usados = set()
+
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i, documento in enumerate(documentos, start=1):
+            if not isinstance(documento, dict):
+                continue
+
+            titulo = texto_valido(
+                documento.get("titulo") or documento.get("nome"),
+                f"documento_{i}",
+            )
+            seq_doc = texto_valido(
+                documento.get("sequencialDocumento"),
+                str(i),
+            )
+            url_doc = montar_url_documento_pncp(documento, contexto)
+
+            if not url_doc:
+                erros.append(f"{titulo}: URL não disponível")
+                continue
+
+            try:
+                arquivo_bytes, nome_original = baixar_documento_pncp(
+                    url_doc,
+                    documento=documento,
+                    contexto=contexto,
+                )
+                nome = nome_arquivo_seguro(
+                    nome_original or f"documento_{seq_doc}"
+                )
+                base, ext = os.path.splitext(nome)
+                candidato = nome
+                contador = 2
+                while candidato.lower() in nomes_usados:
+                    candidato = f"{base}_{contador}{ext}"
+                    contador += 1
+                nomes_usados.add(candidato.lower())
+                zf.writestr(candidato, arquivo_bytes)
+                baixados += 1
+            except Exception as erro:
+                erros.append(f"{titulo}: {erro}")
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue(), baixados, erros
+
+
 def renderizar_aba_arquivos_pncp():
     """Interface da área dedicada aos arquivos/documentos do PNCP."""
     st.title("📥 Arquivos do PNCP")
@@ -2799,6 +2892,44 @@ def renderizar_aba_arquivos_pncp():
 
     st.success(f"✅ {len(documentos)} documento(s) encontrado(s).")
 
+    # Download coletivo: baixa TODOS os documentos retornados pelo PNCP.
+    if len(documentos) > 1:
+        if st.button(
+            f"📦 Preparar ZIP com os {len(documentos)} documentos",
+            type="primary",
+            use_container_width=True,
+            key="preparar_zip_documentos_pncp",
+        ):
+            with st.spinner(f"Baixando {len(documentos)} documentos do PNCP..."):
+                zip_bytes, qtd_baixados, erros_zip = preparar_zip_documentos_pncp(
+                    documentos, contexto
+                )
+            st.session_state["zip_documentos_pncp"] = zip_bytes
+            st.session_state["zip_qtd_documentos_pncp"] = qtd_baixados
+            st.session_state["zip_erros_documentos_pncp"] = erros_zip
+
+        zip_bytes = st.session_state.get("zip_documentos_pncp")
+        qtd_baixados = st.session_state.get("zip_qtd_documentos_pncp", 0)
+        erros_zip = st.session_state.get("zip_erros_documentos_pncp", [])
+        if zip_bytes:
+            nome_zip = nome_arquivo_seguro(
+                f"PNCP_{tipo_recurso}_{contexto.get('ano')}_{contexto.get('sequencial')}_documentos.zip"
+            )
+            st.download_button(
+                f"⬇️ Baixar ZIP ({qtd_baixados} arquivo(s))",
+                data=zip_bytes,
+                file_name=nome_zip,
+                mime="application/zip",
+                use_container_width=True,
+                key="download_zip_documentos_pncp",
+            )
+            if erros_zip:
+                st.warning(
+                    "⚠️ Alguns documentos não puderam ser baixados:\n"
+                    + "\n".join(f"- {e}" for e in erros_zip)
+                )
+        st.divider()
+
     for i, documento in enumerate(documentos, start=1):
         if not isinstance(documento, dict):
             continue
@@ -2819,7 +2950,7 @@ def renderizar_aba_arquivos_pncp():
             documento.get("sequencialDocumento"),
             str(i),
         )
-        url_doc = obter_url_documento(documento)
+        url_doc = montar_url_documento_pncp(documento, contexto)
 
         with st.container(border=True):
             c1, c2 = st.columns([4, 1])
