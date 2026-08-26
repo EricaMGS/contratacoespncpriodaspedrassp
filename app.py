@@ -33,6 +33,9 @@ CODIGO_IBGE_RIO_DAS_PEDRAS = "3544004"
 UF = "SP"
 
 BASE_URL = "https://pncp.gov.br/api/consulta/v1"
+# APIs de consulta e de documentos usam bases diferentes no PNCP.
+# A documentação oficial usa /api/pncp para os serviços de documentos.
+BASE_DOCUMENTOS_URL = "https://pncp.gov.br/api/pncp/v1"
 
 NOME_MUNICIPIO = "Rio das Pedras/SP"
 NOME_PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
@@ -2256,6 +2259,87 @@ def extrair_ano_sequencial_controle(controle: str):
     return None, None
 
 
+def consultar_endpoint_documentos_pncp(url: str) -> Any:
+    """Consulta a API de documentos do PNCP com cabeçalhos próprios.
+
+    A API de documentos não deve usar a mesma rotina da API de consulta,
+    porque são bases/serviços distintos e o serviço de documentos aceita
+    GET sem payload.
+    """
+    sessao = criar_sessao_http()
+    headers = {
+        **HEADERS,
+        "Accept": "*/*",
+    }
+
+    ultimo_erro = None
+
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        try:
+            response = sessao.get(
+                url,
+                headers=headers,
+                timeout=(TIMEOUT_CONEXAO, TIMEOUT_LEITURA),
+                allow_redirects=True,
+            )
+
+            if response.status_code == 200:
+                if not response.content:
+                    return []
+                try:
+                    return response.json()
+                except ValueError as erro:
+                    raise RuntimeError(
+                        "O serviço de documentos do PNCP respondeu HTTP 200, "
+                        "mas não retornou JSON válido."
+                    ) from erro
+
+            if response.status_code == 204:
+                return []
+
+            if response.status_code == 404:
+                raise RuntimeError(
+                    "O registro informado não foi localizado no serviço de documentos "
+                    "do PNCP (HTTP 404). Verifique o ano, o sequencial e o CNPJ do "
+                    "órgão proprietário da contratação. "
+                    f"Endpoint consultado: {url}"
+                )
+
+            if response.status_code in (400, 422):
+                detalhe = mensagem_erro_http(response)
+                raise RuntimeError(
+                    f"Parâmetros rejeitados pelo serviço de documentos do PNCP "
+                    f"(HTTP {response.status_code}): {detalhe}"
+                )
+
+            if response.status_code in (408, 429, 500, 502, 503, 504):
+                ultimo_erro = RuntimeError(
+                    f"Serviço de documentos PNCP HTTP {response.status_code}: "
+                    f"{mensagem_erro_http(response)}"
+                )
+                if tentativa < MAX_TENTATIVAS:
+                    time.sleep(min(2 ** tentativa, 20))
+                    continue
+                raise ultimo_erro
+
+            raise RuntimeError(
+                f"Serviço de documentos do PNCP retornou HTTP "
+                f"{response.status_code}: {mensagem_erro_http(response)}"
+            )
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as erro:
+            ultimo_erro = erro
+            if tentativa < MAX_TENTATIVAS:
+                time.sleep(min(2 ** tentativa, 20))
+                continue
+            raise RuntimeError(
+                "Não foi possível acessar o serviço de documentos do PNCP "
+                "após várias tentativas."
+            ) from erro
+
+    raise RuntimeError("Falha inesperada ao consultar documentos do PNCP.") from ultimo_erro
+
+
 def consultar_documentos_pncp(
     cnpj: str,
     ano: int,
@@ -2263,7 +2347,12 @@ def consultar_documentos_pncp(
     tipo_recurso: str = "contratacao",
     sequencial_ata: Optional[int] = None,
 ):
-    """Consulta os documentos publicados para contratação, contrato ou ata."""
+    """
+    Consulta os documentos publicados para contratação, contrato ou ata.
+
+    IMPORTANTE: os endpoints de documentos pertencem à API de serviços
+    do PNCP (/api/pncp/v1), e não à API de consulta (/api/consulta/v1).
+    """
     cnpj = normalizar_cnpj(cnpj)
     if len(cnpj) != 14:
         raise ValueError("CNPJ inválido. Informe 14 dígitos.")
@@ -2272,24 +2361,24 @@ def consultar_documentos_pncp(
 
     if tipo_recurso == "contrato":
         url = (
-            f"{BASE_URL}/orgaos/{cnpj}/contratos/"
+            f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/contratos/"
             f"{int(ano)}/{int(sequencial)}/arquivos"
         )
     elif tipo_recurso == "ata":
         if not sequencial_ata:
             raise ValueError("Informe o sequencial da Ata.")
         url = (
-            f"{BASE_URL}/orgaos/{cnpj}/compras/"
+            f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
             f"{int(ano)}/{int(sequencial)}/atas/"
             f"{int(sequencial_ata)}/arquivos"
         )
     else:
         url = (
-            f"{BASE_URL}/orgaos/{cnpj}/compras/"
+            f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
             f"{int(ano)}/{int(sequencial)}/arquivos"
         )
 
-    resposta = consultar_pncp(url, {}, max_tentativas=MAX_TENTATIVAS)
+    resposta = consultar_endpoint_documentos_pncp(url)
 
     if isinstance(resposta, dict):
         documentos = resposta.get("documentos")
@@ -2308,36 +2397,104 @@ def obter_url_documento(documento: Dict[str, Any]) -> str:
     return ""
 
 
-def baixar_documento_pncp(url: str) -> Tuple[bytes, str]:
-    """Baixa o arquivo binário publicado pelo PNCP."""
-    if not url:
-        raise ValueError("O PNCP não forneceu uma URL para este documento.")
+def baixar_documento_pncp(
+    url: str,
+    documento: Optional[Dict[str, Any]] = None,
+    contexto: Optional[Dict[str, Any]] = None,
+) -> Tuple[bytes, str]:
+    """
+    Baixa o arquivo publicado pelo PNCP.
+
+    Primeiro utiliza a URL devolvida pelo PNCP. Quando ela não existe,
+    monta o endpoint oficial de consulta do documento específico usando
+    sequencialDocumento + contexto da contratação/contrato/ata.
+    """
+    documento = documento or {}
+    contexto = contexto or {}
+
+    url_final = (url or "").strip()
+
+    if not url_final:
+        seq_doc = documento.get("sequencialDocumento")
+        cnpj = normalizar_cnpj(contexto.get("cnpj", CNPJ_RIO_DAS_PEDRAS))
+        ano = contexto.get("ano")
+        sequencial = contexto.get("sequencial")
+        tipo_recurso = contexto.get("tipo_recurso", "contratacao")
+
+        if not seq_doc or not ano or not sequencial or len(cnpj) != 14:
+            raise ValueError(
+                "O PNCP não forneceu uma URL e não há dados suficientes "
+                "para montar o endereço do documento."
+            )
+
+        if tipo_recurso == "contrato":
+            url_final = (
+                f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/contratos/"
+                f"{int(ano)}/{int(sequencial)}/arquivos/{int(seq_doc)}"
+            )
+        elif tipo_recurso == "ata":
+            seq_ata = contexto.get("sequencial_ata")
+            if not seq_ata:
+                raise ValueError("Sequencial da Ata não informado.")
+            url_final = (
+                f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
+                f"{int(ano)}/{int(sequencial)}/atas/{int(seq_ata)}/"
+                f"arquivos/{int(seq_doc)}"
+            )
+        else:
+            url_final = (
+                f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
+                f"{int(ano)}/{int(sequencial)}/arquivos/{int(seq_doc)}"
+            )
 
     sessao = criar_sessao_http()
-    response = sessao.get(
-        url,
-        timeout=(TIMEOUT_CONEXAO, TIMEOUT_LEITURA),
-        allow_redirects=True,
-        headers={**HEADERS, "Accept": "*/*"},
-    )
+
+    try:
+        response = sessao.get(
+            url_final,
+            timeout=(TIMEOUT_CONEXAO, TIMEOUT_LEITURA),
+            allow_redirects=True,
+            headers={**HEADERS, "Accept": "*/*"},
+        )
+    except requests.RequestException as erro:
+        raise RuntimeError(
+            f"Falha de conexão ao baixar o documento: {erro}"
+        ) from erro
 
     if response.status_code != 200:
         detalhe = mensagem_erro_http(response)
         raise RuntimeError(
-            f"Não foi possível baixar o arquivo. HTTP {response.status_code}: {detalhe}"
+            f"Não foi possível baixar o arquivo. "
+            f"HTTP {response.status_code}: {detalhe}"
         )
 
-    nome = "documento_pncp"
-    content_disposition = response.headers.get("Content-Disposition", "")
+    nome = texto_valido(
+        documento.get("titulo"),
+        "documento_pncp",
+    )
+
+    content_disposition = response.headers.get(
+        "Content-Disposition", ""
+    )
+
     match = re.search(
         r"filename\*?=(?:UTF-8'' )?[\"']?([^\"';]+)",
         content_disposition,
         flags=re.IGNORECASE,
     )
+
     if match:
         nome = match.group(1).strip()
 
-    content_type = response.headers.get("Content-Type", "").lower().split(";")[0].strip()
+    nome = nome_arquivo_seguro(nome)
+
+    content_type = (
+        response.headers.get("Content-Type", "")
+        .lower()
+        .split(";")[0]
+        .strip()
+    )
+
     if "." not in nome:
         extensoes = {
             "application/pdf": ".pdf",
@@ -2346,6 +2503,7 @@ def baixar_documento_pncp(url: str) -> Tuple[bytes, str]:
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
             "application/vnd.ms-excel": ".xls",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+            "text/plain": ".txt",
         }
         nome += extensoes.get(content_type, ".bin")
 
@@ -2365,8 +2523,10 @@ def renderizar_aba_arquivos_pncp():
         "associados a uma contratação, contrato ou Ata de Registro de Preços."
     )
     st.info(
-        "💡 A API oficial do PNCP disponibiliza, quando cadastrados, "
-        "título, tipo de documento, data de publicação e URL/URI para download."
+        "💡 Esta aba consulta o serviço oficial de documentos do PNCP. "
+        "Para Editais/Avisos a rota é /compras/{ano}/{sequencial}/arquivos; "
+        "para Contratos é /contratos/{ano}/{sequencial}/arquivos; e para Atas "
+        "é /compras/{ano}/{sequencial}/atas/{sequencialAta}/arquivos."
     )
 
     col1, col2 = st.columns(2)
@@ -2450,6 +2610,8 @@ def renderizar_aba_arquivos_pncp():
                 "ano": int(ano),
                 "sequencial": int(sequencial),
                 "sequencial_ata": int(sequencial_ata) if sequencial_ata else None,
+                "cnpj": CNPJ_RIO_DAS_PEDRAS,
+                "tipo_recurso": tipo_recurso,
             }
         except Exception as erro:
             st.session_state["documentos_pncp"] = None
@@ -2511,7 +2673,11 @@ def renderizar_aba_arquivos_pncp():
                 if url_doc:
                     try:
                         with st.spinner("Preparando arquivo..."):
-                            arquivo_bytes, nome_original = baixar_documento_pncp(url_doc)
+                            arquivo_bytes, nome_original = baixar_documento_pncp(
+                                url_doc,
+                                documento=documento,
+                                contexto=contexto,
+                            )
                         nome_download = nome_arquivo_seguro(
                             nome_original or f"PNCP_documento_{sequencial_doc}"
                         )
