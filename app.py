@@ -45,7 +45,7 @@ TAMANHO_PAGINA_ATAS = 100
 TAMANHO_PAGINA_EDITAIS = 50
 
 # Parâmetros de otimização de velocidade e segurança
-MAX_PAGINAS_SEGURO = 5  # Otimizado para retorno mais rápido
+MAX_PAGINAS_SEGURO = 5 
 MAX_TENTATIVAS = 3
 TIMEOUT_CONEXAO = 10
 TIMEOUT_LEITURA = 30
@@ -219,7 +219,6 @@ def consultar_pncp(url: str, params: Dict[str, Any], max_tentativas: int = MAX_T
     raise RuntimeError("Falha de comunicação com o PNCP.") from ultimo_erro
 
 
-# Função de requisição individual para paralelização por página
 def _buscar_pagina_isolada(url: str, params_base: Dict[str, Any], pagina: int) -> List[Dict[str, Any]]:
     p_params = params_base.copy()
     p_params["pagina"] = pagina
@@ -232,10 +231,6 @@ def _buscar_pagina_isolada(url: str, params_base: Dict[str, Any], pagina: int) -
 
 @st.cache_data(ttl=900, show_spinner=False)
 def consultar_paginas_paralelo(url: str, params: Dict[str, Any], max_paginas: int = MAX_PAGINAS_SEGURO) -> List[Dict[str, Any]]:
-    """
-    Busca páginas simultaneamente usando ThreadPoolExecutor + Cache de 15 minutos.
-    Acelera o retorno em até 4x comparado ao método sequencial.
-    """
     primeira_pagina = _buscar_pagina_isolada(url, params, 1)
     if not primeira_pagina:
         return []
@@ -457,6 +452,7 @@ if data_fim < data_inicio:
     st.stop()
 
 if st.sidebar.button("🔎 Executar Varredura e Análise", type="primary", use_container_width=True):
+    # Rota unificada focada em publicações municipais para evitar retornos vazios em branco
     endpoints = {
         "Contratos": f"{BASE_URL}/contratos",
         "Atas de Registro de Preços": f"{BASE_URL}/atas",
@@ -469,15 +465,13 @@ if st.sidebar.button("🔎 Executar Varredura e Análise", type="primary", use_c
         "dataInicial": data_inicio.strftime("%Y%m%d"),
         "dataFinal": data_fim.strftime("%Y%m%d"),
         "tamanhoPagina": tamanho_pag,
+        "cnpj": CNPJ_RIO_DAS_PEDRAS,
+        "uf": UF,
+        "codigoIbge": CODIGO_IBGE_RIO_DAS_PEDRAS
     }
     
     if tipo_consulta == "Contratos":
         params["cnpjOrgao"] = CNPJ_RIO_DAS_PEDRAS
-    elif tipo_consulta == "Atas de Registro de Preços":
-        params["cnpj"] = CNPJ_RIO_DAS_PEDRAS
-    else:
-        params["cnpj"] = CNPJ_RIO_DAS_PEDRAS
-        params["codigoIbge"] = CODIGO_IBGE_RIO_DAS_PEDRAS
 
     try:
         with st.spinner("Extraindo dados do PNCP em paralelo e aplicando motores de IA..."):
@@ -490,7 +484,25 @@ if st.sidebar.button("🔎 Executar Varredura e Análise", type="primary", use_c
                 df_processado = executar_modelo_ml_anomalias(df_processado)
                 st.session_state.df_resultado = df_processado
             else:
-                st.session_state.df_resultado = pd.DataFrame()
+                # Fallback de segurança: se a rota específica retornar vazia, busca no endpoint geral de publicações do município
+                endpoint_fallback = f"{BASE_URL}/contratacoes/publicacao"
+                params_fallback = {
+                    "dataInicial": data_inicio.strftime("%Y%m%d"),
+                    "dataFinal": data_fim.strftime("%Y%m%d"),
+                    "cnpj": CNPJ_RIO_DAS_PEDRAS,
+                    "uf": UF,
+                    "codigoIbge": CODIGO_IBGE_RIO_DAS_PEDRAS,
+                    "tamanhoPagina": 50
+                }
+                registros_fb = consultar_paginas_paralelo(endpoint_fallback, params_fallback)
+                if registros_fb:
+                    df_temp_fb = pd.DataFrame(registros_fb)
+                    lista_proc_fb = [extrair_dados_padrao(row, tipo_consulta) for _, row in df_temp_fb.iterrows()]
+                    df_processado_fb = pd.DataFrame(lista_proc_fb)
+                    df_processado_fb = executar_modelo_ml_anomalias(df_processado_fb)
+                    st.session_state.df_resultado = df_processado_fb
+                else:
+                    st.session_state.df_resultado = pd.DataFrame()
     except Exception as e:
         st.error(f"❌ Erro na execução: {e}")
 
