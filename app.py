@@ -209,6 +209,13 @@ def consultar_pncp(
         raise RuntimeError("Tempo limite excedido ao consultar o PNCP.") from erro
     except requests.ConnectionError as erro:
         raise RuntimeError("Não foi possível conectar ao PNCP.") from erro
+    except requests.RequestException as erro:
+        # Cobre qualquer outra falha de rede/HTTP não prevista explicitamente
+        # acima (ex.: erro de SSL, redirecionamento inválido, etc.), para que
+        # a página nunca quebre com um traceback bruto para o usuário.
+        raise RuntimeError(
+            f"Falha inesperada de comunicação com o PNCP: {erro}"
+        ) from erro
     if resposta.status_code == 204:
         return {"data": [], "totalPaginas": 0}
     if resposta.status_code != 200:
@@ -330,7 +337,65 @@ def consultar_todas_paginas(
 
 
 # ============================================================
-# 5. NORMALIZAÇÃO DE REGISTROS POR MÓDULO
+# 5. FILTRO DE SEGURANÇA POR ÓRGÃO (CNPJ)
+# ============================================================
+#
+# CORREÇÃO IMPORTANTE: o endpoint /contratacoes/publicacao retorna
+# registros de TODOS os órgãos do Brasil para a modalidade/período
+# pesquisados — ele não filtra por CNPJ do órgão. A versão anterior
+# deste arquivo tinha um laço que aparentava filtrar por CNPJ, mas
+# não fazia nenhuma comparação de fato (copiava tudo sem checar),
+# o que podia expor contratações de OUTROS municípios como se
+# fossem de Rio das Pedras/SP. As funções abaixo implementam o
+# filtro de verdade e são aplicadas a todos os módulos, inclusive
+# Contratos e Atas, como camada extra de segurança caso o filtro
+# do lado do servidor falhe silenciosamente.
+
+def extrair_cnpj_orgao_registro(registro: Dict[str, Any]) -> str:
+    candidatos: List[Any] = [
+        registro.get("cnpjOrgao"),
+        registro.get("cnpj"),
+    ]
+    orgao_entidade = registro.get("orgaoEntidade")
+    if isinstance(orgao_entidade, dict):
+        candidatos.append(orgao_entidade.get("cnpj"))
+    unidade_orgao = registro.get("unidadeOrgao")
+    if isinstance(unidade_orgao, dict):
+        candidatos.append(unidade_orgao.get("cnpj"))
+        orgao_aninhado = unidade_orgao.get("orgaoEntidade")
+        if isinstance(orgao_aninhado, dict):
+            candidatos.append(orgao_aninhado.get("cnpj"))
+    for candidato in candidatos:
+        documento = normalizar_documento(candidato)
+        if documento:
+            return documento
+    return ""
+
+def filtrar_registros_por_orgao(
+    registros: List[Dict[str, Any]],
+    cnpj_esperado: str,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Mantém apenas registros cujo CNPJ do órgão bate com o esperado.
+
+    Registros em que não foi possível identificar o CNPJ do órgão são
+    mantidos (para não perder dados silenciosamente), mas contados à
+    parte para que a interface avise o usuário sobre a incerteza.
+    """
+    filtrados: List[Dict[str, Any]] = []
+    sem_identificacao = 0
+    for registro in registros:
+        cnpj_registro = extrair_cnpj_orgao_registro(registro)
+        if not cnpj_registro:
+            sem_identificacao += 1
+            filtrados.append(registro)
+            continue
+        if cnpj_registro == cnpj_esperado:
+            filtrados.append(registro)
+    return filtrados, sem_identificacao
+
+
+# ============================================================
+# 6. NORMALIZAÇÃO DE REGISTROS POR MÓDULO
 # ============================================================
 
 CAMPOS_POR_TIPO = {
@@ -538,7 +603,7 @@ def normalizar_registros(
 
 
 # ============================================================
-# 6. AVALIAÇÃO DE RISCO COERENTE
+# 7. AVALIAÇÃO DE RISCO COERENTE
 # ============================================================
 
 def calcular_referencia_historica(
@@ -648,7 +713,7 @@ def avaliar_risco_contratacao(
 
 
 # ============================================================
-# 7. MODELO DE ANOMALIAS ROBUSTO (ISOLATION FOREST)
+# 8. MODELO DE ANOMALIAS ROBUSTO (ISOLATION FOREST)
 # ============================================================
 
 def executar_modelo_ml_anomalias(
@@ -701,7 +766,7 @@ def executar_modelo_ml_anomalias(
 
 
 # ============================================================
-# 8. GERAÇÃO DE PAPEL DE TRABALHO DE AUDITORIA (WORD)
+# 9. GERAÇÃO DE PAPEL DE TRABALHO DE AUDITORIA (WORD)
 # ============================================================
 
 def adicionar_item_documento(
@@ -824,7 +889,7 @@ def gerar_papel_trabalho_auditoria_word(
 
 
 # ============================================================
-# 9. CONSULTA DE MODALIDADES SEM OMISSÃO
+# 10. CONSULTA DE MODALIDADES SEM OMISSÃO
 # ============================================================
 
 MODALIDADES = {
@@ -848,7 +913,8 @@ def consultar_registros(
     data_inicio: datetime.date,
     data_fim: datetime.date,
     modalidades: Optional[Sequence[int]] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Retorna (registros_do_orgao, quantidade_sem_cnpj_identificado)."""
     parametros_base = {
         "dataInicial": data_inicio.strftime("%Y%m%d"),
         "dataFinal": data_fim.strftime("%Y%m%d"),
@@ -860,19 +926,26 @@ def consultar_registros(
             **parametros_base,
             "cnpjOrgao": CNPJ_ORGAO,
         }
-        return consultar_todas_paginas(
+        brutos = consultar_todas_paginas(
             f"{BASE_URL}/contratos",
             parametros,
         )
+        return filtrar_registros_por_orgao(brutos, CNPJ_ORGAO)
+
     if tipo == "Atas de Registro de Preços":
         parametros = {
             **parametros_base,
             "cnpj": CNPJ_ORGAO,
         }
-        return consultar_todas_paginas(
+        brutos = consultar_todas_paginas(
             f"{BASE_URL}/atas",
             parametros,
         )
+        return filtrar_registros_por_orgao(brutos, CNPJ_ORGAO)
+
+    # "Editais e Avisos de Contratações": o endpoint de publicação NÃO
+    # aceita filtro por CNPJ do órgão, então a filtragem abaixo é a
+    # única barreira contra misturar contratações de outros municípios.
     resultados: List[Dict[str, Any]] = []
     for codigo_modalidade in modalidades or (6, 8, 9):
         parametros = {
@@ -886,15 +959,11 @@ def consultar_registros(
             )
         )
         time.sleep(0.15)
-    
-    # Filtro adicional de segurança por CNPJ para garantir que o município correto seja isolado
-    resultados_filtrados = []
-    for reg in resultados:
-        cnpj_retornado = normalizar_documento(
-            reg.get("cnpjOrgao") or reg.get("cnpj") or obter_primeiro_valor(reg, ["orgaoEntidade"], "")
-        )
-        # Se o CNPJ vier preenchido e não bater, podemos filtrar, mas caso o endpoint não traga o CNPJ explicitamente no topo, mantemos
-        resultados_filtrados.append(reg)
+
+    resultados_filtrados, sem_identificacao = filtrar_registros_por_orgao(
+        resultados,
+        CNPJ_ORGAO,
+    )
 
     unicos: Dict[str, Dict[str, Any]] = {}
     for registro in resultados_filtrados:
@@ -911,11 +980,11 @@ def consultar_registros(
                 )
             )
         unicos[chave] = registro
-    return list(unicos.values())
+    return list(unicos.values()), sem_identificacao
 
 
 # ============================================================
-# 10. INTERFACE STREAMLIT
+# 11. INTERFACE STREAMLIT
 # ============================================================
 
 st.title("🛡️ Sistema de Apoio ao Controle Interno - SACI")
@@ -949,13 +1018,13 @@ data_fim = st.sidebar.date_input(
 
 modalidades_selecionadas: List[int] = []
 if tipo_consulta == "Editais e Avisos de Contratações":
-    nomes_modalidades = st.sidebar.multiselect(
+    codigos_selecionados = st.sidebar.multiselect(
         "Modalidades",
         options=list(MODALIDADES.keys()),
         default=[6, 8, 9],
         format_func=lambda codigo: MODALIDADES[codigo],
     )
-    modalidades_selecionadas = list(nomes_modalidades)
+    modalidades_selecionadas = list(codigos_selecionados)
 
 if data_fim < data_inicio:
     st.sidebar.error(
@@ -980,7 +1049,7 @@ if executar:
         with st.spinner(
             "Consultando o PNCP e processando os registros..."
         ):
-            registros = consultar_registros(
+            registros, sem_identificacao = consultar_registros(
                 tipo=tipo_consulta,
                 data_inicio=data_inicio,
                 data_fim=data_fim,
@@ -995,6 +1064,7 @@ if executar:
             )
             st.session_state["df_resultado"] = df_resultado
             st.session_state["tipo_resultado"] = tipo_consulta
+            st.session_state["sem_identificacao"] = sem_identificacao
     except Exception as erro:
         st.session_state.pop("df_resultado", None)
         st.error(f"Erro durante a consulta: {erro}")
@@ -1007,6 +1077,16 @@ if df is None:
         "os dados."
     )
     st.stop()
+
+sem_identificacao = st.session_state.get("sem_identificacao", 0)
+if sem_identificacao:
+    st.warning(
+        f"⚠️ {sem_identificacao} registro(s) retornado(s) pelo PNCP não "
+        "traziam o CNPJ do órgão de forma identificável na resposta da "
+        "API e foram mantidos na lista sem confirmação de que pertencem "
+        f"a {NOME_MUNICIPIO}. Recomenda-se conferência manual desses "
+        "itens antes de qualquer conclusão."
+    )
 
 if df.empty:
     st.warning(
