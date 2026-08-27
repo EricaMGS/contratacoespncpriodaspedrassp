@@ -44,7 +44,6 @@ TAMANHO_PAGINA_CONTRATOS = 100
 TAMANHO_PAGINA_ATAS = 100
 TAMANHO_PAGINA_EDITAIS = 50
 
-# Parâmetros de otimização de velocidade e segurança
 MAX_PAGINAS_SEGURO = 5 
 MAX_TENTATIVAS = 3
 TIMEOUT_CONEXAO = 10
@@ -444,7 +443,7 @@ tipo_consulta = st.sidebar.selectbox(
     ["Contratos", "Atas de Registro de Preços", "Editais e Avisos de Contratações"]
 )
 
-data_inicio = st.sidebar.date_input("📅 Data Inicial", value=pd.to_datetime("2026-01-01").date())
+data_inicio = st.sidebar.date_input("📅 Data Inicial", value=pd.to_datetime("2025-01-01").date())
 data_fim = st.sidebar.date_input("📅 Data Final", value=datetime.date.today())
 
 if data_fim < data_inicio:
@@ -452,57 +451,48 @@ if data_fim < data_inicio:
     st.stop()
 
 if st.sidebar.button("🔎 Executar Varredura e Análise", type="primary", use_container_width=True):
-    # Rota unificada focada em publicações municipais para evitar retornos vazios em branco
+    # Roteamento correto conforme a documentação oficial da API do PNCP
     endpoints = {
         "Contratos": f"{BASE_URL}/contratos",
         "Atas de Registro de Preços": f"{BASE_URL}/atas",
         "Editais e Avisos de Contratações": f"{BASE_URL}/contratacoes/publicacao",
     }
     endpoint = endpoints[tipo_consulta]
-    tamanho_pag = TAMANHO_PAGINA_CONTRATOS if tipo_consulta == "Contratos" else TAMANHO_PAGINA_ATAS
-
+    
+    # Parâmetros validados estritamente para evitar rejeição e erro 400/204 da API
     params = {
         "dataInicial": data_inicio.strftime("%Y%m%d"),
         "dataFinal": data_fim.strftime("%Y%m%d"),
-        "tamanhoPagina": tamanho_pag,
-        "cnpj": CNPJ_RIO_DAS_PEDRAS,
-        "uf": UF,
-        "codigoIbge": CODIGO_IBGE_RIO_DAS_PEDRAS
+        "pagina": 1,
+        "tamanhoPagina": 50
     }
-    
+
     if tipo_consulta == "Contratos":
         params["cnpjOrgao"] = CNPJ_RIO_DAS_PEDRAS
+    elif tipo_consulta == "Atas de Registro de Preços":
+        params["cnpj"] = CNPJ_RIO_DAS_PEDRAS
+    else:
+        # Editais exigem código de modalidade na API pública, iteramos pelas principais ou passamos o escopo de município
+        params["codigoModalidadeContratacao"] = 6  # Pregão Eletrônico como padrão inicial
 
     try:
         with st.spinner("Extraindo dados do PNCP em paralelo e aplicando motores de IA..."):
             registros = consultar_paginas_paralelo(endpoint, params)
             df_temp = pd.DataFrame(registros)
             
+            if df_temp.empty and tipo_consulta == "Editais e Avisos de Contratações":
+                # Tenta modalidade Dispensa (8) caso Pregão retorne vazio
+                params["codigoModalidadeContratacao"] = 8
+                registros = consultar_paginas_paralelo(endpoint, params)
+                df_temp = pd.DataFrame(registros)
+
             if not df_temp.empty:
                 lista_proc = [extrair_dados_padrao(row, tipo_consulta) for _, row in df_temp.iterrows()]
                 df_processado = pd.DataFrame(lista_proc)
                 df_processado = executar_modelo_ml_anomalias(df_processado)
                 st.session_state.df_resultado = df_processado
             else:
-                # Fallback de segurança: se a rota específica retornar vazia, busca no endpoint geral de publicações do município
-                endpoint_fallback = f"{BASE_URL}/contratacoes/publicacao"
-                params_fallback = {
-                    "dataInicial": data_inicio.strftime("%Y%m%d"),
-                    "dataFinal": data_fim.strftime("%Y%m%d"),
-                    "cnpj": CNPJ_RIO_DAS_PEDRAS,
-                    "uf": UF,
-                    "codigoIbge": CODIGO_IBGE_RIO_DAS_PEDRAS,
-                    "tamanhoPagina": 50
-                }
-                registros_fb = consultar_paginas_paralelo(endpoint_fallback, params_fallback)
-                if registros_fb:
-                    df_temp_fb = pd.DataFrame(registros_fb)
-                    lista_proc_fb = [extrair_dados_padrao(row, tipo_consulta) for _, row in df_temp_fb.iterrows()]
-                    df_processado_fb = pd.DataFrame(lista_proc_fb)
-                    df_processado_fb = executar_modelo_ml_anomalias(df_processado_fb)
-                    st.session_state.df_resultado = df_processado_fb
-                else:
-                    st.session_state.df_resultado = pd.DataFrame()
+                st.session_state.df_resultado = pd.DataFrame()
     except Exception as e:
         st.error(f"❌ Erro na execução: {e}")
 
