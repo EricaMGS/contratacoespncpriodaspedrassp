@@ -8,4 +8,5 @@ fpdf
 plotly
 fpdf2
 httpx
-
+scikit-learn
+numpy
