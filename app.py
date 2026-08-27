@@ -222,12 +222,12 @@ def consultar_pncp(
             return conteudo
 
         except requests.Timeout as erro:
-            ultimo_erro = RuntimeError("Tempo limite excedido ao consultar o PNCP.") from erro
+            ultimo_erro = RuntimeError("Tempo limite excedido ao consultar o PNCP.")
             if tentativa < max_tentativas:
                 time.sleep(1.5 ** tentativa)
                 continue
         except requests.ConnectionError as erro:
-            ultimo_erro = RuntimeError("Não foi possível conectar ao PNCP. Verifique sua conexão.") from erro
+            ultimo_erro = RuntimeError("Não foi possível conectar ao PNCP. Verifique sua conexão.")
             if tentativa < max_tentativas:
                 time.sleep(1.5 ** tentativa)
                 continue
