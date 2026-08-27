@@ -431,6 +431,7 @@ def gerar_papel_trabalho_auditoria_word(row: Any, tipo_consulta: str, avaliacao_
 
 st.title("🛡️ Sistema de Apoio ao Controle Interno (SACI)")
 st.markdown("Plataforma de inteligência analítica, matriz de risco e auditoria preventiva das contratações públicas de **Rio das Pedras/SP**.")
+st.markdown("Dados coletados do Portal Nacional de Contratações Públicas - PNCP.")
 
 st.sidebar.header("⚙️ Parâmetros de Consulta")
 tipo_consulta = st.sidebar.selectbox(
@@ -549,4 +550,4 @@ else:
     st.info("💡 Configure o período na barra lateral e clique em **Executar Varredura e Análise** para carregar os dados e acionar a inteligência analítica.")
 
 st.markdown("---")
-st.caption("SACI — Desenvolvido para automação e segurança do Controle Interno Municipal.")
+st.caption("Dados do Portal Nacional de Contratações Públicas - PNCP.")
