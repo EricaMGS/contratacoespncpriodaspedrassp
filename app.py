@@ -3,12 +3,22 @@ import zipfile
 import datetime
 import time
 import re
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
+
+# Machine Learning é opcional: se scikit-learn não estiver instalado,
+# o módulo de similaridade apenas ficará indisponível, sem derrubar o app.
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_DISPONIVEL = True
+except Exception:
+    TfidfVectorizer = None
+    cosine_similarity = None
+    SKLEARN_DISPONIVEL = False
 
 from docx import Document
 from docx.shared import Pt, RGBColor
@@ -1487,10 +1497,7 @@ def executar_consulta(
 def remover_duplicidades(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Remove duplicidades usando o primeiro identificador forte disponível.
-    Se não houver identificador forte, usa todas as colunas.
-    """
+
     if df.empty:
         return df
 
@@ -1504,24 +1511,20 @@ def remover_duplicidades(
         "numeroContrato",
         "numeroAtaRegistroPreco",
         "idContratoPNCP",
-        "idContratacaoPNCP",
     ]
 
-    disponiveis = [
-        coluna
-        for coluna in colunas_identificacao
-        if coluna in resultado.columns
-    ]
+    for coluna in colunas_identificacao:
 
-    if disponiveis:
-        # Constrói uma chave composta para não eliminar registros
-        # diferentes que compartilhem apenas um identificador parcial.
-        chaves = []
-        for coluna in disponiveis:
+        if coluna in resultado.columns:
+
             serie = (
                 resultado[coluna]
                 .astype(str)
                 .str.strip()
+            )
+
+            validos = (
+                serie
                 .replace(
                     {
                         "nan": "",
@@ -1529,23 +1532,24 @@ def remover_duplicidades(
                         "N/D": "",
                     }
                 )
-            )
-            chaves.append(serie)
-
-        chave = chaves[0]
-        for serie in chaves[1:]:
-            chave = chave.where(
-                chave != "",
-                serie,
+                != ""
             )
 
-        validos = chave != ""
+            if validos.any():
 
-        resultado = resultado.loc[
-            ~validos | ~chave.duplicated(keep="first")
-        ]
+                resultado = (
+                    resultado
+                    .loc[
+                        ~validos
+                        | ~serie.duplicated(
+                            keep="first"
+                        )
+                    ]
+                )
 
-        return resultado.reset_index(drop=True)
+                return resultado.reset_index(
+                    drop=True
+                )
 
     return (
         resultado
@@ -1554,6 +1558,9 @@ def remover_duplicidades(
     )
 
 
+# ============================================================
+# FILTRO EXTRA DE SEGURANÇA
+# ============================================================
 
 def filtrar_por_cnpj(
     df: pd.DataFrame,
@@ -1782,153 +1789,6 @@ def consultar_detalhes_contrato(
 
 
 # ============================================================
-# IDENTIFICAÇÃO AMIGÁVEL DA CONSULTA
-# ============================================================
-
-def nome_consulta_exportacao(
-    tipo_consulta: str,
-    modalidade_texto: Optional[str] = None,
-) -> str:
-    """Nome amigável e estável para relatórios e arquivos."""
-    if tipo_consulta == "Editais e Avisos de Contratações":
-        if modalidade_texto:
-            return (
-                "Editais_e_Avisos_de_Contratacoes_"
-                + nome_arquivo_seguro(modalidade_texto)
-            )
-        return "Editais_e_Avisos_de_Contratacoes"
-
-    return nome_arquivo_seguro(
-        tipo_consulta
-        .replace("📥", "")
-        .strip()
-    )
-
-
-def titulo_consulta_relatorio(
-    tipo_consulta: str,
-    modalidade_texto: Optional[str] = None,
-) -> str:
-    if tipo_consulta == "Editais e Avisos de Contratações":
-        if modalidade_texto:
-            return (
-                "EDITAIS E AVISOS DE CONTRATAÇÕES\n"
-                f"MODALIDADE: {modalidade_texto.upper()}"
-            )
-        return "EDITAIS E AVISOS DE CONTRATAÇÕES"
-
-    return f"RELATÓRIO DE {tipo_consulta.upper()}"
-
-
-def gerar_excel_formatado(
-    df: pd.DataFrame,
-    tipo_consulta: str,
-    data_inicio,
-    data_fim,
-    modalidade_texto: Optional[str] = None,
-) -> bytes:
-    """
-    Gera Excel com aba de resumo e aba de dados formatada.
-    """
-    buffer = io.BytesIO()
-
-    with pd.ExcelWriter(
-        buffer,
-        engine="openpyxl",
-    ) as writer:
-        resumo = pd.DataFrame(
-            [
-                ["Prefeitura", NOME_PREFEITURA],
-                ["Consulta", tipo_consulta],
-                [
-                    "Modalidade",
-                    modalidade_texto or "Não se aplica",
-                ],
-                [
-                    "Período",
-                    f"{data_inicio.strftime('%d/%m/%Y')} a "
-                    f"{data_fim.strftime('%d/%m/%Y')}",
-                ],
-                ["Total de registros", len(df)],
-                [
-                    "Fonte",
-                    "Portal Nacional de Contratações Públicas – PNCP",
-                ],
-            ],
-            columns=["Informação", "Valor"],
-        )
-
-        resumo.to_excel(
-            writer,
-            sheet_name="Resumo",
-            index=False,
-        )
-        df.to_excel(
-            writer,
-            sheet_name="Dados",
-            index=False,
-        )
-
-        wb = writer.book
-        ws_resumo = wb["Resumo"]
-        ws_dados = wb["Dados"]
-
-        from openpyxl.styles import Font, PatternFill, Alignment
-        from openpyxl.utils import get_column_letter
-
-        titulo_fill = PatternFill(
-            "solid",
-            fgColor="1F4E78",
-        )
-        titulo_font = Font(
-            bold=True,
-            color="FFFFFF",
-        )
-
-        for ws in (ws_resumo, ws_dados):
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = ws.dimensions
-
-            for cell in ws[1]:
-                cell.fill = titulo_fill
-                cell.font = titulo_font
-                cell.alignment = Alignment(
-                    horizontal="center",
-                    vertical="center",
-                )
-
-        ws_resumo.column_dimensions["A"].width = 28
-        ws_resumo.column_dimensions["B"].width = 90
-
-        for coluna in range(1, ws_dados.max_column + 1):
-            letra = get_column_letter(coluna)
-            maior = len(str(ws_dados.cell(1, coluna).value or ""))
-
-            for linha in range(
-                2,
-                min(ws_dados.max_row, 300) + 1,
-            ):
-                valor = ws_dados.cell(
-                    linha,
-                    coluna,
-                ).value
-                maior = max(
-                    maior,
-                    len(str(valor or "")),
-                )
-
-            ws_dados.column_dimensions[letra].width = min(
-                max(maior + 2, 12),
-                55,
-            )
-
-        ws_dados.freeze_panes = "A2"
-
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-# ============================================================
 # EXPORTAÇÃO - WORD
 # ============================================================
 
@@ -1937,7 +1797,6 @@ def gerar_word(
     tipo_consulta: str,
     data_inicio,
     data_fim,
-    modalidade_texto: Optional[str] = None,
 ) -> bytes:
 
     doc = Document()
@@ -1957,10 +1816,7 @@ def gerar_word(
     p_titulo.alignment = 1
 
     run = p_titulo.add_run(
-        titulo_consulta_relatorio(
-            tipo_consulta,
-            modalidade_texto,
-        )
+        f"RELATÓRIO DE {tipo_consulta.upper()}"
     )
 
     run.bold = True
@@ -2161,7 +2017,6 @@ def gerar_pdf(
     tipo_consulta: str,
     data_inicio,
     data_fim,
-    modalidade_texto: Optional[str] = None,
 ) -> bytes:
 
     pdf = FPDF()
@@ -2184,10 +2039,7 @@ def gerar_pdf(
     )
 
     titulo = texto_pdf(
-        titulo_consulta_relatorio(
-            tipo_consulta,
-            modalidade_texto,
-        )
+        f"RELATORIO DE {tipo_consulta.upper()}"
     )
 
     pdf.cell(
@@ -2598,17 +2450,11 @@ def baixar_documento_pncp(
     contexto: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bytes, str]:
     """
-    Baixa o conteúdo binário de um documento do PNCP.
+    Baixa o arquivo publicado pelo PNCP.
 
-    O PNCP retorna, normalmente, a URL de download no campo ``url``.
-    Quando esse campo não vier, o sistema monta o endpoint oficial
-    de download a partir dos identificadores do registro.
-
-    Importante: a URL de consulta de metadados e a URL de conteúdo
-    podem ser diferentes conforme o recurso. Para contratação e
-    contrato, a documentação atual permite o GET do arquivo no
-    endpoint /arquivos/{sequencialDocumento}; para Ata, a mesma
-    rota é utilizada pelo serviço de download.
+    Primeiro utiliza a URL devolvida pelo PNCP. Quando ela não existe,
+    monta o endpoint oficial de consulta do documento específico usando
+    sequencialDocumento + contexto da contratação/contrato/ata.
     """
     documento = documento or {}
     contexto = contexto or {}
@@ -2617,94 +2463,60 @@ def baixar_documento_pncp(
 
     if not url_final:
         seq_doc = documento.get("sequencialDocumento")
-        cnpj = normalizar_cnpj(
-            contexto.get("cnpj", CNPJ_RIO_DAS_PEDRAS)
-        )
+        cnpj = normalizar_cnpj(contexto.get("cnpj", CNPJ_RIO_DAS_PEDRAS))
         ano = contexto.get("ano")
         sequencial = contexto.get("sequencial")
         tipo_recurso = contexto.get("tipo_recurso", "contratacao")
 
-        try:
-            seq_doc = int(seq_doc)
-            ano = int(ano)
-            sequencial = int(sequencial)
-        except (TypeError, ValueError):
+        if not seq_doc or not ano or not sequencial or len(cnpj) != 14:
             raise ValueError(
                 "O PNCP não forneceu uma URL e não há dados suficientes "
                 "para montar o endereço do documento."
             )
 
-        if len(cnpj) != 14:
-            raise ValueError("CNPJ inválido para o download do documento.")
-
         if tipo_recurso == "contrato":
             url_final = (
                 f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/contratos/"
-                f"{ano}/{sequencial}/arquivos/{seq_doc}"
+                f"{int(ano)}/{int(sequencial)}/arquivos/{int(seq_doc)}"
             )
         elif tipo_recurso == "ata":
             seq_ata = contexto.get("sequencial_ata")
-            try:
-                seq_ata = int(seq_ata)
-            except (TypeError, ValueError):
+            if not seq_ata:
                 raise ValueError("Sequencial da Ata não informado.")
             url_final = (
                 f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
-                f"{ano}/{sequencial}/atas/{seq_ata}/arquivos/{seq_doc}"
+                f"{int(ano)}/{int(sequencial)}/atas/{int(seq_ata)}/"
+                f"arquivos/{int(seq_doc)}"
             )
         else:
             url_final = (
                 f"{BASE_DOCUMENTOS_URL}/orgaos/{cnpj}/compras/"
-                f"{ano}/{sequencial}/arquivos/{seq_doc}"
+                f"{int(ano)}/{int(sequencial)}/arquivos/{int(seq_doc)}"
             )
 
     sessao = criar_sessao_http()
-    headers = {**HEADERS, "Accept": "*/*"}
-    ultimo_erro = None
 
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
-        try:
-            response = sessao.get(
-                url_final,
-                timeout=(TIMEOUT_CONEXAO, TIMEOUT_LEITURA),
-                allow_redirects=True,
-                headers=headers,
-            )
-
-            if response.status_code == 200:
-                break
-
-            if response.status_code in (408, 429, 500, 502, 503, 504):
-                ultimo_erro = RuntimeError(
-                    f"HTTP {response.status_code}: "
-                    f"{mensagem_erro_http(response)}"
-                )
-                if tentativa < MAX_TENTATIVAS:
-                    time.sleep(min(2 ** tentativa, 20))
-                    continue
-
-            detalhe = mensagem_erro_http(response)
-            raise RuntimeError(
-                f"Não foi possível baixar o arquivo. "
-                f"HTTP {response.status_code}: {detalhe}"
-            )
-
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as erro:
-            ultimo_erro = erro
-            if tentativa < MAX_TENTATIVAS:
-                time.sleep(min(2 ** tentativa, 20))
-                continue
-            raise RuntimeError(
-                "Falha de conexão ao baixar o documento do PNCP "
-                "após várias tentativas."
-            ) from erro
-    else:
+    try:
+        response = sessao.get(
+            url_final,
+            timeout=(TIMEOUT_CONEXAO, TIMEOUT_LEITURA),
+            allow_redirects=True,
+            headers={**HEADERS, "Accept": "*/*"},
+        )
+    except requests.RequestException as erro:
         raise RuntimeError(
-            "Não foi possível baixar o documento do PNCP."
-        ) from ultimo_erro
+            f"Falha de conexão ao baixar o documento: {erro}"
+        ) from erro
+
+    if response.status_code != 200:
+        detalhe = mensagem_erro_http(response)
+        raise RuntimeError(
+            f"Não foi possível baixar o arquivo. "
+            f"HTTP {response.status_code}: {detalhe}"
+        )
 
     nome = texto_valido(
-        documento.get("titulo") or documento.get("nome"),
+        documento.get("titulo"),
         "documento_pncp",
     )
 
@@ -2712,27 +2524,14 @@ def baixar_documento_pncp(
         "Content-Disposition", ""
     )
 
-    # Suporta filename="..." e filename*=UTF-8''...
     match = re.search(
-        r"filename\*=\s*(?:UTF-8'')?([^;]+)",
+        r"filename\*?=(?:UTF-8'' )?[\"']?([^\"';]+)",
         content_disposition,
         flags=re.IGNORECASE,
     )
-    if not match:
-        match = re.search(
-            r'filename\s*=\s*"([^"]+)"',
-            content_disposition,
-            flags=re.IGNORECASE,
-        )
-    if not match:
-        match = re.search(
-            r"filename\s*=\s*([^;]+)",
-            content_disposition,
-            flags=re.IGNORECASE,
-        )
 
     if match:
-        nome = match.group(1).strip().strip('"').strip("'")
+        nome = match.group(1).strip()
 
     nome = nome_arquivo_seguro(nome)
 
@@ -2756,6 +2555,7 @@ def baixar_documento_pncp(
         nome += extensoes.get(content_type, ".bin")
 
     return response.content, nome
+
 
 def nome_arquivo_seguro(nome: str) -> str:
     nome = re.sub(r"[^A-Za-z0-9._-]+", "_", nome)
@@ -2804,23 +2604,13 @@ def preparar_zip_documentos_pncp(
     documentos: List[Dict[str, Any]],
     contexto: Dict[str, Any],
 ) -> Tuple[bytes, int, List[str]]:
-    """
-    Baixa todos os documentos retornados pelo PNCP e cria um ZIP único.
-
-    O download coletivo é executado somente quando o usuário solicita.
-    Cada documento é tratado individualmente para que uma falha não
-    impeça os demais downloads.
-    """
+    """Baixa todos os documentos retornados e cria um ZIP único."""
     zip_buffer = io.BytesIO()
     baixados = 0
     erros = []
     nomes_usados = set()
 
-    with zipfile.ZipFile(
-        zip_buffer,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as zf:
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for i, documento in enumerate(documentos, start=1):
             if not isinstance(documento, dict):
                 continue
@@ -2833,15 +2623,10 @@ def preparar_zip_documentos_pncp(
                 documento.get("sequencialDocumento"),
                 str(i),
             )
-            url_doc = montar_url_documento_pncp(
-                documento,
-                contexto,
-            )
+            url_doc = montar_url_documento_pncp(documento, contexto)
 
             if not url_doc:
-                erros.append(
-                    f"{titulo}: URL de download não disponível"
-                )
+                erros.append(f"{titulo}: URL não disponível")
                 continue
 
             try:
@@ -2850,44 +2635,260 @@ def preparar_zip_documentos_pncp(
                     documento=documento,
                     contexto=contexto,
                 )
-
                 nome = nome_arquivo_seguro(
-                    nome_original
-                    or f"documento_{seq_doc}"
+                    nome_original or f"documento_{seq_doc}"
                 )
-
                 base, ext = os.path.splitext(nome)
                 candidato = nome
                 contador = 2
-
                 while candidato.lower() in nomes_usados:
-                    candidato = (
-                        f"{base}_{contador}{ext}"
-                    )
+                    candidato = f"{base}_{contador}{ext}"
                     contador += 1
-
-                nomes_usados.add(
-                    candidato.lower()
-                )
-
-                zf.writestr(
-                    candidato,
-                    arquivo_bytes,
-                )
+                nomes_usados.add(candidato.lower())
+                zf.writestr(candidato, arquivo_bytes)
                 baixados += 1
-
             except Exception as erro:
-                erros.append(
-                    f"{titulo}: {erro}"
-                )
+                erros.append(f"{titulo}: {erro}")
 
     zip_buffer.seek(0)
+    return zip_buffer.getvalue(), baixados, erros
 
-    return (
-        zip_buffer.getvalue(),
-        baixados,
-        erros,
+
+
+# ============================================================
+# MÓDULO DE CONTROLE INTERNO / INTELIGÊNCIA
+# ============================================================
+
+def _coluna_por_alias(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    mapa = {str(c).strip().lower(): c for c in df.columns}
+    for alias in aliases:
+        if alias.lower() in mapa:
+            return mapa[alias.lower()]
+    # segunda tentativa: procura parcial
+    for c in df.columns:
+        lc = str(c).lower()
+        for alias in aliases:
+            if alias.lower() in lc:
+                return c
+    return None
+
+
+def _serie_texto(df: pd.DataFrame, aliases: List[str], padrao="") -> pd.Series:
+    col = _coluna_por_alias(df, aliases)
+    if not col:
+        return pd.Series([padrao] * len(df), index=df.index, dtype="object")
+    return df[col].map(lambda x: texto_valido(x, padrao) if x is not None else padrao)
+
+
+def _serie_valor(df: pd.DataFrame) -> pd.Series:
+    col = _coluna_por_alias(df, [
+        "valorTotalHomologado", "valorTotal", "valorGlobal", "valorTotalEstimado",
+        "valorContratacao", "valorContrato", "valorAta", "valor"
+    ])
+    if not col:
+        return pd.Series([float("nan")] * len(df), index=df.index, dtype="float64")
+    return df[col].map(valor_numerico)
+
+
+def calcular_risco_controle_interno(df: pd.DataFrame) -> pd.DataFrame:
+    """Cria um indicador de risco para priorização da análise humana.
+
+    O indicador é heurístico e não representa conclusão de irregularidade.
+    Cada fator recebe pontos transparentes para que o controlador possa revisar.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    base = df.copy().reset_index(drop=True)
+    objeto = _serie_texto(base, ["objetoCompra", "objetoContratacao", "objeto", "descricaoObjeto"])
+    modalidade = _serie_texto(base, ["modalidadeNome", "nomeModalidade", "modalidade", "modalidadeContratacao"])
+    valor = _serie_valor(base)
+    situacao = _serie_texto(base, ["situacao", "situacaoCompra", "status", "situacaoContrato"])
+    fornecedor = _serie_texto(base, ["nomeRazaoSocialFornecedor", "razaoSocialFornecedor", "nomeFornecedor", "fornecedor"])
+
+    resultado = pd.DataFrame(index=base.index)
+    resultado["Objeto"] = objeto
+    resultado["Fornecedor"] = fornecedor
+    resultado["Valor"] = valor
+    resultado["Modalidade"] = modalidade
+    resultado["Risco"] = 0
+    resultado["Motivos"] = ""
+
+    for i in base.index:
+        pontos = 0
+        motivos = []
+        obj = str(objeto.iloc[i]).lower()
+        mod = str(modalidade.iloc[i]).lower()
+        sit = str(situacao.iloc[i]).lower()
+        val = valor.iloc[i]
+
+        # Indicadores de atenção, não conclusões.
+        if any(k in mod for k in ["dispensa", "inexigibilidade"]):
+            pontos += 15
+            motivos.append("modalidade que merece análise específica")
+        if any(k in obj for k in ["emergencial", "emergência", "urgente"]):
+            pontos += 20
+            motivos.append("objeto com indício textual de urgência/emergência")
+        if any(k in sit for k in ["cancel", "revog", "anulad"]):
+            pontos += 10
+            motivos.append("situação com cancelamento/revogação/anulação")
+        if pd.notna(val) and val > 0:
+            # Não define sobrepreço; apenas cria faixas de atenção no conjunto.
+            med = valor.median(skipna=True)
+            if pd.notna(med) and med > 0 and val >= med * 3:
+                pontos += 20
+                motivos.append("valor muito acima da mediana da consulta")
+            elif pd.notna(med) and med > 0 and val >= med * 2:
+                pontos += 10
+                motivos.append("valor acima da mediana da consulta")
+        if len(obj.strip()) < 20:
+            pontos += 5
+            motivos.append("objeto com descrição curta")
+        if not fornecedor.iloc[i] or str(fornecedor.iloc[i]).strip().lower() in {"n/d", "não informado", "nan"}:
+            pontos += 5
+            motivos.append("fornecedor não identificado no retorno")
+
+        resultado.at[i, "Risco"] = min(pontos, 100)
+        resultado.at[i, "Motivos"] = "; ".join(motivos) if motivos else "Nenhum alerta heurístico identificado"
+
+    def faixa(p):
+        if p >= 50:
+            return "🔴 Alto"
+        if p >= 25:
+            return "🟡 Médio"
+        return "🟢 Baixo"
+
+    resultado["Classificação"] = resultado["Risco"].map(faixa)
+    resultado["Valor formatado"] = resultado["Valor"].map(formatar_moeda_br)
+    return resultado
+
+
+def detectar_outliers_valor(df: pd.DataFrame) -> pd.DataFrame:
+    """Detecta valores estatisticamente atípicos pelo IQR no conjunto consultado."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy().reset_index(drop=True)
+    valores = _serie_valor(out)
+    validos = valores.dropna()
+    if len(validos) < 4:
+        out["Outlier_Valor"] = False
+        out["Motivo_Outlier"] = "Amostra insuficiente para IQR"
+        return out
+    q1 = validos.quantile(0.25)
+    q3 = validos.quantile(0.75)
+    iqr = q3 - q1
+    limite_superior = q3 + 1.5 * iqr
+    limite_inferior = max(0, q1 - 1.5 * iqr)
+    out["Outlier_Valor"] = valores.map(lambda x: bool(pd.notna(x) and (x > limite_superior or x < limite_inferior)))
+    out["Motivo_Outlier"] = valores.map(
+        lambda x: f"Fora do intervalo estatístico (IQR): R$ {limite_inferior:,.2f} a R$ {limite_superior:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        if pd.notna(x) and (x > limite_superior or x < limite_inferior) else ""
     )
+    return out
+
+
+def calcular_similaridade_objetos(df: pd.DataFrame, indice: int, top_n: int = 5) -> pd.DataFrame:
+    if not SKLEARN_DISPONIVEL:
+        return pd.DataFrame()
+    if df is None or df.empty or len(df) < 2:
+        return pd.DataFrame()
+    objetos = _serie_texto(df.reset_index(drop=True), ["objetoCompra", "objetoContratacao", "objeto", "descricaoObjeto"], "").fillna("")
+    if not objetos.iloc[indice].strip():
+        return pd.DataFrame()
+    try:
+        matriz = TfidfVectorizer(strip_accents="unicode", lowercase=True, ngram_range=(1, 2), min_df=1).fit_transform(objetos)
+        similaridades = cosine_similarity(matriz[indice], matriz).ravel()
+        similaridades[indice] = -1
+        melhores = similaridades.argsort()[::-1][:top_n]
+        base = df.reset_index(drop=True).iloc[melhores].copy()
+        base["Similaridade"] = (similaridades[melhores] * 100).round(1)
+        base["Objeto"] = objetos.iloc[melhores].values
+        return base.sort_values("Similaridade", ascending=False)
+    except Exception:
+        return pd.DataFrame()
+
+
+def renderizar_aba_controle_interno():
+    st.title("🛡️ Controle Interno — Inteligência sobre Contratações")
+    st.caption("Ferramenta de apoio à priorização, testes e análise humana. Os alertas não constituem conclusão de irregularidade.")
+
+    df = st.session_state.get("df_resultado")
+    tipo = st.session_state.get("tipo_consulta_atual", "Consulta")
+
+    if df is None or df.empty:
+        st.info("ℹ️ Faça primeiro uma consulta em **Contratos**, **Atas de Registro de Preços** ou **Editais e Avisos de Contratações** para alimentar a análise.")
+        st.markdown("### Como usar")
+        st.write("1. Execute uma consulta.  2. Volte para esta aba.  3. Revise os casos priorizados.  4. Use os resultados como apoio ao trabalho do Controle Interno.")
+        return
+
+    risco = calcular_risco_controle_interno(df)
+    outliers = detectar_outliers_valor(df)
+
+    alto = int((risco["Risco"] >= 50).sum())
+    medio = int(((risco["Risco"] >= 25) & (risco["Risco"] < 50)).sum())
+    baixo = int((risco["Risco"] < 25).sum())
+    outlier_count = int(outliers["Outlier_Valor"].sum()) if "Outlier_Valor" in outliers else 0
+    total_valor = _serie_valor(df).sum(min_count=1)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Registros", f"{len(df):,}".replace(",", "."))
+    c2.metric("🔴 Alto risco", alto)
+    c3.metric("🟡 Médio risco", medio)
+    c4.metric("🚨 Outliers de valor", outlier_count)
+    c5.metric("💰 Valor analisado", formatar_moeda_br(total_valor))
+
+    st.markdown("### 🚦 Casos prioritários")
+    prioridade = risco.sort_values(["Risco"], ascending=False).copy()
+    prioridade = prioridade[prioridade["Risco"] > 0]
+    if prioridade.empty:
+        st.success("🟢 Nenhum alerta heurístico foi identificado no conjunto consultado.")
+    else:
+        mostrar = prioridade[["Classificação", "Risco", "Objeto", "Fornecedor", "Valor formatado", "Motivos"]].head(100)
+        st.dataframe(mostrar, use_container_width=True, hide_index=True)
+
+    st.markdown("### 💰 Valores estatisticamente atípicos")
+    if outlier_count:
+        cols = [c for c in ["numeroControlePNCP", "numeroCompra", "objetoCompra", "objeto", "valorTotal", "valorTotalHomologado", "valorTotalEstimado", "Outlier_Valor", "Motivo_Outlier"] if c in outliers.columns]
+        st.dataframe(outliers[outliers["Outlier_Valor"]][cols].head(100), use_container_width=True, hide_index=True)
+    else:
+        st.info("Nenhum outlier foi identificado ou a amostra é insuficiente. Isso não significa que não exista problema de preço.")
+
+    st.markdown("### 🧠 Contratações semelhantes — Machine Learning")
+    if not SKLEARN_DISPONIVEL:
+        st.warning("scikit-learn não está instalado. Para ativar a busca semântica por TF-IDF, adicione `scikit-learn` ao requirements.txt.")
+    elif len(df) < 2:
+        st.info("É necessário ter pelo menos 2 registros na consulta.")
+    else:
+        objetos = _serie_texto(df.reset_index(drop=True), ["objetoCompra", "objetoContratacao", "objeto", "descricaoObjeto"], "")
+        opcoes = [f"{i+1} — {str(obj)[:120]}" for i, obj in enumerate(objetos)]
+        escolha = st.selectbox("Selecione uma contratação para encontrar objetos semelhantes:", opcoes, key="ml_contratacao_selecionada")
+        idx = opcoes.index(escolha)
+        semelhantes = calcular_similaridade_objetos(df, idx, 5)
+        if semelhantes.empty:
+            st.info("Não foi possível calcular similaridade para este registro.")
+        else:
+            st.dataframe(semelhantes[["Similaridade", "Objeto"]], use_container_width=True, hide_index=True)
+
+    st.markdown("### 📋 Checklist inicial de análise")
+    checklist = pd.DataFrame({
+        "Ponto de controle": [
+            "Objeto da contratação está claramente descrito?",
+            "Fornecedor está identificado no retorno?",
+            "Modalidade está identificada?",
+            "Valor está informado?",
+            "Há valor estatisticamente atípico?",
+            "Há alerta de modalidade que merece análise específica?",
+            "Documentos do PNCP foram consultados?",
+            "A análise possui evidências/documentos de suporte?",
+        ],
+        "Situação": ["⬜ Revisar" for _ in range(8)],
+        "Observação do controlador": ["" for _ in range(8)],
+    })
+    st.data_editor(checklist, use_container_width=True, hide_index=True, num_rows="fixed", key="checklist_controle_interno")
+
+    st.warning("⚠️ **Uso recomendado:** os indicadores servem para selecionar amostras e direcionar testes. A conclusão sobre regularidade, sobrepreço, fraude ou irregularidade deve ser feita pelo responsável, com base nas evidências e na legislação aplicável.")
 
 def renderizar_aba_arquivos_pncp():
     """Interface da área dedicada aos arquivos/documentos do PNCP."""
@@ -2983,9 +2984,6 @@ def renderizar_aba_arquivos_pncp():
                 st.session_state["atas_pncp_disponiveis"] = atas
                 st.session_state["atas_pncp_chave"] = (int(ano), int(sequencial))
                 st.session_state["documentos_pncp"] = None
-                st.session_state["zip_documentos_pncp"] = None
-                st.session_state["zip_qtd_documentos_pncp"] = 0
-                st.session_state["zip_erros_documentos_pncp"] = []
             except Exception as erro:
                 st.session_state["atas_pncp_disponiveis"] = None
                 st.error(f"❌ Não foi possível localizar as atas: {erro}")
@@ -3108,14 +3106,6 @@ def renderizar_aba_arquivos_pncp():
                     ),
                 )
             st.session_state["documentos_pncp"] = documentos
-            # Limpa downloads de uma consulta anterior para não misturar
-            # arquivos de registros diferentes.
-            for chave in list(st.session_state.keys()):
-                if str(chave).startswith(("bytes_", "nome_")):
-                    st.session_state.pop(chave, None)
-            st.session_state["zip_documentos_pncp"] = None
-            st.session_state["zip_qtd_documentos_pncp"] = 0
-            st.session_state["zip_erros_documentos_pncp"] = []
             st.session_state["documentos_pncp_contexto"] = {
                 "tipo": tipo_arquivo,
                 "ano": int(ano),
@@ -3185,16 +3175,8 @@ def renderizar_aba_arquivos_pncp():
                     "⚠️ Alguns documentos não puderam ser baixados:\n"
                     + "\n".join(f"- {e}" for e in erros_zip)
                 )
-            if not qtd_baixados and erros_zip:
-                st.error(
-                    "❌ Nenhum documento pôde ser incluído no ZIP. "
-                    "Use os botões individuais para verificar cada arquivo."
-                )
         st.divider()
 
-    # --------------------------------------------------------
-    # LISTA DE DOCUMENTOS
-    # --------------------------------------------------------
     for i, documento in enumerate(documentos, start=1):
         if not isinstance(documento, dict):
             continue
@@ -3217,18 +3199,8 @@ def renderizar_aba_arquivos_pncp():
         )
         url_doc = montar_url_documento_pncp(documento, contexto)
 
-        chave_doc = (
-            f"{contexto.get('tipo_recurso')}_"
-            f"{contexto.get('ano')}_"
-            f"{contexto.get('sequencial')}_"
-            f"{contexto.get('sequencial_ata')}_"
-            f"{sequencial_doc}"
-        )
-        chave_doc = re.sub(r"[^A-Za-z0-9_-]", "_", chave_doc)
-
         with st.container(border=True):
             c1, c2 = st.columns([4, 1])
-
             with c1:
                 st.markdown(f"### 📄 {titulo}")
                 st.write(f"**Tipo:** {tipo_doc}")
@@ -3236,77 +3208,37 @@ def renderizar_aba_arquivos_pncp():
                 st.write(f"**Sequencial do documento:** {sequencial_doc}")
 
                 if url_doc:
-                    st.caption("Origem: documento publicado no PNCP.")
+                    st.caption("Origem: documento publicado no PNCP")
                 else:
-                    st.warning(
-                        "O PNCP retornou o documento, mas não informou "
-                        "URL/URI nem sequencial suficiente para download."
-                    )
+                    st.warning("O PNCP retornou o documento, mas não informou uma URL/URI de download.")
 
             with c2:
                 if url_doc:
-                    # O download só é feito quando o usuário solicitar.
-                    # Isso evita que a página faça uma requisição HTTP
-                    # para cada documento a cada rerun do Streamlit.
-                    chave_preparar = f"preparar_{chave_doc}"
-
-                    if st.button(
-                        "📥 Preparar arquivo",
-                        use_container_width=True,
-                        key=chave_preparar,
-                    ):
-                        try:
-                            with st.spinner("Baixando documento do PNCP..."):
-                                arquivo_bytes, nome_original = baixar_documento_pncp(
-                                    url_doc,
-                                    documento=documento,
-                                    contexto=contexto,
-                                )
-
-                            st.session_state[
-                                f"bytes_{chave_doc}"
-                            ] = arquivo_bytes
-                            st.session_state[
-                                f"nome_{chave_doc}"
-                            ] = nome_original
-
-                        except Exception as erro:
-                            st.session_state.pop(
-                                f"bytes_{chave_doc}",
-                                None,
+                    try:
+                        with st.spinner("Preparando arquivo..."):
+                            arquivo_bytes, nome_original = baixar_documento_pncp(
+                                url_doc,
+                                documento=documento,
+                                contexto=contexto,
                             )
-                            st.error(
-                                f"Erro no download: {erro}"
-                            )
-
-                    arquivo_pronto = st.session_state.get(
-                        f"bytes_{chave_doc}"
-                    )
-
-                    if arquivo_pronto:
                         nome_download = nome_arquivo_seguro(
-                            st.session_state.get(
-                                f"nome_{chave_doc}",
-                                f"PNCP_documento_{sequencial_doc}",
-                            )
+                            nome_original or f"PNCP_documento_{sequencial_doc}"
                         )
-
                         st.download_button(
-                            "⬇️ Baixar arquivo",
-                            data=arquivo_pronto,
+                            "📥 Baixar arquivo",
+                            data=arquivo_bytes,
                             file_name=nome_download,
                             mime="application/octet-stream",
                             use_container_width=True,
-                            key=f"download_{chave_doc}",
+                            key=f"download_pncp_{contexto.get('ano')}_{contexto.get('sequencial')}_{contexto.get('sequencial_ata')}_{sequencial_doc}_{i}",
                         )
-
-                    st.link_button(
-                        "🔗 Abrir no PNCP",
-                        url_doc,
-                        use_container_width=True,
-                    )
-                else:
-                    st.caption("Download indisponível.")
+                    except Exception as erro:
+                        st.error(f"Erro no download: {erro}")
+                        st.link_button(
+                            "🔗 Abrir no PNCP",
+                            url_doc,
+                            use_container_width=True,
+                        )
 
 
 # ============================================================
@@ -3349,11 +3281,16 @@ tipo_consulta = st.sidebar.selectbox(
         "Atas de Registro de Preços",
         "Editais e Avisos de Contratações",
         "📥 Arquivos do PNCP",
+        "🛡️ Controle Interno",
     ],
 )
 
 if tipo_consulta == "📥 Arquivos do PNCP":
     renderizar_aba_arquivos_pncp()
+    st.stop()
+
+if tipo_consulta == "🛡️ Controle Interno":
+    renderizar_aba_controle_interno()
     st.stop()
 
 
@@ -3444,6 +3381,9 @@ if (
     not in st.session_state
 ):
     st.session_state.df_resultado = None
+
+
+st.session_state["tipo_consulta_atual"] = tipo_consulta
 
 
 if (
@@ -3850,42 +3790,47 @@ if (
 
     cols = st.columns(4)
 
-    modalidade_nome = (
-        mod_escolhida.split(" (")[0]
-        if tipo_consulta == "Editais e Avisos de Contratações"
-        else None
-    )
-
-    nome_arquivo = nome_consulta_exportacao(
-        tipo_consulta,
-        modalidade_nome,
+    nome_arquivo = (
+        tipo_consulta
+        .replace(
+            " ",
+            "_",
+        )
+        .replace(
+            "/",
+            "_",
+        )
+        .replace(
+            "ç",
+            "c",
+        )
+        .replace(
+            "ã",
+            "a",
+        )
     )
 
     # --------------------------------------------------------
     # EXCEL
     # --------------------------------------------------------
 
-    try:
-        excel_bytes = gerar_excel_formatado(
-            df,
-            tipo_consulta,
-            data_inicio,
-            data_fim,
-            modalidade_nome,
-        )
+    buffer_xlsx = io.BytesIO()
 
-        cols[0].download_button(
-            "📊 Excel",
-            excel_bytes,
-            f"{nome_arquivo}_Rio_Das_Pedras.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            use_container_width=True,
-        )
-    except Exception as erro_excel:
-        cols[0].error(f"Erro Excel: {erro_excel}")
+    df.to_excel(
+        buffer_xlsx,
+        index=False,
+    )
+
+    cols[0].download_button(
+        "📊 Excel",
+        buffer_xlsx.getvalue(),
+        f"{nome_arquivo}_Rio_Das_Pedras.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        use_container_width=True,
+    )
 
     # --------------------------------------------------------
     # CSV
@@ -3915,7 +3860,6 @@ if (
             tipo_consulta,
             data_inicio,
             data_fim,
-            modalidade_nome,
         )
 
         cols[2].download_button(
@@ -3946,7 +3890,6 @@ if (
             tipo_consulta,
             data_inicio,
             data_fim,
-            modalidade_nome,
         )
 
         cols[3].download_button(
