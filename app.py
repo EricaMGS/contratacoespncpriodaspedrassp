@@ -1,564 +1,1139 @@
-import io
-import zipfile
 import datetime
-import time
+import io
+import math
 import re
-import os
-from typing import Any, Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from dataclasses import dataclass
+from threading import local
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
-import numpy as np
 import requests
 import streamlit as st
-
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
-
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt, RGBColor
-from fpdf import FPDF
-
+from requests.adapters import HTTPAdapter
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import RobustScaler
+from urllib3.util.retry import Retry
 
 # ============================================================
-# 🏛️ CONFIGURAÇÃO DA PÁGINA E DO SISTEMA
+# 1. CONFIGURAÇÕES E TIPOS
 # ============================================================
 
 st.set_page_config(
-    page_title="SACI — Sistema de Apoio ao Controle Interno",
+    page_title="SACI - Sistema de Apoio ao Controle Interno",
     page_icon="🛡️",
     layout="wide",
 )
 
-CNPJ_RIO_DAS_PEDRAS = "44826840000183"
-CODIGO_IBGE_RIO_DAS_PEDRAS = "3544004"
-UF = "SP"
-
-BASE_URL = "https://pncp.gov.br/api/consulta/v1"
-BASE_DOCUMENTOS_URL = "https://pncp.gov.br/api/pncp/v1"
-
+CNPJ_ORGAO = "44826840000183"
 NOME_MUNICIPIO = "Rio das Pedras/SP"
 NOME_PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
 
-TAMANHO_PAGINA_CONTRATOS = 100
-TAMANHO_PAGINA_ATAS = 100
-TAMANHO_PAGINA_EDITAIS = 50
-
-MAX_PAGINAS_SEGURO = 5 
-MAX_TENTATIVAS = 3
-TIMEOUT_CONEXAO = 10
-TIMEOUT_LEITURA = 30
+BASE_URL = "https://pncp.gov.br/api/consulta/v1"
+TIMEOUT = (10, 45)
+TAMANHO_PAGINA = 50
+MAX_PAGINAS = 100
+MAX_TRABALHADORES = 4
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "SACI-Controle-Interno/2.0",
     "Accept": "application/json",
-    "Connection": "keep-alive",
 }
 
+_thread_local = local()
+
+@dataclass(frozen=True)
+class ConfiguracaoConsulta:
+    endpoint: str
+    parametros_extras: Dict[str, Any]
+
 
 # ============================================================
-# 🛠️ UTILITÁRIOS DE DADOS E FORMATAÇÃO
+# 2. FUNÇÕES DE CONVERSÃO E SEGURANÇA DE DADOS
 # ============================================================
 
-def texto_valido(valor: Any, padrao: str = "N/D") -> str:
+VALORES_AUSENTES = {"", "none", "nan", "null", "n/d", "nd", "nat"}
+
+def valor_ausente(valor: Any) -> bool:
     if valor is None:
-        return padrao
+        return True
     try:
         if pd.isna(valor):
-            return padrao
-    except Exception:
+            return True
+    except (TypeError, ValueError):
         pass
+    return isinstance(valor, str) and valor.strip().lower() in VALORES_AUSENTES
+
+def texto_valido(valor: Any, padrao: str = "N/D") -> str:
+    if valor_ausente(valor):
+        return padrao
     if isinstance(valor, dict):
-        for chave in ("nome", "razaoSocial", "descricao", "valor", "nomeUnidade", "municipioNome"):
-            if chave in valor:
-                res = texto_valido(valor.get(chave), "")
-                if res:
-                    return res
-        return str(valor)
+        campos_preferidos = (
+            "nome",
+            "razaoSocial",
+            "descricao",
+            "valor",
+            "nomeUnidade",
+            "municipioNome",
+        )
+        for campo in campos_preferidos:
+            if campo in valor:
+                resultado = texto_valido(valor[campo], "")
+                if resultado:
+                    return resultado
+        return padrao
     if isinstance(valor, list):
-        if not valor:
-            return padrao
         partes = [texto_valido(item, "") for item in valor]
-        partes = [i for i in partes if i]
+        partes = [parte for parte in partes if parte]
         return ", ".join(partes) if partes else padrao
     texto = str(valor).strip()
-    if texto.lower() in {"", "none", "nan", "null", "n/d", "nd", "nat"}:
-        return padrao
-    return texto
-
+    return texto if texto.lower() not in VALORES_AUSENTES else padrao
 
 def valor_numerico(valor: Any) -> Optional[float]:
-    if valor is None or isinstance(valor, bool):
+    if valor_ausente(valor) or isinstance(valor, bool):
+        return None
+    if isinstance(valor, dict):
+        for campo in (
+            "valor",
+            "value",
+            "valorTotal",
+            "valorGlobal",
+            "valorInicial",
+        ):
+            if campo in valor:
+                numero = valor_numerico(valor[campo])
+                if numero is not None:
+                    return numero
         return None
     if isinstance(valor, (int, float)):
-        try:
-            return None if pd.isna(valor) else float(valor)
-        except Exception:
-            return None
-    if isinstance(valor, dict):
-        for chave in ("valor", "value", "valorTotal", "valorGlobal", "valorInicial"):
-            if chave in valor:
-                res = valor_numerico(valor[chave])
-                if res is not None:
-                    return res
-        return None
-    texto = str(valor).strip().replace("R$", "").replace("r$", "").replace(" ", "")
+        numero = float(valor)
+        return numero if math.isfinite(numero) else None
+    texto = re.sub(r"[^\d,.\-]", "", str(valor))
     if not texto:
         return None
-    try:
-        return float(texto)
-    except Exception:
-        pass
-    try:
-        if "," in texto and "." in texto:
+    if "," in texto and "." in texto:
+        if texto.rfind(",") > texto.rfind("."):
             texto = texto.replace(".", "").replace(",", ".")
-        elif "," in texto:
-            texto = texto.replace(",", ".")
-        return float(texto)
-    except Exception:
+        else:
+            texto = texto.replace(",", "")
+    elif "," in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    try:
+        numero = float(texto)
+        return numero if math.isfinite(numero) else None
+    except ValueError:
         return None
-
 
 def formatar_moeda_br(valor: Any) -> str:
     numero = valor_numerico(valor)
     if numero is None:
         return "N/D"
-    texto = f"{numero:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    texto = f"{numero:,.2f}"
+    texto = texto.replace(",", "#").replace(".", ",").replace("#", ".")
     return f"R$ {texto}"
 
-
 def formatar_data(valor: Any) -> str:
-    if valor is None:
+    if valor_ausente(valor):
         return "N/D"
-    texto = str(valor).strip()
-    if not texto or texto.lower() in {"none", "nan", "null", "n/d", "nat"}:
-        return "N/D"
-    try:
-        data = pd.to_datetime(valor, errors="coerce")
-        return texto if pd.isna(data) else data.strftime("%d/%m/%Y")
-    except Exception:
-        return texto
+    data = pd.to_datetime(valor, errors="coerce")
+    if pd.isna(data):
+        return texto_valido(valor)
+    return data.strftime("%d/%m/%Y")
 
-
-def normalizar_cnpj(valor: Any) -> str:
+def normalizar_documento(valor: Any) -> str:
     return re.sub(r"\D", "", texto_valido(valor, ""))
 
-
-def extrair_valor_recursivo(valor: Any, profundidade: int = 0) -> Any:
-    if profundidade > 4 or valor is None:
-        return valor
-    if isinstance(valor, dict):
-        for chave in ("nome", "razaoSocial", "descricao", "descricaoObjeto", "valor", "numero", "cnpj", "ni"):
-            if chave in valor:
-                res = extrair_valor_recursivo(valor[chave], profundidade + 1)
-                if res not in (None, "", "N/D"):
-                    return res
-        return valor
-    if isinstance(valor, list):
-        resultados = [str(extrair_valor_recursivo(item, profundidade + 1)) for item in valor if item is not None]
-        return ", ".join([r for r in resultados if r not in ("", "N/D")]) if resultados else None
-    return valor
-
-
-def obter_primeiro_valor(row: Any, campos: List[str], padrao: Any = "N/D") -> Any:
-    if row is None:
+def obter_primeiro_valor(
+    registro: Any,
+    campos: Sequence[str],
+    padrao: Any = None,
+) -> Any:
+    if registro is None:
         return padrao
     for campo in campos:
         try:
-            val = row.get(campo) if isinstance(row, (dict, pd.Series)) else None
-            if val is not None and not (isinstance(val, float) and pd.isna(val)):
-                res = extrair_valor_recursivo(val)
-                if res not in (None, "", "N/D"):
-                    return res
-        except Exception:
+            valor = registro.get(campo)
+        except (AttributeError, TypeError):
             continue
+        if not valor_ausente(valor):
+            return valor
     return padrao
 
 
 # ============================================================
-# 🌐 CLIENTE HTTP ROBUSTO COM CACHE E ALTA VELOCIDADE
+# 3. CLIENTE HTTP COM RETENTATIVAS (THREAD-SAFE)
 # ============================================================
 
-@st.cache_resource
-def criar_sessao_http():
+def criar_sessao_http() -> requests.Session:
     sessao = requests.Session()
     sessao.headers.update(HEADERS)
+    estrategia = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adaptador = HTTPAdapter(
+        max_retries=estrategia,
+        pool_connections=MAX_TRABALHADORES,
+        pool_maxsize=MAX_TRABALHADORES,
+    )
+    sessao.mount("https://", adaptador)
     return sessao
 
+def obter_sessao_thread() -> requests.Session:
+    if not hasattr(_thread_local, "sessao"):
+        _thread_local.sessao = criar_sessao_http()
+    return _thread_local.sessao
 
-def consultar_pncp(url: str, params: Dict[str, Any], max_tentativas: int = MAX_TENTATIVAS) -> Any:
-    sessao = criar_sessao_http()
-    ultimo_erro = None
-    for tentativa in range(1, max_tentativas + 1):
-        try:
-            response = sessao.get(url, params=params, timeout=(TIMEOUT_CONEXAO, TIMEOUT_LEITURA))
-            if response.status_code == 200:
-                try:
-                    return response.json()
-                except ValueError as e:
-                    raise RuntimeError("API retornou HTTP 200, mas o conteúdo não é um JSON válido.") from e
-            if response.status_code == 204:
-                return []
-            if response.status_code in (400, 422):
-                raise RuntimeError(f"Parâmetros rejeitados pelo PNCP (HTTP {response.status_code}).")
-            if response.status_code == 429:
-                time.sleep(2 * tentativa)
-                continue
-            if response.status_code in (500, 502, 503, 504):
-                ultimo_erro = RuntimeError(f"Erro no servidor PNCP (HTTP {response.status_code}).")
-                time.sleep(1.5 ** tentativa)
-                continue
-            raise RuntimeError(f"PNCP retornou erro HTTP {response.status_code}.")
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            ultimo_erro = e
-            if tentativa < max_tentativas:
-                time.sleep(1.5 ** tentativa)
-                continue
-            raise RuntimeError("Tempo limite esgotado ao consultar o PNCP.") from e
-    raise RuntimeError("Falha de comunicação com o PNCP.") from ultimo_erro
-
-
-def _buscar_pagina_isolada(url: str, params_base: Dict[str, Any], pagina: int) -> List[Dict[str, Any]]:
-    p_params = params_base.copy()
-    p_params["pagina"] = pagina
+def consultar_pncp(
+    url: str,
+    parametros: Dict[str, Any],
+) -> Dict[str, Any]:
+    sessao = obter_sessao_thread()
     try:
-        dados = consultar_pncp(url, p_params)
-        return dados.get("data") or dados.get("items") or dados.get("content") or (dados if isinstance(dados, list) else [])
-    except Exception:
-        return []
+        resposta = sessao.get(
+            url,
+            params=parametros,
+            timeout=TIMEOUT,
+        )
+    except requests.Timeout as erro:
+        raise RuntimeError("Tempo limite excedido ao consultar o PNCP.") from erro
+    except requests.ConnectionError as erro:
+        raise RuntimeError("Não foi possível conectar ao PNCP.") from erro
+    if resposta.status_code == 204:
+        return {"data": [], "totalPaginas": 0}
+    if resposta.status_code != 200:
+        detalhe = resposta.text[:300].strip()
+        mensagem = (
+            f"PNCP retornou HTTP {resposta.status_code}. "
+            f"Endpoint: {url}. Parâmetros: {parametros}."
+        )
+        if detalhe:
+            mensagem += f" Resposta: {detalhe}"
+        raise RuntimeError(mensagem)
+    try:
+        conteudo = resposta.json()
+    except ValueError as erro:
+        raise RuntimeError(
+            "O PNCP respondeu com conteúdo que não é JSON válido."
+        ) from erro
+    if isinstance(conteudo, list):
+        return {
+            "data": conteudo,
+            "totalPaginas": 1,
+        }
+    if not isinstance(conteudo, dict):
+        raise RuntimeError("Formato de resposta inesperado do PNCP.")
+    return conteudo
 
+
+# ============================================================
+# 4. PAGINAÇÃO COMPLETA E VERIFICÁVEL
+# ============================================================
+
+def extrair_lista_resposta(conteudo: Dict[str, Any]) -> List[Dict[str, Any]]:
+    for campo in ("data", "items", "content"):
+        registros = conteudo.get(campo)
+        if isinstance(registros, list):
+            return registros
+    return []
+
+def extrair_total_paginas(
+    conteudo: Dict[str, Any],
+    tamanho_primeira_pagina: int,
+    tamanho_pagina: int,
+) -> int:
+    for campo in ("totalPaginas", "totalPages"):
+        total = conteudo.get(campo)
+        if isinstance(total, int) and total >= 0:
+            return total
+    total_registros = conteudo.get("totalRegistros")
+    if isinstance(total_registros, int) and total_registros >= 0:
+        return math.ceil(total_registros / tamanho_pagina)
+    return 1 if tamanho_primeira_pagina > 0 else 0
+
+def buscar_pagina(
+    url: str,
+    parametros_base: Dict[str, Any],
+    pagina: int,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    parametros = dict(parametros_base)
+    parametros["pagina"] = pagina
+    resposta = consultar_pncp(url, parametros)
+    return pagina, extrair_lista_resposta(resposta)
 
 @st.cache_data(ttl=900, show_spinner=False)
-def consultar_paginas_paralelo(url: str, params: Dict[str, Any], max_paginas: int = MAX_PAGINAS_SEGURO) -> List[Dict[str, Any]]:
-    primeira_pagina = _buscar_pagina_isolada(url, params, 1)
+def consultar_todas_paginas(
+    url: str,
+    parametros: Dict[str, Any],
+    max_paginas: int = MAX_PAGINAS,
+) -> List[Dict[str, Any]]:
+    parametros_base = dict(parametros)
+    parametros_base["pagina"] = 1
+    resposta_inicial = consultar_pncp(url, parametros_base)
+    primeira_pagina = extrair_lista_resposta(resposta_inicial)
     if not primeira_pagina:
         return []
-
-    todos_registros = list(primeira_pagina)
-    tamanho_pag = int(params.get("tamanhoPagina", 50))
-
-    if len(primeira_pagina) < tamanho_pag or max_paginas <= 1:
-        return todos_registros
-
-    paginas_restantes = list(range(2, max_paginas + 1))
-    
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(_buscar_pagina_isolada, url, params, p): p for p in paginas_restantes}
-        for future in as_completed(futures):
-            res = future.result()
-            if res:
-                todos_registros.extend(res)
-
-    return todos_registros
+    tamanho_pagina = int(
+        parametros_base.get("tamanhoPagina", TAMANHO_PAGINA)
+    )
+    total_paginas = extrair_total_paginas(
+        resposta_inicial,
+        len(primeira_pagina),
+        tamanho_pagina,
+    )
+    total_paginas = min(max(total_paginas, 1), max_paginas)
+    if total_paginas == 1:
+        return primeira_pagina
+    paginas: Dict[int, List[Dict[str, Any]]] = {
+        1: primeira_pagina
+    }
+    erros: List[str] = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_TRABALHADORES, total_paginas - 1)
+    ) as executor:
+        tarefas = {
+            executor.submit(
+                buscar_pagina,
+                url,
+                parametros_base,
+                pagina,
+            ): pagina
+            for pagina in range(2, total_paginas + 1)
+        }
+        for tarefa in as_completed(tarefas):
+            pagina = tarefas[tarefa]
+            try:
+                numero, registros = tarefa.result()
+                paginas[numero] = registros
+            except Exception as erro:
+                erros.append(f"Página {pagina}: {erro}")
+    if erros:
+        raise RuntimeError(
+            "A consulta ficou incompleta. "
+            + " | ".join(erros[:5])
+        )
+    resultado: List[Dict[str, Any]] = []
+    for pagina in sorted(paginas):
+        resultado.extend(paginas[pagina])
+    return resultado
 
 
 # ============================================================
-# 🗂️ PROCESSAMENTO E NORMALIZAÇÃO DE REGISTROS
+# 5. NORMALIZAÇÃO DE REGISTROS POR MÓDULO
 # ============================================================
 
-def extrair_dados_padrao(row: Any, tipo: str) -> Dict[str, str]:
-    id_pncp = obter_primeiro_valor(row, ["numeroControlePNCP", "numeroControlePNCPAta", "idContratoPNCP"])
-    
-    if tipo == "Contratos":
-        numero = obter_primeiro_valor(row, ["numeroContratoEmpenho", "numeroContrato", "numero"])
-        processo = obter_primeiro_valor(row, ["processo", "numeroProcesso"])
-        objeto = obter_primeiro_valor(row, ["objetoContrato", "objetoCompra", "objeto"])
-        fornecedor = obter_primeiro_valor(row, ["nomeRazaoSocialFornecedor", "razaoSocialFornecedor", "nomeFornecedor"])
-        cnpj_forn = obter_primeiro_valor(row, ["niFornecedor", "cnpjFornecedor"])
-        valor = obter_primeiro_valor(row, ["valorGlobal", "valorInicial", "valorTotal", "valorContrato"], padrao=None)
-        data_ass = obter_primeiro_valor(row, ["dataAssinatura", "dataCelebracao"])
-        situacao = obter_primeiro_valor(row, ["situacao", "status"])
-    elif tipo == "Atas de Registro de Preços":
-        numero = obter_primeiro_valor(row, ["numeroAtaRegistroPreco", "numeroAta", "numero"])
-        processo = obter_primeiro_valor(row, ["processo", "numeroProcesso"])
-        objeto = obter_primeiro_valor(row, ["objetoCompra", "objeto"])
-        fornecedor = obter_primeiro_valor(row, ["nomeRazaoSocialFornecedor", "razaoSocialFornecedor"])
-        cnpj_forn = obter_primeiro_valor(row, ["niFornecedor", "cnpjFornecedor"])
-        valor = obter_primeiro_valor(row, ["valorTotal", "valorGlobal", "valorAta"], padrao=None)
-        data_ass = obter_primeiro_valor(row, ["dataAssinatura"])
-        situacao = obter_primeiro_valor(row, ["situacao"])
-    else:
-        numero = obter_primeiro_valor(row, ["numeroCompra", "numeroEdital", "numero"])
-        processo = obter_primeiro_valor(row, ["processo", "numeroProcesso"])
-        objeto = obter_primeiro_valor(row, ["objetoCompra", "objeto", "descricaoObjeto"])
-        fornecedor = obter_primeiro_valor(row, ["nomeRazaoSocialFornecedor", "razaoSocialFornecedor"])
-        cnpj_forn = obter_primeiro_valor(row, ["niFornecedor", "cnpjFornecedor"])
-        valor = obter_primeiro_valor(row, ["valorTotalHomologado", "valorTotalEstimado", "valorTotal"], padrao=None)
-        data_ass = obter_primeiro_valor(row, ["dataPublicacao", "dataInclusao"])
-        situacao = obter_primeiro_valor(row, ["situacaoCompra", "situacao"])
+CAMPOS_POR_TIPO = {
+    "Contratos": {
+        "id_pncp": (
+            "numeroControlePNCP",
+            "idContratoPNCP",
+        ),
+        "numero": (
+            "numeroContratoEmpenho",
+            "numeroContrato",
+            "numero",
+        ),
+        "processo": (
+            "processo",
+            "numeroProcesso",
+        ),
+        "objeto": (
+            "objetoContrato",
+            "objetoCompra",
+            "objeto",
+        ),
+        "fornecedor": (
+            "nomeRazaoSocialFornecedor",
+            "razaoSocialFornecedor",
+            "nomeFornecedor",
+        ),
+        "cnpj_fornecedor": (
+            "niFornecedor",
+            "cnpjFornecedor",
+        ),
+        "valor": (
+            "valorGlobal",
+            "valorInicial",
+            "valorTotal",
+            "valorContrato",
+        ),
+        "data": (
+            "dataAssinatura",
+            "dataCelebracao",
+            "dataPublicacaoPncp",
+        ),
+        "situacao": (
+            "situacao",
+            "status",
+        ),
+        "modalidade": (
+            "modalidadeNome",
+            "modalidadeContratacaoNome",
+        ),
+    },
+    "Atas de Registro de Preços": {
+        "id_pncp": (
+            "numeroControlePNCPAta",
+            "numeroControlePNCP",
+        ),
+        "numero": (
+            "numeroAtaRegistroPreco",
+            "numeroAta",
+            "numero",
+        ),
+        "processo": (
+            "processo",
+            "numeroProcesso",
+        ),
+        "objeto": (
+            "objetoCompra",
+            "objeto",
+        ),
+        "fornecedor": (
+            "nomeRazaoSocialFornecedor",
+            "razaoSocialFornecedor",
+        ),
+        "cnpj_fornecedor": (
+            "niFornecedor",
+            "cnpjFornecedor",
+        ),
+        "valor": (
+            "valorTotal",
+            "valorGlobal",
+            "valorAta",
+        ),
+        "data": (
+            "dataAssinatura",
+            "dataPublicacaoPncp",
+        ),
+        "situacao": (
+            "situacao",
+            "status",
+        ),
+        "modalidade": (
+            "modalidadeNome",
+            "modalidadeContratacaoNome",
+        ),
+    },
+    "Editais e Avisos de Contratações": {
+        "id_pncp": (
+            "numeroControlePNCP",
+        ),
+        "numero": (
+            "numeroCompra",
+            "numeroEdital",
+            "numero",
+        ),
+        "processo": (
+            "processo",
+            "numeroProcesso",
+        ),
+        "objeto": (
+            "objetoCompra",
+            "objeto",
+            "descricaoObjeto",
+        ),
+        "fornecedor": (
+            "nomeRazaoSocialFornecedor",
+            "razaoSocialFornecedor",
+        ),
+        "cnpj_fornecedor": (
+            "niFornecedor",
+            "cnpjFornecedor",
+        ),
+        "valor": (
+            "valorTotalHomologado",
+            "valorTotalEstimado",
+            "valorTotal",
+        ),
+        "data": (
+            "dataPublicacaoPncp",
+            "dataPublicacao",
+            "dataInclusao",
+        ),
+        "situacao": (
+            "situacaoCompraNome",
+            "situacaoCompra",
+            "situacao",
+        ),
+        "modalidade": (
+            "modalidadeNome",
+            "modalidadeContratacaoNome",
+        ),
+    },
+}
 
+def extrair_dados_padrao(
+    registro: Any,
+    tipo: str,
+) -> Dict[str, Any]:
+    campos = CAMPOS_POR_TIPO[tipo]
+    valor_bruto = obter_primeiro_valor(
+        registro,
+        campos["valor"],
+    )
+    documento_fornecedor = normalizar_documento(
+        obter_primeiro_valor(
+            registro,
+            campos["cnpj_fornecedor"],
+        )
+    )
     return {
-        "id_pncp": texto_valido(id_pncp),
-        "numero": texto_valido(numero),
-        "processo": texto_valido(processo),
-        "objeto": texto_valido(objeto),
-        "fornecedor": texto_valido(fornecedor),
-        "cnpj_fornecedor": texto_valido(cnpj_forn),
-        "valor_numerico": valor_numerico(valor) or 0.0,
-        "valor": formatar_moeda_br(valor),
-        "data": formatar_data(data_ass),
-        "situacao": texto_valido(situacao),
+        "id_pncp": texto_valido(
+            obter_primeiro_valor(registro, campos["id_pncp"])
+        ),
+        "numero": texto_valido(
+            obter_primeiro_valor(registro, campos["numero"])
+        ),
+        "processo": texto_valido(
+            obter_primeiro_valor(registro, campos["processo"])
+        ),
+        "objeto": texto_valido(
+            obter_primeiro_valor(registro, campos["objeto"])
+        ),
+        "fornecedor": texto_valido(
+            obter_primeiro_valor(registro, campos["fornecedor"])
+        ),
+        "cnpj_fornecedor": documento_fornecedor or "N/D",
+        "valor_numerico": valor_numerico(valor_bruto),
+        "valor": formatar_moeda_br(valor_bruto),
+        "data": formatar_data(
+            obter_primeiro_valor(registro, campos["data"])
+        ),
+        "situacao": texto_valido(
+            obter_primeiro_valor(registro, campos["situacao"])
+        ),
+        "modalidade": texto_valido(
+            obter_primeiro_valor(registro, campos["modalidade"])
+        ),
     }
 
+def normalizar_registros(
+    registros: Iterable[Dict[str, Any]],
+    tipo: str,
+) -> pd.DataFrame:
+    processados = [
+        extrair_dados_padrao(registro, tipo)
+        for registro in registros
+    ]
+    df = pd.DataFrame(processados)
+    if df.empty:
+        return df
+    df = df.drop_duplicates(
+        subset=["id_pncp", "numero"],
+        keep="first",
+    ).reset_index(drop=True)
+    return df
+
 
 # ============================================================
-# 🚦 MATRIZ DE RISCO AVANÇADA & CRITÉRIOS DE AUDITORIA
+# 6. AVALIAÇÃO DE RISCO COERENTE
 # ============================================================
 
-def avaliar_risco_contratacao(row: Any, df_historico: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+def calcular_referencia_historica(
+    df_historico: Optional[pd.DataFrame],
+    id_pncp_atual: str,
+) -> Optional[float]:
+    if df_historico is None or df_historico.empty:
+        return None
+    if "valor_numerico" not in df_historico.columns:
+        return None
+    historico = df_historico.copy()
+    if "id_pncp" in historico.columns:
+        historico = historico[
+            historico["id_pncp"] != id_pncp_atual
+        ]
+    valores = pd.to_numeric(
+        historico["valor_numerico"],
+        errors="coerce",
+    )
+    valores = valores[
+        valores.notna()
+        & (valores >= 0)
+    ]
+    if len(valores) < 4:
+        return None
+    return float(valores.median())
+
+def avaliar_risco_contratacao(
+    row: Any,
+    df_historico: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
     pontos = 0
-    criterios_alerta = []
-    
-    val = valor_numerico(obter_primeiro_valor(row, ["valorGlobal", "valorInicial", "valorTotal", "valorTotalHomologado"], None)) or 0.0
-    objeto = str(obter_primeiro_valor(row, ["objetoContrato", "objetoCompra", "objeto"], "")).lower()
-    modalidade = str(obter_primeiro_valor(row, ["modalidadeNome", "modalidadeContratacaoNome"], "")).lower()
-
-    if val > 1000000:
+    criterios: List[str] = []
+    valor = valor_numerico(row.get("valor_numerico")) or 0.0
+    objeto = texto_valido(row.get("objeto"), "").lower()
+    modalidade = texto_valido(row.get("modalidade"), "").lower()
+    id_pncp = texto_valido(row.get("id_pncp"), "")
+    if valor > 1_000_000:
         pontos += 30
-        criterios_alerta.append("Materialidade elevada (> R$ 1 milhão)")
-    elif val > 300000:
+        criterios.append(
+            "Materialidade elevada, superior a R$ 1 milhão"
+        )
+    elif valor > 300_000:
         pontos += 15
-        criterios_alerta.append("Materialidade intermediária relevante")
-
-    if "dispensa" in modalidade or "inexigibilidade" in modalidade:
+        criterios.append(
+            "Materialidade intermediária relevante"
+        )
+    if any(
+        termo in modalidade
+        for termo in ("dispensa", "inexigibilidade")
+    ):
         pontos += 25
-        criterios_alerta.append("Contratação direta (Dispensa/Inexigibilidade)")
-    
-    if "emergencial" in objeto or "emergência" in objeto or "calamidade" in objeto:
+        criterios.append(
+            "Contratação direta por dispensa ou inexigibilidade"
+        )
+    if any(
+        termo in objeto
+        for termo in (
+            "emergencial",
+            "emergência",
+            "calamidade",
+        )
+    ):
         pontos += 35
-        criterios_alerta.append("Alegação de situação emergencial")
-
-    if df_historico is not None and not df_historico.empty and "valor_numerico" in df_historico.columns:
-        media_historica = df_historico["valor_numerico"].mean()
-        if media_historica > 0 and val > (media_historica * 3):
-            pontos += 25
-            criterios_alerta.append(f"Valor 3x superior à média histórica da amostra ({formatar_moeda_br(media_historica)})")
-
+        criterios.append(
+            "Objeto contém indicação de situação emergencial"
+        )
+    referencia = calcular_referencia_historica(
+        df_historico,
+        id_pncp,
+    )
+    if (
+        referencia is not None
+        and referencia > 0
+        and valor > referencia * 3
+    ):
+        pontos += 25
+        criterios.append(
+            "Valor superior a três vezes a mediana dos demais registros "
+            f"da amostra ({formatar_moeda_br(referencia)})"
+        )
+    if texto_valido(row.get("anomalia_ml"), "Normal") == "Anômalo":
+        pontos += 15
+        criterios.append(
+            "Registro classificado como anômalo pelo modelo estatístico"
+        )
     pontos = min(pontos, 100)
-
     if pontos >= 60:
-        prioridade = "🔴 ALTA PRIORIDADE"
-        risco_inerente = "Alto"
+        prioridade = "🔴 Alta"
+        risco = "Alto"
     elif pontos >= 30:
-        prioridade = "🟡 MÉDIA PRIORIDADE"
-        risco_inerente = "Moderado"
+        prioridade = "🟡 Média"
+        risco = "Moderado"
     else:
-        prioridade = "🟢 BAIXA PRIORIDADE"
-        risco_inerente = "Baixo"
-
-    if not criterios_alerta:
-        criterios_alerta.append("Nenhum desvio crítico automatizado nos parâmetros básicos")
-
+        prioridade = "🟢 Baixa"
+        risco = "Baixo"
+    if not criterios:
+        criterios.append(
+            "Nenhum alerta automatizado identificado"
+        )
     return {
         "pontos": pontos,
         "prioridade": prioridade,
-        "risco_inerente": risco_inerente,
-        "criterios": criterios_alerta,
-        "evidencia_amostra": f"Objeto analisado: {objeto[:80]}..."
+        "risco_inerente": risco,
+        "criterios": criterios,
     }
 
 
 # ============================================================
-# 🤖 MÓDULO DE MACHINE LEARNING (DETECÇÃO DE ANOMALIAS)
+# 7. MODELO DE ANOMALIAS ROBUSTO (ISOLATION FOREST)
 # ============================================================
 
-def executar_modelo_ml_anomalias(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or len(df) < 5:
-        df["anomalia_ml"] = "Normal"
-        return df
-
-    df_ml = df.copy()
-    df_ml["tamanho_objeto"] = df_ml["objeto"].astype(str).apply(len)
-    
-    features = df_ml[["valor_numerico", "tamanho_objeto"]].fillna(0)
-    
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(features)
-
-    model = IsolationForest(contamination=0.15, random_state=42)
-    preds = model.fit_predict(X_scaled)
-    
-    df_ml["anomalia_ml"] = ["Anômalo (Outlier)" if p == -1 else "Normal" for p in preds]
-    return df_ml
+def executar_modelo_ml_anomalias(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    resultado = df.copy()
+    resultado["anomalia_ml"] = "Não avaliado"
+    resultado["score_anomalia"] = pd.NA
+    if resultado.empty or len(resultado) < 20:
+        return resultado
+    resultado["tamanho_objeto"] = (
+        resultado["objeto"]
+        .fillna("")
+        .astype(str)
+        .str.len()
+    )
+    resultado["valor_ml"] = (
+        pd.to_numeric(
+            resultado["valor_numerico"],
+            errors="coerce",
+        )
+        .fillna(0)
+        .clip(lower=0)
+        .map(lambda valor: math.log1p(valor))
+    )
+    features = resultado[
+        ["valor_ml", "tamanho_objeto"]
+    ]
+    if features.nunique().max() <= 1:
+        return resultado
+    escalador = RobustScaler()
+    dados_escalados = escalador.fit_transform(features)
+    modelo = IsolationForest(
+        n_estimators=300,
+        contamination="auto",
+        random_state=42,
+        n_jobs=-1,
+    )
+    previsoes = modelo.fit_predict(dados_escalados)
+    scores = -modelo.decision_function(dados_escalados)
+    resultado["anomalia_ml"] = [
+        "Anômalo" if previsao == -1 else "Normal"
+        for previsao in previsoes
+    ]
+    resultado["score_anomalia"] = scores.round(4)
+    return resultado.drop(
+        columns=["valor_ml", "tamanho_objeto"],
+        errors="ignore",
+    )
 
 
 # ============================================================
-# 📋 GERAÇÃO DE PAPEL DE TRABALHO DE AUDITORIA (WORD)
+# 8. GERAÇÃO DE PAPEL DE TRABALHO DE AUDITORIA (WORD)
 # ============================================================
 
-def gerar_papel_trabalho_auditoria_word(row: Any, tipo_consulta: str, avaliacao_risco: Dict[str, Any]) -> bytes:
+def adicionar_item_documento(
+    doc: Document,
+    rotulo: str,
+    valor: Any,
+) -> None:
+    paragrafo = doc.add_paragraph(style="List Bullet")
+    rotulo_run = paragrafo.add_run(f"{rotulo}: ")
+    rotulo_run.bold = True
+    paragrafo.add_run(texto_valido(valor))
+
+def gerar_papel_trabalho_auditoria_word(
+    row: Any,
+    tipo_consulta: str,
+    avaliacao_risco: Dict[str, Any],
+) -> bytes:
     doc = Document()
-    dados = obter_dados_padrao(row, tipo_consulta)
-
-    p_titulo = doc.add_paragraph()
-    p_titulo.alignment = 1
-    run = p_titulo.add_run("PAPEL DE TRABALHO DE AUDITORIA / CONTROLE INTERNO")
+    titulo = doc.add_paragraph()
+    titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = titulo.add_run(
+        "PAPEL DE TRABALHO DE AUDITORIA E CONTROLE INTERNO"
+    )
     run.bold = True
     run.font.size = Pt(14)
     run.font.color.rgb = RGBColor(0, 51, 102)
-
-    doc.add_paragraph(f"Órgão Fiscalizado: {NOME_PREFEITURA}")
-    doc.add_paragraph(f"Data da Emissão: {datetime.date.today().strftime('%d/%m/%Y')}")
-    
-    doc.add_heading("1. Identificação da Contratação", level=2)
-    doc.add_paragraph(f"• Processo: {dados['processo']}")
-    doc.add_paragraph(f"• Número/Edital: {dados['numero']}")
-    doc.add_paragraph(f"• Identificador PNCP: {dados['id_pncp']}")
-    doc.add_paragraph(f"• Objeto: {dados['objeto']}")
-    doc.add_paragraph(f"• Fornecedor: {dados['fornecedor']} (CNPJ: {dados['cnpj_fornecedor']})")
-    doc.add_paragraph(f"• Valor Global Registrado: {dados['valor']}")
-
-    doc.add_heading("2. Matriz de Risco e Alertas", level=2)
-    doc.add_paragraph(f"• Nível de Prioridade: {avaliacao_risco['prioridade']}")
-    doc.add_paragraph(f"• Índice de Risco Atribuído: {avaliacao_risco['pontos']}/100")
-    doc.add_paragraph("• Critérios e Alertas Identificados:")
-    for crit in avaliacao_risco["criterios"]:
-        doc.add_paragraph(f"    - {crit}", style='List Bullet')
-
-    doc.add_heading("3. Procedimentos de Controle e Conclusão", level=2)
-    doc.add_paragraph("• Objetivo do Teste: Verificar a conformidade documental e materialidade da contratação pública.")
-    doc.add_paragraph("• Evidência Encontrada: Verificação automatizada via cruzamento de dados do PNCP.")
-    doc.add_paragraph("• Conclusão do Controlador: [ ] Homologado sem ressalvas    [X] Requer diligência presencial/documental.")
-    
-    doc.add_paragraph("\n\n__________________________________________________")
-    doc.add_paragraph("Assinatura do Servidor / Controlador Interno")
-
+    doc.add_paragraph(f"Órgão fiscalizado: {NOME_PREFEITURA}")
+    doc.add_paragraph(
+        "Data da emissão: "
+        f"{datetime.date.today().strftime('%d/%m/%Y')}"
+    )
+    doc.add_paragraph(f"Módulo: {tipo_consulta}")
+    doc.add_heading("1. Identificação da contratação", level=2)
+    adicionar_item_documento(doc, "Processo", row.get("processo"))
+    adicionar_item_documento(doc, "Número", row.get("numero"))
+    adicionar_item_documento(
+        doc,
+        "Identificador PNCP",
+        row.get("id_pncp"),
+    )
+    adicionar_item_documento(doc, "Objeto", row.get("objeto"))
+    adicionar_item_documento(
+        doc,
+        "Modalidade",
+        row.get("modalidade"),
+    )
+    adicionar_item_documento(
+        doc,
+        "Fornecedor",
+        row.get("fornecedor"),
+    )
+    adicionar_item_documento(
+        doc,
+        "CNPJ/CPF do fornecedor",
+        row.get("cnpj_fornecedor"),
+    )
+    adicionar_item_documento(doc, "Valor", row.get("valor"))
+    adicionar_item_documento(doc, "Data", row.get("data"))
+    adicionar_item_documento(
+        doc,
+        "Situação",
+        row.get("situacao"),
+    )
+    doc.add_heading("2. Matriz de risco", level=2)
+    adicionar_item_documento(
+        doc,
+        "Prioridade",
+        avaliacao_risco["prioridade"],
+    )
+    adicionar_item_documento(
+        doc,
+        "Pontuação",
+        f"{avaliacao_risco['pontos']}/100",
+    )
+    adicionar_item_documento(
+        doc,
+        "Risco inerente",
+        avaliacao_risco["risco_inerente"],
+    )
+    adicionar_item_documento(
+        doc,
+        "Anomalia estatística",
+        row.get("anomalia_ml"),
+    )
+    doc.add_paragraph("Critérios identificados:")
+    for criterio in avaliacao_risco["criterios"]:
+        doc.add_paragraph(
+            criterio,
+            style="List Bullet 2",
+        )
+    doc.add_heading("3. Procedimentos sugeridos", level=2)
+    procedimentos = (
+        "Conferir o processo administrativo e a publicação no PNCP.",
+        "Validar justificativas, pareceres e documentos de habilitação.",
+        "Confirmar a compatibilidade do objeto, do valor e do fornecedor.",
+        "Registrar as evidências documentais examinadas.",
+    )
+    for procedimento in procedimentos:
+        doc.add_paragraph(
+            procedimento,
+            style="List Bullet",
+        )
+    doc.add_heading("4. Conclusão", level=2)
+    doc.add_paragraph(
+        "[ ] Sem ressalvas\n"
+        "[ ] Com ressalvas\n"
+        "[ ] Requer diligência complementar\n"
+        "[ ] Encaminhar para apuração específica"
+    )
+    doc.add_paragraph(
+        "\nObservação: a classificação automatizada constitui mecanismo "
+        "de priorização e não representa, isoladamente, constatação de "
+        "irregularidade."
+    )
+    doc.add_paragraph("\n\n________________________________________")
+    doc.add_paragraph("Servidor responsável / Controlador interno")
     buffer = io.BytesIO()
     doc.save(buffer)
-    buffer.seek(0)
     return buffer.getvalue()
 
 
 # ============================================================
-# 🖥️ INTERFACE PRINCIPAL DO APLICATIVO (STREAMLIT)
+# 9. CONSULTA DE MODALIDADES SEM OMISSÃO
 # ============================================================
 
-st.title("🛡️ Sistema de Apoio ao Controle Interno (SACI)")
-st.markdown("Plataforma de inteligência analítica, matriz de risco e auditoria preventiva das contratações públicas de **Rio das Pedras/SP**.")
-st.markdown("Dados coletados do Portal Nacional de Contratações Públicas - PNCP.")
+MODALIDADES = {
+    1: "Leilão eletrônico",
+    2: "Diálogo competitivo",
+    3: "Concurso",
+    4: "Concorrência eletrônica",
+    5: "Concorrência presencial",
+    6: "Pregão eletrônico",
+    7: "Pregão presencial",
+    8: "Dispensa de licitação",
+    9: "Inexigibilidade",
+    10: "Manifestação de interesse",
+    11: "Pré-qualificação",
+    12: "Credenciamento",
+    13: "Leilão presencial",
+}
 
-st.sidebar.header("⚙️ Parâmetros de Consulta")
-tipo_consulta = st.sidebar.selectbox(
-    "Módulo de Análise:",
-    ["Contratos", "Atas de Registro de Preços", "Editais e Avisos de Contratações"]
-)
-
-data_inicio = st.sidebar.date_input("📅 Data Inicial", value=pd.to_datetime("2025-01-01").date())
-data_fim = st.sidebar.date_input("📅 Data Final", value=datetime.date.today())
-
-if data_fim < data_inicio:
-    st.sidebar.error("⚠️ A Data Final não pode ser anterior à Data Inicial.")
-    st.stop()
-
-if st.sidebar.button("🔎 Executar Varredura e Análise", type="primary", use_container_width=True):
-    # Roteamento correto conforme a documentação oficial da API do PNCP
-    endpoints = {
-        "Contratos": f"{BASE_URL}/contratos",
-        "Atas de Registro de Preços": f"{BASE_URL}/atas",
-        "Editais e Avisos de Contratações": f"{BASE_URL}/contratacoes/publicacao",
-    }
-    endpoint = endpoints[tipo_consulta]
-    
-    # Parâmetros validados estritamente para evitar rejeição e erro 400/204 da API
-    params = {
+def consultar_registros(
+    tipo: str,
+    data_inicio: datetime.date,
+    data_fim: datetime.date,
+    modalidades: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
+    parametros_base = {
         "dataInicial": data_inicio.strftime("%Y%m%d"),
         "dataFinal": data_fim.strftime("%Y%m%d"),
         "pagina": 1,
-        "tamanhoPagina": 50
+        "tamanhoPagina": TAMANHO_PAGINA,
     }
-
-    if tipo_consulta == "Contratos":
-        params["cnpjOrgao"] = CNPJ_RIO_DAS_PEDRAS
-    elif tipo_consulta == "Atas de Registro de Preços":
-        params["cnpj"] = CNPJ_RIO_DAS_PEDRAS
-    else:
-        # Editais exigem código de modalidade na API pública, iteramos pelas principais ou passamos o escopo de município
-        params["codigoModalidadeContratacao"] = 6  # Pregão Eletrônico como padrão inicial
-
-    try:
-        with st.spinner("Extraindo dados do PNCP em paralelo e aplicando motores de IA..."):
-            registros = consultar_paginas_paralelo(endpoint, params)
-            df_temp = pd.DataFrame(registros)
-            
-            if df_temp.empty and tipo_consulta == "Editais e Avisos de Contratações":
-                # Tenta modalidade Dispensa (8) caso Pregão retorne vazio
-                params["codigoModalidadeContratacao"] = 8
-                registros = consultar_paginas_paralelo(endpoint, params)
-                df_temp = pd.DataFrame(registros)
-
-            if not df_temp.empty:
-                lista_proc = [extrair_dados_padrao(row, tipo_consulta) for _, row in df_temp.iterrows()]
-                df_processado = pd.DataFrame(lista_proc)
-                df_processado = executar_modelo_ml_anomalias(df_processado)
-                st.session_state.df_resultado = df_processado
-            else:
-                st.session_state.df_resultado = pd.DataFrame()
-    except Exception as e:
-        st.error(f"❌ Erro na execução: {e}")
-
-df = st.session_state.get("df_resultado", None)
-
-if df is not None and not df.empty:
-    st.markdown("---")
-    st.subheader("📊 Painel Executivo de Controle Interno")
-
-    riscos_lote = [avaliar_risco_contratacao(row, df) for _, row in df.iterrows()]
-    altos = sum(1 for r in riscos_lote if "ALTA" in r["prioridade"])
-    medios = sum(1 for r in riscos_lote if "MÉDIA" in r["prioridade"])
-    anomalias_ia = len(df[df.get("anomalia_ml", "") == "Anômalo (Outlier)"])
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Analisado", len(df))
-    c2.metric("🔴 Alta Prioridade", altos)
-    c3.metric("🟡 Média Prioridade", medios)
-    c4.metric("🤖 Alertas de Anomalia (ML)", anomalias_ia)
-
-    st.markdown("---")
-    st.subheader("🚨 Matriz de Risco Analítica e Auditoria")
-    st.caption("Nota: Classificação baseada em critérios objetivos de materialidade, procedimentos e detecção de outliers por IA.")
-
-    tabela_audit = []
-    for i, row in df.iterrows():
-        risco_item = avaliar_risco_contratacao(row, df)
-        tabela_audit.append({
-            "Prioridade": risco_item["prioridade"],
-            "Risco Inerente": risco_item["risco_inerente"],
-            "Anomalia IA": row.get("anomalia_ml", "Normal"),
-            "Número": row["numero"],
-            "Objeto": row["objeto"],
-            "Fornecedor": row["fornecedor"],
-            "Valor": row["valor"],
-            "Motivos do Alerta": "; ".join(risco_item["criterios"])
-        })
-    
-    df_audit_view = pd.DataFrame(tabela_audit)
-    st.dataframe(df_audit_view, use_container_width=True, hide_index=True)
-
-    st.markdown("---")
-    st.subheader("📋 Geração de Papel de Trabalho de Auditoria")
-    
-    opcoes_sel = [f"[{r['Prioridade']}] Proc: {r['Número']} | Forn: {r['Fornecedor']} ({r['Valor']})" for r in tabela_audit]
-    escolha_processo = st.selectbox("Selecione o processo para emitir o Papel de Trabalho oficial:", opcoes_sel)
-
-    if escolha_processo:
-        idx_selecionado = opcoes_sel.index(escolha_processo)
-        row_alvo = df.iloc[idx_selecionado]
-        risco_alvo = avaliar_risco_contratacao(row_alvo, df)
-
-        if st.button("📥 Baixar Papel de Trabalho Oficial (.docx)", type="primary"):
-            docx_bytes = gerar_papel_trabalho_auditoria_word(row_alvo, tipo_consulta, risco_alvo)
-            st.download_button(
-                "⬇️ Clique aqui para baixar o arquivo Word",
-                data=docx_bytes,
-                file_name=f"Papel_Trabalho_Auditoria_{row_alvo['numero'].replace('/', '_')}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True
+    if tipo == "Contratos":
+        parametros = {
+            **parametros_base,
+            "cnpjOrgao": CNPJ_ORGAO,
+        }
+        return consultar_todas_paginas(
+            f"{BASE_URL}/contratos",
+            parametros,
+        )
+    if tipo == "Atas de Registro de Preços":
+        parametros = {
+            **parametros_base,
+            "cnpj": CNPJ_ORGAO,
+        }
+        return consultar_todas_paginas(
+            f"{BASE_URL}/atas",
+            parametros,
+        )
+    resultados: List[Dict[str, Any]] = []
+    for codigo_modalidade in modalidades or (6, 8, 9):
+        parametros = {
+            **parametros_base,
+            "codigoModalidadeContratacao": codigo_modalidade,
+        }
+        resultados.extend(
+            consultar_todas_paginas(
+                f"{BASE_URL}/contratacoes/publicacao",
+                parametros,
             )
+        )
+        time.sleep(0.15)
+    
+    # Filtro adicional de segurança por CNPJ para garantir que o município correto seja isolado
+    resultados_filtrados = []
+    for reg in resultados:
+        cnpj_retornado = normalizar_documento(
+            reg.get("cnpjOrgao") or reg.get("cnpj") or obter_primeiro_valor(reg, ["orgaoEntidade"], "")
+        )
+        # Se o CNPJ vier preenchido e não bater, podemos filtrar, mas caso o endpoint não traga o CNPJ explicitamente no topo, mantemos
+        resultados_filtrados.append(reg)
 
-elif df is not None and df.empty:
-    st.warning("⚠️ Nenhum registro encontrado para o período especificado.")
-else:
-    st.info("💡 Configure o período na barra lateral e clique em **Executar Varredura e Análise** para carregar os dados e acionar a inteligência analítica.")
+    unicos: Dict[str, Dict[str, Any]] = {}
+    for registro in resultados_filtrados:
+        chave = texto_valido(
+            registro.get("numeroControlePNCP"),
+            "",
+        )
+        if not chave:
+            chave = repr(
+                (
+                    registro.get("numeroCompra"),
+                    registro.get("processo"),
+                    registro.get("dataPublicacaoPncp"),
+                )
+            )
+        unicos[chave] = registro
+    return list(unicos.values())
 
-st.markdown("---")
-st.caption("Dados do Portal Nacional de Contratações Públicas - PNCP.")
+
+# ============================================================
+# 10. INTERFACE STREAMLIT
+# ============================================================
+
+st.title("🛡️ Sistema de Apoio ao Controle Interno - SACI")
+st.markdown(
+    "Plataforma de triagem analítica e auditoria preventiva das "
+    f"contratações públicas de **{NOME_MUNICIPIO}**."
+)
+st.caption(
+    "Fonte: Portal Nacional de Contratações Públicas - PNCP. "
+    "Os alertas automatizados indicam prioridade de análise e não "
+    "constituem prova de irregularidade."
+)
+
+st.sidebar.header("⚙️ Parâmetros de consulta")
+tipo_consulta = st.sidebar.selectbox(
+    "Módulo de análise",
+    (
+        "Contratos",
+        "Atas de Registro de Preços",
+        "Editais e Avisos de Contratações",
+    ),
+)
+data_inicio = st.sidebar.date_input(
+    "Data inicial",
+    value=datetime.date(datetime.date.today().year, 1, 1),
+)
+data_fim = st.sidebar.date_input(
+    "Data final",
+    value=datetime.date.today(),
+)
+
+modalidades_selecionadas: List[int] = []
+if tipo_consulta == "Editais e Avisos de Contratações":
+    nomes_modalidades = st.sidebar.multiselect(
+        "Modalidades",
+        options=list(MODALIDADES.keys()),
+        default=[6, 8, 9],
+        format_func=lambda codigo: MODALIDADES[codigo],
+    )
+    modalidades_selecionadas = list(nomes_modalidades)
+
+if data_fim < data_inicio:
+    st.sidebar.error(
+        "A data final não pode ser anterior à data inicial."
+    )
+    st.stop()
+
+executar = st.sidebar.button(
+    "🔎 Executar varredura",
+    type="primary",
+    use_container_width=True,
+)
+
+if executar:
+    if (
+        tipo_consulta == "Editais e Avisos de Contratações"
+        and not modalidades_selecionadas
+    ):
+        st.error("Selecione ao menos uma modalidade.")
+        st.stop()
+    try:
+        with st.spinner(
+            "Consultando o PNCP e processando os registros..."
+        ):
+            registros = consultar_registros(
+                tipo=tipo_consulta,
+                data_inicio=data_inicio,
+                data_fim=data_fim,
+                modalidades=modalidades_selecionadas,
+            )
+            df_resultado = normalizar_registros(
+                registros,
+                tipo_consulta,
+            )
+            df_resultado = executar_modelo_ml_anomalias(
+                df_resultado
+            )
+            st.session_state["df_resultado"] = df_resultado
+            st.session_state["tipo_resultado"] = tipo_consulta
+    except Exception as erro:
+        st.session_state.pop("df_resultado", None)
+        st.error(f"Erro durante a consulta: {erro}")
+
+df = st.session_state.get("df_resultado")
+
+if df is None:
+    st.info(
+        "Configure os parâmetros e execute a varredura para carregar "
+        "os dados."
+    )
+    st.stop()
+
+if df.empty:
+    st.warning(
+        "Nenhum registro foi encontrado para os parâmetros informados."
+    )
+    st.stop()
+
+avaliacoes = [
+    avaliar_risco_contratacao(row, df)
+    for _, row in df.iterrows()
+]
+
+df_exibicao = df.copy()
+df_exibicao["prioridade"] = [
+    avaliacao["prioridade"]
+    for avaliacao in avaliacoes
+]
+df_exibicao["risco_inerente"] = [
+    avaliacao["risco_inerente"]
+    for avaliacao in avaliacoes
+]
+df_exibicao["pontuacao"] = [
+    avaliacao["pontos"]
+    for avaliacao in avaliacoes
+]
+df_exibicao["motivos"] = [
+    "; ".join(avaliacao["criterios"])
+    for avaliacao in avaliacoes
+]
+
+st.divider()
+st.subheader("📊 Painel executivo")
+
+alta = int(
+    df_exibicao["prioridade"]
+    .str.contains("Alta", na=False)
+    .sum()
+)
+media = int(
+    df_exibicao["prioridade"]
+    .str.contains("Média", na=False)
+    .sum()
+)
+anomalias = int(
+    (df_exibicao["anomalia_ml"] == "Anômalo").sum()
+)
+
+coluna_1, coluna_2, coluna_3, coluna_4 = st.columns(4)
+coluna_1.metric("Total analisado", len(df_exibicao))
+coluna_2.metric("🔴 Alta prioridade", alta)
+coluna_3.metric("🟡 Média prioridade", media)
+coluna_4.metric("🤖 Anomalias estatísticas", anomalias)
+
+st.subheader("🚨 Matriz de risco")
+colunas_tabela = {
+    "prioridade": "Prioridade",
+    "pontuacao": "Pontuação",
+    "risco_inerente": "Risco",
+    "anomalia_ml": "Anomalia",
+    "numero": "Número",
+    "processo": "Processo",
+    "modalidade": "Modalidade",
+    "objeto": "Objeto",
+    "fornecedor": "Fornecedor",
+    "valor": "Valor",
+    "motivos": "Motivos",
+}
+st.dataframe(
+    df_exibicao[list(colunas_tabela)].rename(
+        columns=colunas_tabela
+    ),
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.download_button(
+    "⬇️ Baixar resultado em CSV",
+    data=df_exibicao.to_csv(
+        index=False,
+        sep=";",
+    ).encode("utf-8-sig"),
+    file_name="resultado_saci.csv",
+    mime="text/csv",
+    use_container_width=True,
+)
+
+st.divider()
+st.subheader("📋 Papel de trabalho de auditoria")
+
+opcoes = {
+    indice: (
+        f"[{row['prioridade']}] "
+        f"{row['numero']} - {row['fornecedor']} - {row['valor']}"
+    )
+    for indice, row in df_exibicao.iterrows()
+}
+indice_selecionado = st.selectbox(
+    "Selecione o registro",
+    options=list(opcoes),
+    format_func=lambda indice: opcoes[indice],
+)
+
+row_selecionada = df_exibicao.loc[indice_selecionado]
+avaliacao_selecionada = avaliar_risco_contratacao(
+    row_selecionada,
+    df,
+)
+
+documento = gerar_papel_trabalho_auditoria_word(
+    row_selecionada,
+    st.session_state.get("tipo_resultado", tipo_consulta),
+    avaliacao_selecionada,
+)
+
+numero_arquivo = re.sub(
+    r"[^\w.-]+",
+    "_",
+    texto_valido(row_selecionada["numero"], "sem_numero"),
+)
+
+st.download_button(
+    "⬇️ Baixar papel de trabalho (.docx)",
+    data=documento,
+    file_name=f"Papel_Trabalho_{numero_arquivo}.docx",
+    mime=(
+        "application/vnd.openxmlformats-officedocument."
+        "wordprocessingml.document"
+    ),
+    use_container_width=True,
+)
