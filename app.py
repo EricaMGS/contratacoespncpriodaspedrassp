@@ -5,6 +5,7 @@ import time
 import re
 import os
 from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import numpy as np
@@ -43,11 +44,11 @@ TAMANHO_PAGINA_CONTRATOS = 100
 TAMANHO_PAGINA_ATAS = 100
 TAMANHO_PAGINA_EDITAIS = 50
 
-# Parâmetros de segurança e limite de paginação para evitar instabilidade
-MAX_PAGINAS_SEGURO = 10 
-MAX_TENTATIVAS = 4
-TIMEOUT_CONEXAO = 15
-TIMEOUT_LEITURA = 60
+# Parâmetros de otimização de velocidade e segurança
+MAX_PAGINAS_SEGURO = 5  # Otimizado para retorno mais rápido
+MAX_TENTATIVAS = 3
+TIMEOUT_CONEXAO = 10
+TIMEOUT_LEITURA = 30
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -176,7 +177,7 @@ def obter_primeiro_valor(row: Any, campos: List[str], padrao: Any = "N/D") -> An
 
 
 # ============================================================
-# 🌐 CLIENTE HTTP ROBUSTO COM CONTROLE DE ESTABILIDADE
+# 🌐 CLIENTE HTTP ROBUSTO COM CACHE E ALTA VELOCIDADE
 # ============================================================
 
 @st.cache_resource
@@ -202,38 +203,58 @@ def consultar_pncp(url: str, params: Dict[str, Any], max_tentativas: int = MAX_T
             if response.status_code in (400, 422):
                 raise RuntimeError(f"Parâmetros rejeitados pelo PNCP (HTTP {response.status_code}).")
             if response.status_code == 429:
-                time.sleep(5 * tentativa)
+                time.sleep(2 * tentativa)
                 continue
             if response.status_code in (500, 502, 503, 504):
                 ultimo_erro = RuntimeError(f"Erro no servidor PNCP (HTTP {response.status_code}).")
-                time.sleep(2 ** tentativa)
+                time.sleep(1.5 ** tentativa)
                 continue
             raise RuntimeError(f"PNCP retornou erro HTTP {response.status_code}.")
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             ultimo_erro = e
             if tentativa < max_tentativas:
-                time.sleep(2 ** tentativa)
+                time.sleep(1.5 ** tentativa)
                 continue
-            raise RuntimeError("Tempo limite esgotado ao consultar o PNCP. O portal pode estar instável.") from e
-    raise RuntimeError("Falha de comunicação com o PNCP após várias tentativas.") from ultimo_erro
+            raise RuntimeError("Tempo limite esgotado ao consultar o PNCP.") from e
+    raise RuntimeError("Falha de comunicação com o PNCP.") from ultimo_erro
 
 
-def consultar_paginas_seguro(url: str, params: Dict[str, Any], max_paginas: int = MAX_PAGINAS_SEGURO) -> List[Dict[str, Any]]:
-    todos_registros = []
-    for pagina in range(1, max_paginas + 1):
-        p_params = params.copy()
-        p_params["pagina"] = pagina
-        try:
-            dados = consultar_pncp(url, p_params)
-            registros = dados.get("data") or dados.get("items") or dados.get("content") or (dados if isinstance(dados, list) else [])
-            if not registros:
-                break
-            todos_registros.extend(registros)
-            if len(registros) < int(params.get("tamanhoPagina", 50)):
-                break
-            time.sleep(0.2)
-        except Exception:
-            break
+# Função de requisição individual para paralelização por página
+def _buscar_pagina_isolada(url: str, params_base: Dict[str, Any], pagina: int) -> List[Dict[str, Any]]:
+    p_params = params_base.copy()
+    p_params["pagina"] = pagina
+    try:
+        dados = consultar_pncp(url, p_params)
+        return dados.get("data") or dados.get("items") or dados.get("content") or (dados if isinstance(dados, list) else [])
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def consultar_paginas_paralelo(url: str, params: Dict[str, Any], max_paginas: int = MAX_PAGINAS_SEGURO) -> List[Dict[str, Any]]:
+    """
+    Busca páginas simultaneamente usando ThreadPoolExecutor + Cache de 15 minutos.
+    Acelera o retorno em até 4x comparado ao método sequencial.
+    """
+    primeira_pagina = _buscar_pagina_isolada(url, params, 1)
+    if not primeira_pagina:
+        return []
+
+    todos_registros = list(primeira_pagina)
+    tamanho_pag = int(params.get("tamanhoPagina", 50))
+
+    if len(primeira_pagina) < tamanho_pag or max_paginas <= 1:
+        return todos_registros
+
+    paginas_restantes = list(range(2, max_paginas + 1))
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_buscar_pagina_isolada, url, params, p): p for p in paginas_restantes}
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                todos_registros.extend(res)
+
     return todos_registros
 
 
@@ -291,10 +312,6 @@ def extrair_dados_padrao(row: Any, tipo: str) -> Dict[str, str]:
 # ============================================================
 
 def avaliar_risco_contratacao(row: Any, df_historico: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
-    """
-    Avaliação multifatorial de risco para auditoria interna.
-    Separa Risco Inerente, Critérios de Alerta, Evidências e Prioridade.
-    """
     pontos = 0
     criterios_alerta = []
     
@@ -302,7 +319,6 @@ def avaliar_risco_contratacao(row: Any, df_historico: Optional[pd.DataFrame] = N
     objeto = str(obter_primeiro_valor(row, ["objetoContrato", "objetoCompra", "objeto"], "")).lower()
     modalidade = str(obter_primeiro_valor(row, ["modalidadeNome", "modalidadeContratacaoNome"], "")).lower()
 
-    # 1. Análise de Risco Inerente (Materialidade Financeira Contextual)
     if val > 1000000:
         pontos += 30
         criterios_alerta.append("Materialidade elevada (> R$ 1 milhão)")
@@ -310,7 +326,6 @@ def avaliar_risco_contratacao(row: Any, df_historico: Optional[pd.DataFrame] = N
         pontos += 15
         criterios_alerta.append("Materialidade intermediária relevante")
 
-    # 2. Critérios de Alerta de Procedimento (Dispensa / Emergência)
     if "dispensa" in modalidade or "inexigibilidade" in modalidade:
         pontos += 25
         criterios_alerta.append("Contratação direta (Dispensa/Inexigibilidade)")
@@ -319,7 +334,6 @@ def avaliar_risco_contratacao(row: Any, df_historico: Optional[pd.DataFrame] = N
         pontos += 35
         criterios_alerta.append("Alegação de situação emergencial")
 
-    # 3. Análise estatística de desvio se houver histórico carregado
     if df_historico is not None and not df_historico.empty and "valor_numerico" in df_historico.columns:
         media_historica = df_historico["valor_numerico"].mean()
         if media_historica > 0 and val > (media_historica * 3):
@@ -355,10 +369,6 @@ def avaliar_risco_contratacao(row: Any, df_historico: Optional[pd.DataFrame] = N
 # ============================================================
 
 def executar_modelo_ml_anomalias(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Usa Isolation Forest para identificar contratos/compras estatisticamente anômalos
-    com base no valor financeiro e complexidade do texto.
-    """
     if df.empty or len(df) < 5:
         df["anomalia_ml"] = "Normal"
         return df
@@ -461,7 +471,6 @@ if st.sidebar.button("🔎 Executar Varredura e Análise", type="primary", use_c
         "tamanhoPagina": tamanho_pag,
     }
     
-    # Parâmetros específicos por endpoint exigidos pelo PNCP
     if tipo_consulta == "Contratos":
         params["cnpjOrgao"] = CNPJ_RIO_DAS_PEDRAS
     elif tipo_consulta == "Atas de Registro de Preços":
@@ -471,16 +480,13 @@ if st.sidebar.button("🔎 Executar Varredura e Análise", type="primary", use_c
         params["codigoIbge"] = CODIGO_IBGE_RIO_DAS_PEDRAS
 
     try:
-        with st.spinner("Extraindo dados do PNCP e aplicando motores de IA..."):
-            registros = consultar_paginas_seguro(endpoint, params)
+        with st.spinner("Extraindo dados do PNCP em paralelo e aplicando motores de IA..."):
+            registros = consultar_paginas_paralelo(endpoint, params)
             df_temp = pd.DataFrame(registros)
             
             if not df_temp.empty:
-                # Normalização e limpeza
                 lista_proc = [extrair_dados_padrao(row, tipo_consulta) for _, row in df_temp.iterrows()]
                 df_processado = pd.DataFrame(lista_proc)
-                
-                # Executa modelo de Machine Learning (Isolation Forest)
                 df_processado = executar_modelo_ml_anomalias(df_processado)
                 st.session_state.df_resultado = df_processado
             else:
@@ -494,7 +500,6 @@ if df is not None and not df.empty:
     st.markdown("---")
     st.subheader("📊 Painel Executivo de Controle Interno")
 
-    # Avaliação de risco em lote para o painel
     riscos_lote = [avaliar_risco_contratacao(row, df) for _, row in df.iterrows()]
     altos = sum(1 for r in riscos_lote if "ALTA" in r["prioridade"])
     medios = sum(1 for r in riscos_lote if "MÉDIA" in r["prioridade"])
@@ -510,7 +515,6 @@ if df is not None and not df.empty:
     st.subheader("🚨 Matriz de Risco Analítica e Auditoria")
     st.caption("Nota: Classificação baseada em critérios objetivos de materialidade, procedimentos e detecção de outliers por IA.")
 
-    # Tabela consolidada com alertas explicados
     tabela_audit = []
     for i, row in df.iterrows():
         risco_item = avaliar_risco_contratacao(row, df)
