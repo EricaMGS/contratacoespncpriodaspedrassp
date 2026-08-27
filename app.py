@@ -409,12 +409,12 @@ def gerar_papel_trabalho_auditoria_word(row: Any, tipo_consulta: str, avaliacao_
     doc.add_paragraph(f"• Índice de Risco Atribuído: {avaliacao_risco['pontos']}/100")
     doc.add_paragraph("• Critérios e Alertas Identificados:")
     for crit in avaliacao_risco["criterios"]:
-        doc.add_paragraph(f"   - {crit}", style='List Bullet')
+        doc.add_paragraph(f"    - {crit}", style='List Bullet')
 
     doc.add_heading("3. Procedimentos de Controle e Conclusão", level=2)
     doc.add_paragraph("• Objetivo do Teste: Verificar a conformidade documental e materialidade da contratação pública.")
     doc.add_paragraph("• Evidência Encontrada: Verificação automatizada via cruzamento de dados do PNCP.")
-    doc.add_paragraph("• Conclusão do Controlador: [ ] Homologado sem ressalvas   [X] Requer diligência presencial/documental.")
+    doc.add_paragraph("• Conclusão do Controlador: [ ] Homologado sem ressalvas    [X] Requer diligência presencial/documental.")
     
     doc.add_paragraph("\n\n__________________________________________________")
     doc.add_paragraph("Assinatura do Servidor / Controlador Interno")
@@ -460,10 +460,15 @@ if st.sidebar.button("🔎 Executar Varredura e Análise", type="primary", use_c
         "dataFinal": data_fim.strftime("%Y%m%d"),
         "tamanhoPagina": tamanho_pag,
     }
+    
+    # Parâmetros específicos por endpoint exigidos pelo PNCP
     if tipo_consulta == "Contratos":
         params["cnpjOrgao"] = CNPJ_RIO_DAS_PEDRAS
     elif tipo_consulta == "Atas de Registro de Preços":
         params["cnpj"] = CNPJ_RIO_DAS_PEDRAS
+    else:
+        params["cnpj"] = CNPJ_RIO_DAS_PEDRAS
+        params["codigoIbge"] = CODIGO_IBGE_RIO_DAS_PEDRAS
 
     try:
         with st.spinner("Extraindo dados do PNCP e aplicando motores de IA..."):
