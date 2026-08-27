@@ -6,17 +6,14 @@ import time
 from dataclasses import dataclass
 from threading import local
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
 import pandas as pd
 import requests
 import streamlit as st
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt, RGBColor
-from requests.adapters import HTTPAdapter
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
-from urllib3.util.retry import Retry
 
 # ============================================================
 # 1. CONFIGURAÇÕES E TIPOS
@@ -33,13 +30,13 @@ NOME_MUNICIPIO = "Rio das Pedras/SP"
 NOME_PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
 
 BASE_URL = "https://pncp.gov.br/api/consulta/v1"
-TIMEOUT = (10, 45)
+TIMEOUT = (15, 60)
 TAMANHO_PAGINA = 50
 MAX_PAGINAS = 100
 MAX_TRABALHADORES = 4
 
 HEADERS = {
-    "User-Agent": "SACI-Controle-Interno/2.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
 }
 
@@ -164,29 +161,12 @@ def obter_primeiro_valor(
 
 
 # ============================================================
-# 3. CLIENTE HTTP COM RETENTATIVAS (THREAD-SAFE)
+# 3. CLIENTE HTTP ROBUSTO (THREAD-SAFE)
 # ============================================================
 
 def criar_sessao_http() -> requests.Session:
     sessao = requests.Session()
     sessao.headers.update(HEADERS)
-    estrategia = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
-        backoff_factor=1.0,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET"}),
-        respect_retry_after_header=True,
-        raise_on_status=False,
-    )
-    adaptador = HTTPAdapter(
-        max_retries=estrategia,
-        pool_connections=MAX_TRABALHADORES,
-        pool_maxsize=MAX_TRABALHADORES,
-    )
-    sessao.mount("https://", adaptador)
     return sessao
 
 def obter_sessao_thread() -> requests.Session:
@@ -199,48 +179,66 @@ def consultar_pncp(
     parametros: Dict[str, Any],
 ) -> Dict[str, Any]:
     sessao = obter_sessao_thread()
-    try:
-        resposta = sessao.get(
-            url,
-            params=parametros,
-            timeout=TIMEOUT,
-        )
-    except requests.Timeout as erro:
-        raise RuntimeError("Tempo limite excedido ao consultar o PNCP.") from erro
-    except requests.ConnectionError as erro:
-        raise RuntimeError("Não foi possível conectar ao PNCP.") from erro
-    except requests.RequestException as erro:
-        # Cobre qualquer outra falha de rede/HTTP não prevista explicitamente
-        # acima (ex.: erro de SSL, redirecionamento inválido, etc.), para que
-        # a página nunca quebre com um traceback bruto para o usuário.
-        raise RuntimeError(
-            f"Falha inesperada de comunicação com o PNCP: {erro}"
-        ) from erro
-    if resposta.status_code == 204:
-        return {"data": [], "totalPaginas": 0}
-    if resposta.status_code != 200:
-        detalhe = resposta.text[:300].strip()
-        mensagem = (
-            f"PNCP retornou HTTP {resposta.status_code}. "
-            f"Endpoint: {url}. Parâmetros: {parametros}."
-        )
-        if detalhe:
-            mensagem += f" Resposta: {detalhe}"
-        raise RuntimeError(mensagem)
-    try:
-        conteudo = resposta.json()
-    except ValueError as erro:
-        raise RuntimeError(
-            "O PNCP respondeu com conteúdo que não é JSON válido."
-        ) from erro
-    if isinstance(conteudo, list):
-        return {
-            "data": conteudo,
-            "totalPaginas": 1,
-        }
-    if not isinstance(conteudo, dict):
-        raise RuntimeError("Formato de resposta inesperado do PNCP.")
-    return conteudo
+    max_tentativas = 3
+    ultimo_erro = None
+
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            resposta = sessao.get(
+                url,
+                params=parametros,
+                timeout=TIMEOUT,
+            )
+            
+            if resposta.status_code == 204:
+                return {"data": [], "totalPaginas": 0}
+            
+            if resposta.status_code == 429:
+                time.sleep(2 * tentativa)
+                continue
+                
+            if resposta.status_code in (500, 502, 503, 504):
+                time.sleep(1.5 ** tentativa)
+                continue
+
+            if resposta.status_code != 200:
+                detalhe = resposta.text[:300].strip()
+                mensagem = (
+                    f"PNCP retornou HTTP {resposta.status_code}. "
+                    f"Endpoint: {url}. Parâmetros: {parametros}."
+                )
+                if detalhe:
+                    mensagem += f" Resposta: {detalhe}"
+                raise RuntimeError(mensagem)
+
+            conteudo = resposta.json()
+            if isinstance(conteudo, list):
+                return {
+                    "data": conteudo,
+                    "totalPaginas": 1,
+                }
+            if not isinstance(conteudo, dict):
+                raise RuntimeError("Formato de resposta inesperado do PNCP.")
+            return conteudo
+
+        except requests.Timeout as erro:
+            ultimo_erro = RuntimeError("Tempo limite excedido ao consultar o PNCP.") from erro
+            if tentativa < max_tentativas:
+                time.sleep(1.5 ** tentativa)
+                continue
+        except requests.ConnectionError as erro:
+            ultimo_erro = RuntimeError("Não foi possível conectar ao PNCP. Verifique sua conexão.") from erro
+            if tentativa < max_tentativas:
+                time.sleep(1.5 ** tentativa)
+                continue
+        except requests.RequestException as erro:
+            raise RuntimeError(f"Falha inesperada de comunicação com o PNCP: {erro}") from erro
+        except ValueError as erro:
+            raise RuntimeError("O PNCP respondeu com conteúdo que não é JSON válido.") from erro
+
+    if ultimo_erro:
+        raise ultimo_erro
+    raise RuntimeError("Falha de comunicação com o PNCP após várias tentativas.")
 
 
 # ============================================================
@@ -339,17 +337,6 @@ def consultar_todas_paginas(
 # ============================================================
 # 5. FILTRO DE SEGURANÇA POR ÓRGÃO (CNPJ)
 # ============================================================
-#
-# CORREÇÃO IMPORTANTE: o endpoint /contratacoes/publicacao retorna
-# registros de TODOS os órgãos do Brasil para a modalidade/período
-# pesquisados — ele não filtra por CNPJ do órgão. A versão anterior
-# deste arquivo tinha um laço que aparentava filtrar por CNPJ, mas
-# não fazia nenhuma comparação de fato (copiava tudo sem checar),
-# o que podia expor contratações de OUTROS municípios como se
-# fossem de Rio das Pedras/SP. As funções abaixo implementam o
-# filtro de verdade e são aplicadas a todos os módulos, inclusive
-# Contratos e Atas, como camada extra de segurança caso o filtro
-# do lado do servidor falhe silenciosamente.
 
 def extrair_cnpj_orgao_registro(registro: Dict[str, Any]) -> str:
     candidatos: List[Any] = [
@@ -375,12 +362,6 @@ def filtrar_registros_por_orgao(
     registros: List[Dict[str, Any]],
     cnpj_esperado: str,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Mantém apenas registros cujo CNPJ do órgão bate com o esperado.
-
-    Registros em que não foi possível identificar o CNPJ do órgão são
-    mantidos (para não perder dados silenciosamente), mas contados à
-    parte para que a interface avise o usuário sobre a incerteza.
-    """
     filtrados: List[Dict[str, Any]] = []
     sem_identificacao = 0
     for registro in registros:
@@ -914,7 +895,6 @@ def consultar_registros(
     data_fim: datetime.date,
     modalidades: Optional[Sequence[int]] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Retorna (registros_do_orgao, quantidade_sem_cnpj_identificado)."""
     parametros_base = {
         "dataInicial": data_inicio.strftime("%Y%m%d"),
         "dataFinal": data_fim.strftime("%Y%m%d"),
@@ -943,9 +923,6 @@ def consultar_registros(
         )
         return filtrar_registros_por_orgao(brutos, CNPJ_ORGAO)
 
-    # "Editais e Avisos de Contratações": o endpoint de publicação NÃO
-    # aceita filtro por CNPJ do órgão, então a filtragem abaixo é a
-    # única barreira contra misturar contratações de outros municípios.
     resultados: List[Dict[str, Any]] = []
     for codigo_modalidade in modalidades or (6, 8, 9):
         parametros = {
@@ -1210,7 +1187,7 @@ numero_arquivo = re.sub(
 st.download_button(
     "⬇️ Baixar papel de trabalho (.docx)",
     data=documento,
-    file_name=f"Papel_Trabalho_{numero_arquivo}.docx",
+    file_name=f"Papel_Trabolho_{numero_arquivo}.docx",
     mime=(
         "application/vnd.openxmlformats-officedocument."
         "wordprocessingml.document"
