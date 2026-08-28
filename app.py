@@ -61,7 +61,7 @@ HISTORICO_PATH = CACHE_DIR / "contratacoes_controle_interno.parquet"
 META_PATH = CACHE_DIR / "controle_incremental.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/2.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/2.1",
     "Accept": "application/json",
     "Connection": "keep-alive",
 }
@@ -491,7 +491,7 @@ def gerar_excel(df: pd.DataFrame, tipo: str, df_risco: pd.DataFrame) -> bytes:
 def main():
     st.set_page_config(page_title="Controle Interno — PNCP Rio das Pedras", page_icon="🛡️", layout="wide")
 
-    # Garante que o estado seja inicializado
+    # Garante que o estado seja inicializado e prevenimos ghosting
     if "df" not in st.session_state:
         st.session_state.update({"df": None, "tipo": TIPOS[0], "inicio": dt.date(2026, 1, 1), "fim": dt.date.today(), "modo": "⚡ Consulta por período"})
 
@@ -501,7 +501,7 @@ def main():
     with st.sidebar:
         st.header("⚙️ Parâmetros")
         
-        # PREVENÇÃO DE GHOSTING: Se o usuário mudar o escopo, limpa os dados da tela antes de buscar!
+        # PREVENÇÃO DE GHOSTING (Bug das Atas resolvidas)
         tipo_selecionado = st.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
         if tipo_selecionado != st.session_state.tipo:
             st.session_state.tipo = tipo_selecionado
@@ -520,11 +520,11 @@ def main():
         buscar_btn = st.button("🔎 Carregar dados", type="primary", use_container_width=True)
 
     if buscar_btn:
-        # CORREÇÃO DE API: Editais e Avisos agora utilizam o endpoint correto de consulta de publicações!
+        # CORREÇÃO DE ENDPOINT: Revertido para a API do Órgão, que não sofre bloqueio do código 400
         endpoints = {
             "Contratos": f"{BASE_CONSULTA}/contratos",
             "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
-            "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes/publicacao", 
+            "Editais e Avisos de Contratações": f"{BASE_DOCUMENTOS}/orgaos/{CNPJ}/compras", 
         }
         tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
         
@@ -538,17 +538,29 @@ def main():
                     "dataFinal": data_fim.strftime("%Y%m%d"), 
                     "tamanhoPagina": tamanhos[tipo_selecionado]
                 }
-                params["cnpjOrgao" if tipo_selecionado != "Atas de Registro de Preços" else "cnpj"] = CNPJ
+                
+                # Setup Específico dos Parâmetros
+                if tipo_selecionado == "Contratos":
+                    params["cnpjOrgao"] = CNPJ
+                elif tipo_selecionado == "Atas de Registro de Preços":
+                    params["cnpj"] = CNPJ
+                elif tipo_selecionado == "Editais e Avisos de Contratações":
+                    # O endpoint /compras trabalha muito bem se informarmos o anoCompra caso a consulta seja dentro do mesmo ano
+                    if data_ini.year == data_fim.year:
+                        params["anoCompra"] = data_ini.year
                 
                 regs, _, _ = consultar(endpoints[tipo_selecionado], params, max_paginas)
                 novo = normalizar_pncp(regs)
                 novo = deduplicar(novo)
-                novo = filtrar_cnpj(novo)
+                
+                # A API de Editais já garante o CNPJ pelo link, os outros necessitam checagem no código
+                if tipo_selecionado != "Editais e Avisos de Contratações":
+                    novo = filtrar_cnpj(novo)
 
                 combinado = mesclar_historico(historico, novo, tipo_selecionado)
                 df = combinado.copy()
                 
-                # Filtragem Segura
+                # Filtragem Segura por Datas com Pandas
                 col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
                 if col_data and not df.empty:
                     ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
@@ -580,9 +592,9 @@ def main():
     # Processamento Inicial
     dados_totais = [dados_registro(row, tipo_atual) for row in df_bruto.to_dict('records')]
     
-    # 🌟 NOVA FEATURE: Filtro Global de Segmentação por Modalidade 🌟
+    # 🌟 FILTRO GLOBAL DE SEGMENTAÇÃO POR MODALIDADE 🌟
     st.markdown("---")
-    st.subheader("🗂️ Segmentação de Dados")
+    st.subheader("🗂️ Segmentação Estratégica")
     todas_modalidades = sorted(list(set(d["modalidade"] for d in dados_totais if d["modalidade"] and d["modalidade"] != "N/D")))
     
     if todas_modalidades:
@@ -624,7 +636,7 @@ def main():
     df_risco = pd.DataFrame(rows).sort_values(["Score", "Índice"], ascending=[False, True])
 
     st.markdown("---")
-    tab1, tab2 = st.tabs(["🚦 Matriz de Risco Geral", "📋 Auditoria e Semântica Individual"])
+    tab1, tab2 = st.tabs(["🚦 Matriz de Risco Segmentada", "📋 Auditoria e Semântica Individual"])
 
     with tab1:
         st.dataframe(df_risco.drop(columns=["Índice"]), use_container_width=True, hide_index=True)
