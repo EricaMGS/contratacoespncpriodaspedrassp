@@ -351,15 +351,29 @@ def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str)
     partes = [x for x in (df_antigo, df_novo) if x is not None and not x.empty]
     if not partes:
         return pd.DataFrame()
+        
     out = pd.concat(partes, ignore_index=True, sort=False)
     out["__chave"] = out.apply(chave_historico, axis=1)
     out = out.drop_duplicates("__chave", keep="last").drop(columns=["__chave"])
     out["__tipo_controle"] = tipo
+    
     garantir_cache()
     try:
-        out.to_parquet(HISTORICO_PATH, index=False)
+        # CORREÇÃO: Garante que os registros antigos de OUTROS tipos não sejam apagados do arquivo Parquet.
+        if HISTORICO_PATH.exists():
+            df_completo = pd.read_parquet(HISTORICO_PATH)
+            if not df_completo.empty and "__tipo_controle" in df_completo.columns:
+                df_outros_tipos = df_completo[df_completo["__tipo_controle"] != tipo]
+                df_salvar = pd.concat([df_outros_tipos, out], ignore_index=True, sort=False)
+            else:
+                df_salvar = out
+        else:
+            df_salvar = out
+            
+        df_salvar.to_parquet(HISTORICO_PATH, index=False)
     except Exception:
         out.to_csv(CACHE_DIR / "contratacoes_controle_interno.csv", index=False, encoding="utf-8-sig")
+        
     return out.drop(columns=["__tipo_controle"], errors="ignore").reset_index(drop=True)
 
 
@@ -434,15 +448,15 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         dt_ = primeiro(r_dict, ["dataAssinatura", "dataPublicacaoPncp", "dataCelebracao"])
         sit = primeiro(r_dict, ["situacao", "status"])
         
-    else:
-        num = primeiro(r_dict, ["numeroCompra", "numeroEdital", "numero"])
-        proc = primeiro(r_dict, ["processo", "numeroProcesso"])
-        obj = primeiro(r_dict, ["objetoCompra", "objeto", "descricaoObjeto"])
+    else: # Editais e Avisos de Contratações
+        num = primeiro(r_dict, ["numeroCompra", "compra.numeroCompra", "numeroEdital", "numero"])
+        proc = primeiro(r_dict, ["processo", "compra.processo", "numeroProcesso"])
+        obj = primeiro(r_dict, ["objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
         forn = primeiro(r_dict, ["nomeRazaoSocialFornecedor", "fornecedor.nomeRazaoSocial", "razaoSocialFornecedor", "nomeFornecedor"])
-        cnpj = primeiro(r_dict, ["niFornecedor", "fornecedor.niFornecedor", "cnpjFornecedor"])
-        val = primeiro(r_dict, ["valorTotalHomologado", "valorTotalEstimado", "valorTotal"])
+        cnpj = primeiro(r_dict, ["niFornecedor", "fornecedor.niFornecedor", "cnpjFornecedor", "cnpjOrgao"])
+        val = primeiro(r_dict, ["valorTotalHomologado", "compra.valorTotalHomologado", "valorTotalEstimado", "compra.valorTotalEstimado", "valorTotal"])
         dt_ = primeiro(r_dict, ["dataPublicacao", "dataPublicacaoPncp", "dataInclusao"])
-        sit = primeiro(r_dict, ["situacaoCompra", "situacao", "status"])
+        sit = primeiro(r_dict, ["situacaoCompra", "compra.situacaoCompraNome", "situacao", "status"])
         
     mod = primeiro(r_dict, ["modalidadeNome", "modalidadeContratacaoNome", "compra.modalidadeNome", "modalidade"])
 
@@ -498,7 +512,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     modalidade = d.get("modalidade", "").lower()
     objeto = d.get("objeto", "").lower()
 
-    # 1) Completude
     faltantes = []
     for campo, label in (("objeto", "objeto"), ("controle", "controle PNCP"), ("data", "data")):
         if texto(d.get(campo), "") in {"", "N/D"}:
@@ -510,7 +523,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     else:
         testes.append("Completude cadastral: OK")
 
-    # 2) Modalidades
     if "dispensa" in modalidade or "inexig" in modalidade:
         pontos += 20
         motivos.append("Modalidade que requer análise específica de fundamento e justificativas")
@@ -522,7 +534,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     else:
         testes.append("Modalidade: sem alerta automático desta regra")
 
-    # 3) Valor
     if valor is not None:
         if valor >= 500_000:
             pontos += 10
@@ -534,7 +545,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     else:
         testes.append("Materialidade: valor não identificado")
 
-    # 4) Outlier relativo
     baixo, alto, mediana = limites_iqr(contexto.get("valor_num", pd.Series(dtype=float)))
     outlier = False
     if valor is not None and alto is not None and valor > alto:
@@ -545,13 +555,11 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     else:
         testes.append("Anomalia de valor: sem alerta pelo IQR")
 
-    # 5) Continuidade/Aditivo
     if any(k in objeto for k in ("prorroga", "aditivo", "continuado", "continuidade")):
         pontos += 10
         motivos.append("Objeto contém termos associados a continuidade/aditamento")
         testes.append("Continuidade/aditivo: revisar histórico contratual")
 
-    # 6) Concentração de Fornecedor
     fornecedor = texto(d.get("fornecedor"), "N/D")
     if fornecedor != "N/D" and not contexto.empty and "fornecedor" in contexto.columns:
         qtd = int((contexto["fornecedor"].astype(str).str.strip() == fornecedor.strip()).sum())
@@ -784,6 +792,11 @@ if "tipo" not in st.session_state:
 
 st.sidebar.header("⚙️ Parâmetros")
 tipo = st.sidebar.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
+
+# Alerta caso o usuário troque o escopo sem apertar "Carregar dados"
+if tipo != st.session_state.tipo and st.session_state.df is not None:
+    st.warning("⚠️ Você alterou o escopo da consulta. Clique no botão **Carregar dados** para buscar os registros no PNCP e atualizar a tabela.")
+
 inicio = st.sidebar.date_input("📅 Data inicial", dt.date(2026, 1, 1))
 fim = st.sidebar.date_input("📅 Data final", dt.date.today())
 max_paginas = st.sidebar.slider("📄 Limite máximo de páginas", 1, 30, MAX_PAGINAS_PADRAO)
@@ -825,15 +838,22 @@ if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=
                 data_ini, data_fim = inicio, fim
 
             params = {"dataInicial": data_ini.strftime("%Y%m%d"), "dataFinal": data_fim.strftime("%Y%m%d"), "tamanhoPagina": tamanhos[tipo], "pagina": 1}
-            if tipo == "Contratos": params["cnpjOrgao"] = CNPJ
-            if tipo == "Atas de Registro de Preços": params["cnpj"] = CNPJ
+            
+            # CORREÇÃO CRUCIAL: O filtro CNPJ agora é exigido estritamente para todas as buscas.
+            if tipo == "Contratos": 
+                params["cnpjOrgao"] = CNPJ
+            elif tipo == "Atas de Registro de Preços": 
+                params["cnpj"] = CNPJ
+            elif tipo == "Editais e Avisos de Contratações": 
+                params["cnpjOrgao"] = CNPJ
             
             regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
             
             novo = normalizar_pncp(regs)
             novo = deduplicar(novo)
             
-            if tipo == "Contratos": novo = filtrar_cnpj(novo)
+            # Filtro CNPJ para eliminar lixo na API independente do tipo
+            novo = filtrar_cnpj(novo)
 
             combinado = mesclar_historico(historico, novo, tipo)
             
@@ -916,7 +936,7 @@ for i, r in enumerate(riscos):
 st.caption(f"{len(indices)} registro(s) selecionado(s) para análise.")
 
 # Processo selecionado
-st.subheader("📋 Análise individual / Papel de Trabalho")
+st.subheader("📋 Análise individual")
 if not indices:
     st.warning("Nenhum registro atende aos filtros atuais.")
 else:
