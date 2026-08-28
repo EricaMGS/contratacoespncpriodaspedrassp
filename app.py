@@ -3,6 +3,8 @@ import re
 import time
 import zipfile
 import datetime as dt
+import json
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,13 +46,14 @@ BASE_DOCUMENTOS = "https://pncp.gov.br/api/pncp/v1"
 PAGE_CONTRATOS = 100
 PAGE_ATAS = 100
 PAGE_EDITAIS = 50
-
-# A consulta agora carrega as páginas restantes em paralelo depois da 1ª.
-# Isso reduz bastante o tempo quando existem muitas páginas.
 MAX_PAGINAS_PADRAO = 15
-MAX_WORKERS = 6
 MAX_TENTATIVAS = 3
-TIMEOUT = (8, 45)
+TIMEOUT = (10, 45)
+MAX_WORKERS = 6
+CACHE_TTL = 900
+CACHE_DIR = Path("dados")
+HISTORICO_PATH = CACHE_DIR / "contratacoes_controle_interno.parquet"
+META_PATH = CACHE_DIR / "controle_incremental.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
@@ -253,65 +256,110 @@ def paginacao(data: Any) -> Dict[str, Optional[int]]:
     return out
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_paginas: int) -> Tuple[List[Dict[str, Any]], int]:
-    """
-    Consulta otimizada:
-    1) busca a primeira página para descobrir o total;
-    2) baixa as demais páginas em paralelo;
-    3) não usa sleep artificial entre páginas;
-    4) mantém cache por 15 minutos.
-    """
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_paginas: int) -> Tuple[List[Dict[str, Any]], int, Optional[int]]:
     base = dict(params_tuple)
-    tamanho = int(base.get("tamanhoPagina", 50))
-    limite = max(1, int(max_paginas))
-
-    primeira = get_json(url, {**base, "pagina": 1})
+    base["pagina"] = 1
+    primeira = get_json(url, base)
     regs1 = registros_api(primeira)
     if not regs1:
-        return [], 0
-
+        return [], 0, paginacao(primeira).get("totalPaginas")
     info = paginacao(primeira)
-    total_paginas = info.get("totalPaginas")
-    if total_paginas:
-        total_paginas = min(int(total_paginas), limite)
-    else:
-        total_paginas = 1
-
-    paginas = list(range(2, total_paginas + 1))
+    total = info.get("totalPaginas")
+    if total is None and info.get("totalRegistros") is not None:
+        tamanho = max(1, int(base.get("tamanhoPagina", 50)))
+        total = (info["totalRegistros"] + tamanho - 1) // tamanho
+    limite = max(1, min(max_paginas, total or max_paginas))
     todos = list(regs1)
+    if limite == 1:
+        return todos, 1, total
 
-    if not paginas:
-        return todos, 1
+    def buscar(pagina: int):
+        p = dict(base); p["pagina"] = pagina
+        # Cada worker usa sua própria Session para evitar concorrência sobre a mesma Session.
+        r = requests.Session(); r.headers.update(HEADERS)
+        data = get_json_com_sessao(r, url, p)
+        return pagina, registros_api(data)
 
-    def buscar_pagina(pagina: int):
-        p = dict(base)
-        p["pagina"] = pagina
-        return pagina, registros_api(get_json(url, p))
-
-    # Paralelismo moderado para não sobrecarregar o PNCP.
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(paginas))) as executor:
-        futures = [executor.submit(buscar_pagina, p) for p in paginas]
-        resultados = {}
-        for future in as_completed(futures):
-            pagina, regs = future.result()
-            resultados[pagina] = regs
-
-    paginas_ok = 1
-    for pagina in sorted(resultados):
-        regs = resultados[pagina]
-        if regs:
-            todos.extend(regs)
-            paginas_ok = pagina
-        # Se uma página intermediária vier vazia, não descartamos as outras:
-        # o PNCP pode apresentar paginação inconsistente temporariamente.
-
-    return todos, paginas_ok
+    resultados = {}
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, limite - 1)) as pool:
+        futuros = {pool.submit(buscar, pagina): pagina for pagina in range(2, limite + 1)}
+        for f in as_completed(futuros):
+            pagina = futuros[f]
+            try:
+                resultados[pagina] = f.result()[1]
+            except Exception:
+                resultados[pagina] = []
+    for pagina in range(2, limite + 1):
+        todos.extend(resultados.get(pagina, []))
+    return todos, limite, total
 
 
 def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[Dict[str, Any]], int]:
     serial = tuple(sorted((str(k), str(v)) for k, v in params.items()))
     return consultar_cache(url, serial, max_paginas)
+
+
+# ============================================================
+# BASE HISTÓRICA / CONSULTA INCREMENTAL
+# ============================================================
+
+def garantir_cache():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ler_meta():
+    garantir_cache()
+    if not META_PATH.exists():
+        return {}
+    try:
+        return json.loads(META_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def salvar_meta(meta):
+    garantir_cache()
+    META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def carregar_historico(tipo: str) -> pd.DataFrame:
+    garantir_cache()
+    if not HISTORICO_PATH.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_parquet(HISTORICO_PATH)
+        if "__tipo_controle" in df.columns:
+            df = df[df["__tipo_controle"] == tipo].drop(columns=["__tipo_controle"])
+        return df.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def chave_historico(row):
+    for c in ("numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"):
+        if c in row.index:
+            v = texto(row[c], "")
+            if v:
+                return f"{c}:{v}"
+    return "|".join(texto(row.get(c), "") for c in ("numero", "numeroCompra", "numeroContrato", "processo"))
+
+
+def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str) -> pd.DataFrame:
+    partes = [x for x in (df_antigo, df_novo) if x is not None and not x.empty]
+    if not partes:
+        return pd.DataFrame()
+    out = pd.concat(partes, ignore_index=True, sort=False)
+    out["__chave"] = out.apply(chave_historico, axis=1)
+    out = out.drop_duplicates("__chave", keep="last").drop(columns=["__chave"])
+    out["__tipo_controle"] = tipo
+    garantir_cache()
+    try:
+        out.to_parquet(HISTORICO_PATH, index=False)
+    except Exception:
+        # Parquet é preferencial; CSV é fallback caso pyarrow/fastparquet não esteja disponível.
+        out.to_csv(CACHE_DIR / "contratacoes_controle_interno.csv", index=False, encoding="utf-8-sig")
+    return out.drop(columns=["__tipo_controle"], errors="ignore").reset_index(drop=True)
 
 
 # ============================================================
@@ -409,24 +457,12 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
 # RISCO — REGRAS TRANSPARENTES + ANOMALIA RELATIVA
 # ============================================================
 
-@st.cache_data(ttl=900, show_spinner=False)
 def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
     rows = []
     for _, row in df.iterrows():
-        rows.append(dados_registro(row, tipo))
-    ctx = pd.DataFrame(rows)
-
-    # Pré-calcula estatísticas usadas repetidamente pela matriz de risco.
-    if "valor_num" in ctx:
-        baixo, alto, mediana = limites_iqr(ctx["valor_num"])
-        ctx.attrs["iqr_baixo"] = baixo
-        ctx.attrs["iqr_alto"] = alto
-        ctx.attrs["mediana"] = mediana
-    if "fornecedor" in ctx:
-        ctx.attrs["fornecedor_counts"] = (
-            ctx["fornecedor"].fillna("N/D").astype(str).str.strip().value_counts().to_dict()
-        )
-    return ctx
+        d = dados_registro(row, tipo)
+        rows.append(d)
+    return pd.DataFrame(rows)
 
 
 def limites_iqr(serie: pd.Series) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -485,9 +521,7 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
         testes.append("Materialidade: valor não identificado")
 
     # 4) Outlier relativo ao conjunto consultado.
-    baixo = contexto.attrs.get("iqr_baixo")
-    alto = contexto.attrs.get("iqr_alto")
-    mediana = contexto.attrs.get("mediana")
+    baixo, alto, mediana = limites_iqr(contexto.get("valor_num", pd.Series(dtype=float)))
     outlier = False
     if valor is not None and alto is not None and valor > alto:
         outlier = True
@@ -506,8 +540,7 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     # 6) Fornecedor — concentração na própria amostra.
     fornecedor = texto(d.get("fornecedor"), "N/D")
     if fornecedor != "N/D" and not contexto.empty and "fornecedor" in contexto.columns:
-        counts = contexto.attrs.get("fornecedor_counts", {})
-        qtd = int(counts.get(fornecedor.strip(), 0))
+        qtd = int((contexto["fornecedor"].astype(str).str.strip() == fornecedor.strip()).sum())
         if qtd >= max(3, len(contexto) * 0.10):
             pontos += 10
             motivos.append(f"Fornecedor aparece {qtd} vezes na amostra consultada")
@@ -540,42 +573,32 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
 # MACHINE LEARNING — SIMILARIDADE DE OBJETOS
 # ============================================================
 
-@st.cache_data(ttl=900, show_spinner=False)
-def calcular_scores_similares(textos: Tuple[str, ...], idx: int) -> Optional[List[float]]:
-    """
-    Calcula somente a similaridade da contratação escolhida contra as demais.
-    A versão anterior construía uma matriz NxN inteira, o que ficava caro
-    quando a consulta retornava muitos registros.
-    """
-    if not SKLEARN_OK or len(textos) < 2 or idx < 0 or idx >= len(textos):
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def calcular_modelo_tfidf(textos: Tuple[str, ...]):
+    if not SKLEARN_OK or len(textos) < 2:
         return None
-    limpos = [t if t.strip() else "sem objeto" for t in textos]
-    vec = TfidfVectorizer(
-        lowercase=True,
-        strip_accents="unicode",
-        ngram_range=(1, 2),
-        min_df=1,
-        max_features=8000,
-        sublinear_tf=True,
-    )
-    matriz = vec.fit_transform(limpos)
-    consulta = matriz[idx]
-    return cosine_similarity(consulta, matriz).ravel().tolist()
+    vec = TfidfVectorizer(lowercase=True, strip_accents="unicode", ngram_range=(1, 2), min_df=1, max_features=8000, sublinear_tf=True)
+    return vec.fit_transform([t if t.strip() else "sem objeto" for t in textos])
 
 
 def similares(df: pd.DataFrame, idx: int, tipo: str, limite: int = 5) -> pd.DataFrame:
     if not SKLEARN_OK or len(df) < 2:
         return pd.DataFrame()
     objetos = [dados_registro(row, tipo)["objeto"] for _, row in df.iterrows()]
-    scores_matriz = calcular_scores_similares(tuple(objetos), idx)
-    if scores_matriz is None:
+    matriz = calcular_modelo_tfidf(tuple(objetos))
+    if matriz is None:
         return pd.DataFrame()
-    scores = [(i, float(scores_matriz[i])) for i in range(len(df)) if i != idx]
-    scores.sort(key=lambda x: x[1], reverse=True)
+    # TF-IDF normalizado: produto entre a linha selecionada e as demais = cosseno.
+    scores = (matriz @ matriz[idx].T).toarray().ravel()
+    ordem = scores.argsort()[::-1]
     saida = []
-    for i, score in scores[:limite]:
-        d = dados_registro(df.iloc[i], tipo)
-        saida.append({"Similaridade": f"{score * 100:.1f}%", "Número": d["numero"], "Objeto": d["objeto"], "Fornecedor": d["fornecedor"], "Valor": d["valor"]})
+    for j in ordem:
+        if j == idx:
+            continue
+        d = dados_registro(df.iloc[int(j)], tipo)
+        saida.append({"Similaridade": f"{float(scores[j])*100:.1f}%", "Número": d["numero"], "Objeto": d["objeto"], "Fornecedor": d["fornecedor"], "Valor": d["valor"]})
+        if len(saida) >= limite:
+            break
     return pd.DataFrame(saida)
 
 
@@ -750,7 +773,14 @@ st.sidebar.header("⚙️ Parâmetros")
 tipo = st.sidebar.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
 inicio = st.sidebar.date_input("📅 Data inicial", dt.date(2026, 1, 1))
 fim = st.sidebar.date_input("📅 Data final", dt.date.today())
-max_paginas = st.sidebar.slider("📄 Limite de páginas", 1, 30, MAX_PAGINAS_PADRAO)
+max_paginas = st.sidebar.slider("📄 Limite máximo de páginas", 1, 30, MAX_PAGINAS_PADRAO)
+modo = st.sidebar.radio("Modo", ["⚡ Consulta por período", "🔄 Atualização incremental"], index=0)
+meta = ler_meta()
+historico = carregar_historico(tipo)
+if meta.get("ultima_atualizacao"):
+    st.sidebar.caption(f"Última atualização local: {meta["ultima_atualizacao"]}")
+else:
+    st.sidebar.caption("Nenhuma atualização incremental registrada.")
 
 if fim < inicio:
     st.sidebar.error("Data final anterior à data inicial.")
@@ -763,19 +793,48 @@ if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=
         "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes/publicacao",
     }
     tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
-    params = {"dataInicial": inicio.strftime("%Y%m%d"), "dataFinal": fim.strftime("%Y%m%d"), "tamanhoPagina": tamanhos[tipo], "pagina": 1}
-    if tipo == "Contratos": params["cnpjOrgao"] = CNPJ
-    if tipo == "Atas de Registro de Preços": params["cnpj"] = CNPJ
     try:
-        with st.spinner("Consultando o PNCP... A consulta pode demorar em períodos grandes."):
-            regs, pags = consultar(endpoints[tipo], params, max_paginas)
-            df = deduplicar(tratar_df(pd.DataFrame(regs)))
-            if tipo == "Contratos": df = filtrar_cnpj(df)
+        with st.spinner("Consultando o PNCP... delimitando o período e usando paginação otimizada."):
+            if modo == "🔄 Atualização incremental":
+                ultima = meta.get("ultima_data_consultada")
+                try:
+                    base_date = dt.date.fromisoformat(ultima) if ultima else inicio
+                except Exception:
+                    base_date = inicio
+                data_ini = max(inicio, base_date - dt.timedelta(days=1))
+                data_fim = min(fim, dt.date.today())
+                if data_fim < data_ini:
+                    data_ini = data_fim
+            else:
+                data_ini, data_fim = inicio, fim
+
+            params = {"dataInicial": data_ini.strftime("%Y%m%d"), "dataFinal": data_fim.strftime("%Y%m%d"), "tamanhoPagina": tamanhos[tipo], "pagina": 1}
+            if tipo == "Contratos": params["cnpjOrgao"] = CNPJ
+            if tipo == "Atas de Registro de Preços": params["cnpj"] = CNPJ
+            regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
+            novo = deduplicar(tratar_df(pd.DataFrame(regs)))
+            if tipo == "Contratos": novo = filtrar_cnpj(novo)
+
+            combinado = mesclar_historico(historico, novo, tipo)
+            # Resultado da tela continua respeitando o período solicitado.
+            df = combinado.copy()
+            col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
+            if col_data:
+                ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
+                df = df[(ds >= inicio) & (ds <= fim)].reset_index(drop=True)
+
+            meta["ultima_atualizacao"] = dt.datetime.now().isoformat(timespec="seconds")
+            meta["ultima_data_consultada"] = data_fim.isoformat()
+            meta["tipo"] = tipo
+            salvar_meta(meta)
             st.session_state.df = df
             st.session_state.tipo = tipo
             st.session_state.paginas = pags
+            st.session_state.total_paginas_api = total_paginas
             st.session_state.inicio = inicio
             st.session_state.fim = fim
+            st.session_state.modo = modo
+            st.success(f"Consulta concluída: {len(df)} registro(s). {pags} página(s) processada(s); API informou {total_paginas or 'N/D'} página(s).")
     except Exception as e:
         st.error(f"❌ {e}")
 
@@ -801,7 +860,7 @@ valor_total = contexto["valor_num"].sum(min_count=1) if "valor_num" in contexto 
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Registros", len(df)); c2.metric("🔴 Alto risco", altos); c3.metric("🟡 Médio risco", medios); c4.metric("🚨 Outliers", outliers); c5.metric("Valor analisado", moeda(valor_total))
-st.caption(f"Páginas consultadas: {st.session_state.get('paginas', 'N/D')} | Registros após deduplicação: {len(df)}")
+st.caption(f"Páginas desta operação: {st.session_state.get('paginas', 'N/D')} | Total de páginas informado pela API: {st.session_state.get('total_paginas_api', 'N/D')} | Registros: {len(df)}")
 
 # Matriz
 st.subheader("🚦 Matriz de risco")
