@@ -46,7 +46,6 @@ PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
 BASE_CONSULTA = "https://pncp.gov.br/api/consulta/v1"
 BASE_DOCUMENTOS = "https://pncp.gov.br/api/pncp/v1"
 
-# Ajuste dinâmico de workers baseado no ambiente
 MAX_WORKERS = int(os.getenv("PNCP_MAX_WORKERS", 6))
 TIMEOUT = (10, int(os.getenv("PNCP_TIMEOUT_READ", 45)))
 MAX_TENTATIVAS = 4
@@ -62,7 +61,7 @@ HISTORICO_PATH = CACHE_DIR / "contratacoes_controle_interno.parquet"
 META_PATH = CACHE_DIR / "controle_incremental.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/1.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/2.0",
     "Accept": "application/json",
     "Connection": "keep-alive",
 }
@@ -75,17 +74,12 @@ TIPOS = ["Contratos", "Atas de Registro de Preços", "Editais e Avisos de Contra
 
 @st.cache_resource
 def sessao_http() -> requests.Session:
-    """
-    Cria uma sessão HTTP persistente com política de Exponential Backoff nativa.
-    Isso é vital para Data Engineering ao raspar APIs instáveis.
-    """
     session = requests.Session()
     session.headers.update(HEADERS)
     
-    # Configura tentativas automáticas para erros comuns de sobrecarga (429) e falha de servidor (5xx)
     retries = Retry(
         total=MAX_TENTATIVAS,
-        backoff_factor=1.5, # 1.5s, 3s, 6s...
+        backoff_factor=1.5,
         status_forcelist=[408, 429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS"]
     )
@@ -106,59 +100,48 @@ def detalhe_http(r: requests.Response) -> str:
     return r.text[:250].strip()
 
 def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    """Faz a requisição HTTP com tratamento de erro simplificado, delegando retry ao urllib3."""
     session = sessao_http()
     try:
         r = session.get(url, params=params, timeout=TIMEOUT)
-        
         if r.status_code == 200:
             return r.json()
         if r.status_code == 204:
             return []
-            
-        r.raise_for_status() # Lança erro se não for 200/204, capturado abaixo
-        
+        r.raise_for_status()
     except requests.exceptions.RetryError as e:
-        raise RuntimeError(f"Falha ao conectar no PNCP após múltiplas tentativas: Limite de taxa ou API indisponível.") from e
+        raise RuntimeError(f"Falha ao conectar no PNCP (Limite de Taxa).") from e
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"PNCP rejeitou a requisição (HTTP {e.response.status_code}): {detalhe_http(e.response)}") from e
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Erro de conexão ao acessar o PNCP: {e}") from e
+        raise RuntimeError(f"Erro de conexão: {e}") from e
 
 # ============================================================
 # UTILITÁRIOS DE LIMPEZA E FORMATAÇÃO
 # ============================================================
 
 def texto(valor: Any, padrao: str = "N/D") -> str:
-    if pd.isna(valor) or valor is None:
-        return padrao
+    if pd.isna(valor) or valor is None: return padrao
     s = str(valor).strip()
     return padrao if s.lower() in {"", "none", "nan", "null", "n/d", "nat"} else s
 
 def numero(valor: Any) -> Optional[float]:
-    if pd.isna(valor) or valor is None or isinstance(valor, bool):
-        return None
-    if isinstance(valor, (int, float)):
-        return float(valor)
+    if pd.isna(valor) or valor is None or isinstance(valor, bool): return None
+    if isinstance(valor, (int, float)): return float(valor)
     s = str(valor).strip().replace("R$", "").replace(" ", "")
     try:
-        if "," in s and "." in s:
-            s = s.replace(".", "").replace(",", ".")
-        elif "," in s:
-            s = s.replace(",", ".")
+        if "," in s and "." in s: s = s.replace(".", "").replace(",", ".")
+        elif "," in s: s = s.replace(",", ".")
         return float(s)
     except ValueError:
         return None
 
 def moeda(valor: Any) -> str:
     n = numero(valor)
-    if n is None:
-        return "N/D"
+    if n is None: return "N/D"
     return f"R$ {n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def data_br(valor: Any) -> str:
-    if pd.isna(valor) or valor is None:
-        return "N/D"
+    if pd.isna(valor) or valor is None: return "N/D"
     d = pd.to_datetime(valor, errors="coerce")
     return "N/D" if pd.isna(d) else d.strftime("%d/%m/%Y")
 
@@ -172,32 +155,25 @@ def slug(valor: Any) -> str:
 def primeiro(row_dict: Dict[str, Any], campos: List[str], padrao: Any = "N/D") -> Any:
     for campo in campos:
         valor = row_dict.get(campo)
-        if pd.isna(valor) or valor is None:
-            continue
+        if pd.isna(valor) or valor is None: continue
         if isinstance(valor, str):
             v_limpo = valor.strip()
-            if v_limpo.lower() in {"", "nan", "none", "null", "n/d", "nat"}:
-                continue
+            if v_limpo.lower() in {"", "nan", "none", "null", "n/d", "nat"}: continue
             return v_limpo
         return valor
     return padrao
 
 def fuzzy_match(r_dict: Dict[str, Any], palavras: List[str]) -> Any:
     for k, v in r_dict.items():
-        if pd.isna(v) or v is None:
-            continue
+        if pd.isna(v) or v is None: continue
         v_str = str(v).strip()
-        if v_str.lower() in ("", "nan", "none", "n/d"):
-            continue
+        if v_str.lower() in ("", "nan", "none", "n/d"): continue
         k_lower = str(k).lower()
-        if any(p in k_lower for p in palavras):
-            return v
+        if any(p in k_lower for p in palavras): return v
     return None
 
 def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
-    """Padroniza as chaves do dicionário de acordo com o tipo de contratação."""
     r_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
-    
     controle = primeiro(r_dict, ["numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"])
     
     if tipo == "Contratos":
@@ -220,7 +196,7 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         dt_ = primeiro(r_dict, ["dataAssinatura", "dataPublicacaoPncp", "dataCelebracao"])
         sit = primeiro(r_dict, ["situacao", "status"])
         
-    else: 
+    else: # Editais e Avisos (Compras)
         num = primeiro(r_dict, ["numeroCompra", "compra.numeroCompra", "numeroEdital", "numero"])
         proc = primeiro(r_dict, ["processo", "compra.processo", "numeroProcesso"])
         obj = primeiro(r_dict, ["objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
@@ -253,28 +229,22 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
     }
 
 # ============================================================
-# PAGINAÇÃO E API HANDLERS
+# PAGINAÇÃO E CÁLCULOS
 # ============================================================
 
 def registros_api(data: Any) -> List[Dict[str, Any]]:
-    if isinstance(data, list):
-        return data
-    if not isinstance(data, dict):
-        return []
+    if isinstance(data, list): return data
+    if not isinstance(data, dict): return []
     for k in ("data", "items", "content", "dados", "registros"):
-        if isinstance(data.get(k), list):
-            return data[k]
+        if isinstance(data.get(k), list): return data[k]
     return []
 
 def paginacao(data: Any) -> Dict[str, Optional[int]]:
-    if not isinstance(data, dict):
-        return {"totalPaginas": None, "totalRegistros": None}
+    if not isinstance(data, dict): return {"totalPaginas": None, "totalRegistros": None}
     out = {}
     for k in ("totalPaginas", "totalRegistros", "numeroPagina"):
-        try:
-            out[k] = int(data[k]) if data.get(k) is not None else None
-        except (ValueError, TypeError):
-            out[k] = None
+        try: out[k] = int(data[k]) if data.get(k) is not None else None
+        except (ValueError, TypeError): out[k] = None
     return out
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
@@ -285,8 +255,7 @@ def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_pag
     primeira = get_json(url, base)
     regs1 = registros_api(primeira)
     
-    if not regs1:
-        return [], 0, paginacao(primeira).get("totalPaginas")
+    if not regs1: return [], 0, paginacao(primeira).get("totalPaginas")
         
     info = paginacao(primeira)
     total = info.get("totalPaginas")
@@ -298,22 +267,19 @@ def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_pag
     limite = max(1, min(max_paginas, total or max_paginas))
     todos = list(regs1)
     
-    if limite == 1:
-        return todos, 1, total
+    if limite == 1: return todos, 1, total
 
     def buscar(pagina: int):
         p = dict(base)
         p["pagina"] = pagina
-        data = get_json(url, p)
-        return pagina, registros_api(data)
+        return pagina, registros_api(get_json(url, p))
 
     resultados = {}
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, limite - 1)) as pool:
         futuros = {pool.submit(buscar, pagina): pagina for pagina in range(2, limite + 1)}
         for f in as_completed(futuros):
             pagina = futuros[f]
-            try:
-                resultados[pagina] = f.result()[1]
+            try: resultados[pagina] = f.result()[1]
             except Exception as e:
                 logging.error(f"Erro na página {pagina}: {e}")
                 resultados[pagina] = []
@@ -328,7 +294,7 @@ def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[
     return consultar_cache(url, serial, max_paginas)
 
 # ============================================================
-# GERENCIAMENTO DE STORAGE LOCAL (Parquet IO)
+# GERENCIAMENTO DE STORAGE E CACHE (Parquet)
 # ============================================================
 
 def garantir_cache():
@@ -336,12 +302,9 @@ def garantir_cache():
 
 def ler_meta() -> dict:
     garantir_cache()
-    if not META_PATH.exists():
-        return {}
-    try:
-        return json.loads(META_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    if not META_PATH.exists(): return {}
+    try: return json.loads(META_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError: return {}
 
 def salvar_meta(meta: dict):
     garantir_cache()
@@ -349,31 +312,24 @@ def salvar_meta(meta: dict):
 
 def carregar_historico(tipo: str) -> pd.DataFrame:
     garantir_cache()
-    if not HISTORICO_PATH.exists():
-        return pd.DataFrame()
+    if not HISTORICO_PATH.exists(): return pd.DataFrame()
     try:
-        # Engine pyarrow garantido para evitar falhas de cast de tipos
         df = pd.read_parquet(HISTORICO_PATH, engine="pyarrow")
         if "__tipo_controle" in df.columns:
             df = df[df["__tipo_controle"] == tipo].drop(columns=["__tipo_controle"])
         return df.reset_index(drop=True)
     except Exception as e:
-        logging.warning(f"Aviso ao ler parquet histórico: {e}")
+        logging.warning(f"Falha ao ler parquet histórico: {e}")
         return pd.DataFrame()
 
 def chave_historico(row: pd.Series) -> str:
     for c in ("numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"):
-        if c in row.index:
-            v = texto(row[c], "")
-            if v:
-                return f"{c}:{v}"
+        if c in row.index and texto(row[c], ""): return f"{c}:{row[c]}"
     return "|".join(texto(row.get(c), "") for c in ("numero", "numeroCompra", "numeroContrato", "processo"))
 
 def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str) -> pd.DataFrame:
-    """Mescla dados com segurança, usando engine explícito e gerenciando memória."""
     partes = [x for x in (df_antigo, df_novo) if x is not None and not x.empty]
-    if not partes:
-        return pd.DataFrame()
+    if not partes: return pd.DataFrame()
         
     out = pd.concat(partes, ignore_index=True, sort=False)
     out["__chave"] = out.apply(chave_historico, axis=1)
@@ -392,19 +348,14 @@ def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str)
         else:
             df_salvar = out
             
-        # Forçar string nas colunas mistas antes de salvar no Parquet
         df_salvar = df_salvar.astype(str)
         df_salvar.to_parquet(HISTORICO_PATH, index=False, engine="pyarrow", compression="snappy")
     except Exception as e:
-        logging.error(f"Erro crítico ao salvar histórico parquet: {e}")
-        # Fallback de emergência CSV
-        out.to_csv(CACHE_DIR / "contratacoes_controle_interno.csv", index=False, encoding="utf-8-sig")
-        
+        logging.error(f"Erro ao salvar parquet: {e}")
     return out.drop(columns=["__tipo_controle"], errors="ignore").reset_index(drop=True)
 
 def normalizar_pncp(regs: List[Dict[str, Any]]) -> pd.DataFrame:
-    if not regs:
-        return pd.DataFrame()
+    if not regs: return pd.DataFrame()
     df = pd.json_normalize(regs)
     for col in df.columns:
         if any(isinstance(v, (dict, list)) for v in df[col]):
@@ -412,10 +363,8 @@ def normalizar_pncp(regs: List[Dict[str, Any]]) -> pd.DataFrame:
     return df
 
 def deduplicar(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    chaves = ["numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"]
-    for c in chaves:
+    if df.empty: return df
+    for c in ["numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"]:
         if c in df.columns:
             s = df[c].astype(str).str.strip()
             valid = s.notna() & ~s.isin({"", "nan", "None", "N/D"})
@@ -423,119 +372,66 @@ def deduplicar(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates().reset_index(drop=True)
 
 def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    if df.empty: return df
     alvo = cnpj_limpo(CNPJ)
     for col in ("cnpjOrgao", "cnpj", "cnpjCompra", "orgaoEntidade.cnpj", "orgao.cnpj"):
         if col in df.columns:
-            s = df[col].map(cnpj_limpo)
-            m = s == alvo
-            if m.any():
-                return df.loc[m].reset_index(drop=True)
+            m = df[col].map(cnpj_limpo) == alvo
+            if m.any(): return df.loc[m].reset_index(drop=True)
     return df
 
 # ============================================================
-# MOTOR DE RISCO (ESTATÍSTICA)
+# MOTOR DE RISCO (ESTATÍSTICO E REGRAS)
 # ============================================================
-
-def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
-    registros = [dados_registro(row, tipo) for row in df.to_dict('records')]
-    return pd.DataFrame(registros)
 
 def limites_iqr(serie: pd.Series) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     s = pd.to_numeric(serie, errors="coerce").dropna()
-    if len(s) < 5:
-        return None, None, None
+    if len(s) < 5: return None, None, None
     q1, q3 = s.quantile(0.25), s.quantile(0.75)
     iqr = q3 - q1
-    if iqr <= 0:
-        return None, None, float(s.median())
-    return float(q1 - 1.5 * iqr), float(q3 + 1.5 * iqr), float(s.median())
-
-def avaliar_modalidade(modalidade: str, objeto: str) -> Tuple[int, List[str], List[str]]:
-    pontos, motivos, testes = 0, [], []
-    if "dispensa" in modalidade or "inexig" in modalidade:
-        pontos += 20
-        motivos.append("Modalidade de exceção direta")
-        testes.append("Revisar fundamento legal da dispensa/inexigibilidade")
-    elif "emerg" in objeto or "emerg" in modalidade:
-        pontos += 25
-        motivos.append("Indício de contratação emergencial")
-        testes.append("Revisar motivação e prazo emergencial")
-    return pontos, motivos, testes
+    return float(q1 - 1.5 * iqr), float(q3 + 1.5 * iqr) if iqr > 0 else None, float(s.median())
 
 def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict[str, Any]:
-    pontos = 0
-    motivos = []
-    testes = []
+    pontos, motivos, testes = 0, [], []
     valor = d.get("valor_num")
     modalidade = d.get("modalidade", "").lower()
     objeto = d.get("objeto", "").lower()
 
-    faltantes = []
-    for campo, label in (("objeto", "objeto"), ("controle", "controle PNCP"), ("data", "data")):
-        if texto(d.get(campo), "") in {"", "N/D"}:
-            faltantes.append(label)
-            
+    faltantes = [label for c, label in (("objeto", "objeto"), ("controle", "controle PNCP"), ("data", "data")) if texto(d.get(c), "") in {"", "N/D"}]
     if faltantes:
         pontos += min(12, 4 * len(faltantes))
-        motivos.append("Campos não identificados: " + ", ".join(faltantes))
+        motivos.append("Campos incompletos: " + ", ".join(faltantes))
         testes.append("Atenção na completude cadastral")
 
-    p_mod, m_mod, t_mod = avaliar_modalidade(modalidade, objeto)
-    pontos += p_mod
-    motivos.extend(m_mod)
-    testes.extend(t_mod)
+    if "dispensa" in modalidade or "inexig" in modalidade:
+        pontos += 20; motivos.append("Exceção direta"); testes.append("Revisar fundamento legal")
+    elif "emerg" in objeto or "emerg" in modalidade:
+        pontos += 25; motivos.append("Indício emergencial"); testes.append("Revisar prazo emergencial")
 
     if valor is not None:
-        if valor >= 500_000:
-            pontos += 10
-            motivos.append("Valor elevado (>500k)")
-        elif valor >= 150_000:
-            pontos += 5
-            motivos.append("Valor relevante (>150k)")
+        if valor >= 500_000: pontos += 10; motivos.append("Valor elevado (>500k)")
+        elif valor >= 150_000: pontos += 5; motivos.append("Valor relevante (>150k)")
 
     baixo, alto, mediana = limites_iqr(contexto.get("valor_num", pd.Series(dtype=float)))
     outlier = False
     if valor is not None and alto is not None and valor > alto:
         outlier = True
-        pontos += 25
-        motivos.append("Valor anômalo (Acima do limite superior estatístico IQR)")
-        testes.append("ALERTA: Avaliar composição de custos frente ao mercado")
+        pontos += 25; motivos.append("Valor anômalo (Acima IQR)"); testes.append("Avaliar custos no mercado")
 
-    if any(k in objeto for k in ("prorroga", "aditivo", "continuado", "continuidade")):
-        pontos += 10
-        motivos.append("Contrato continuado/aditivo")
-        testes.append("Revisar histórico e vantajosidade da prorrogação")
+    if any(k in objeto for k in ("prorroga", "aditivo", "continuado")):
+        pontos += 10; motivos.append("Contrato continuado"); testes.append("Revisar vantajosidade")
 
-    fornecedor = texto(d.get("fornecedor"), "N/D")
-    if fornecedor != "N/D" and not contexto.empty and "fornecedor" in contexto.columns:
-        qtd = int((contexto["fornecedor"].astype(str).str.strip() == fornecedor.strip()).sum())
+    forn = texto(d.get("fornecedor"), "N/D")
+    if forn != "N/D" and not contexto.empty and "fornecedor" in contexto.columns:
+        qtd = int((contexto["fornecedor"].astype(str).str.strip() == forn.strip()).sum())
         if qtd >= max(3, len(contexto) * 0.10):
-            pontos += 10
-            motivos.append(f"Fornecedor concentrado ({qtd} ocorrências na amostra)")
-            testes.append("ALERTA: Avaliar possível dependência/direcionamento")
+            pontos += 10; motivos.append(f"Fornecedor concentrado ({qtd}x)"); testes.append("Avaliar direcionamento")
 
     pontos = min(100, int(pontos))
-    if pontos >= 60:
-        nivel = "🔴 ALTO"
-    elif pontos >= 30:
-        nivel = "🟡 MÉDIO"
-    else:
-        nivel = "🟢 BAIXO"
-        
-    if not motivos:
-        motivos = ["Sem alertas automáticos."]
+    nivel = "🔴 ALTO" if pontos >= 60 else "🟡 MÉDIO" if pontos >= 30 else "🟢 BAIXO"
+    if not motivos: motivos = ["Sem alertas automáticos."]
 
-    return {
-        "pontos": pontos,
-        "nivel": nivel,
-        "motivos": motivos,
-        "testes": testes,
-        "outlier": outlier,
-        "mediana_amostra": mediana,
-        "limite_iqr": alto,
-    }
+    return {"pontos": pontos, "nivel": nivel, "motivos": motivos, "testes": testes, "outlier": outlier}
 
 # ============================================================
 # NLP (PROCESSAMENTO SEMÂNTICO)
@@ -543,71 +439,42 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def calcular_modelo_tfidf(textos: Tuple[str, ...]):
-    if not SKLEARN_OK or len(textos) < 2:
-        return None
-    
+    if not SKLEARN_OK or len(textos) < 2: return None
     vec = TfidfVectorizer(lowercase=True, strip_accents="unicode", ngram_range=(1, 2), min_df=1, max_features=8000, sublinear_tf=True)
-    textos_seguros = []
-    for t in textos:
-        t_str = str(t)
-        if len(re.sub(r'[^a-zA-Z0-9]', '', t_str)) > 1:
-            textos_seguros.append(t_str)
-        else:
-            textos_seguros.append("objeto_nao_informado_pelo_orgao")
-            
-    try:
-        return vec.fit_transform(textos_seguros)
-    except ValueError as e:
-        logging.error(f"Erro no pipeline NLP (TfIdf): {e}")
-        return None
+    textos_seguros = [t if len(re.sub(r'[^a-zA-Z0-9]', '', str(t))) > 1 else "obj_ausente" for t in textos]
+    try: return vec.fit_transform(textos_seguros)
+    except ValueError: return None
 
-def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = None, limite: int = 5) -> pd.DataFrame:
-    if not SKLEARN_OK or len(df) < 2:
-        return pd.DataFrame()
-        
-    if dados_processados:
-        objetos = [d["objeto"] for d in dados_processados]
-    else:
-        objetos = [dados_registro(row, tipo)["objeto"] for row in df.to_dict('records')]
-        
-    matriz = calcular_modelo_tfidf(tuple(objetos))
-    if matriz is None:
-        return pd.DataFrame()
+def similares(df_local: pd.DataFrame, idx: int, dados_processados: list, limite: int = 5) -> pd.DataFrame:
+    if not SKLEARN_OK or len(dados_processados) < 2: return pd.DataFrame()
+    objetos = tuple(d["objeto"] for d in dados_processados)
+    matriz = calcular_modelo_tfidf(objetos)
+    if matriz is None: return pd.DataFrame()
         
     scores = (matriz @ matriz[idx].T).toarray().ravel()
     ordem = scores.argsort()[::-1]
     saida = []
     
     for j in ordem:
-        if j == idx:
-            continue
-        d = dados_processados[int(j)] if dados_processados else dados_registro(df.iloc[int(j)].to_dict(), tipo)
+        if j == idx: continue
+        d = dados_processados[int(j)]
         saida.append({
             "Similaridade": f"{float(scores[j])*100:.1f}%", 
-            "Número": d["numero"], 
-            "Objeto": d["objeto"], 
-            "Fornecedor": d["fornecedor"], 
-            "Valor": d["valor"]
+            "Número": d["numero"], "Objeto": d["objeto"], 
+            "Fornecedor": d["fornecedor"], "Valor": d["valor"]
         })
-        if len(saida) >= limite:
-            break
+        if len(saida) >= limite: break
     return pd.DataFrame(saida)
 
 # ============================================================
 # EXPORTAÇÕES
 # ============================================================
 
-def gerar_excel(df: pd.DataFrame, tipo: str, inicio: dt.date, fim: dt.date, df_risco: pd.DataFrame) -> bytes:
+def gerar_excel(df: pd.DataFrame, tipo: str, df_risco: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        resumo = pd.DataFrame({
-            "Informação": ["Órgão", "Consulta", "Período", "Registros", "Fonte"], 
-            "Valor": [PREFEITURA, tipo, f"{inicio:%d/%m/%Y} a {fim:%d/%m/%Y}", len(df), "PNCP"]
-        })
-        resumo.to_excel(writer, sheet_name="Resumo", index=False)
         df_risco.to_excel(writer, sheet_name="Matriz de Risco", index=False)
-        df.to_excel(writer, sheet_name="Dados PNCP", index=False)
-        
+        df.to_excel(writer, sheet_name="Dados Brutos", index=False)
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
@@ -617,247 +484,189 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio: dt.date, fim: dt.date, df_r
     buf.seek(0)
     return buf.getvalue()
 
-
 # ============================================================
 # APPLICATION ENTRYPOINT (STREAMLIT APP)
 # ============================================================
 
 def main():
-    st.set_page_config(
-        page_title="Controle Interno — PNCP Rio das Pedras/SP",
-        page_icon="🛡️",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Controle Interno — PNCP Rio das Pedras", page_icon="🛡️", layout="wide")
 
-    defaults = {
-        "df": None,
-        "tipo": TIPOS[0],
-        "paginas": 0,
-        "total_paginas_api": 0,
-        "inicio": dt.date(2026, 1, 1),
-        "fim": dt.date.today(),
-        "modo": "⚡ Consulta por período"
-    }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+    # Garante que o estado seja inicializado
+    if "df" not in st.session_state:
+        st.session_state.update({"df": None, "tipo": TIPOS[0], "inicio": dt.date(2026, 1, 1), "fim": dt.date.today(), "modo": "⚡ Consulta por período"})
 
-    st.title("🏛️ Painel de Inteligência e Apoio ao Controle Interno")
-    st.caption("Monitoramento preventivo de contratações públicas de Rio das Pedras/SP com dados do PNCP.")
-    st.info("ℹ️ Os alertas são instrumentos de priorização. Um alerta não significa irregularidade. A conclusão depende da análise do controlador.")
+    st.title("🏛️ Inteligência de Controle Interno PNCP")
+    st.info("ℹ️ Sistema de alertas automáticos. Necessário validação e auditoria humana para tomada de decisão.")
 
     with st.sidebar:
-        st.header("⚙️ Parâmetros de Pesquisa")
-        tipo = st.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
+        st.header("⚙️ Parâmetros")
         
-        if tipo != st.session_state.tipo and st.session_state.df is not None:
-            st.warning("⚠️ Você alterou o escopo. Clique em **Carregar dados** para atualizar.")
+        # PREVENÇÃO DE GHOSTING: Se o usuário mudar o escopo, limpa os dados da tela antes de buscar!
+        tipo_selecionado = st.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
+        if tipo_selecionado != st.session_state.tipo:
+            st.session_state.tipo = tipo_selecionado
+            st.session_state.df = None
+            st.rerun()
 
         inicio = st.date_input("📅 Data inicial", st.session_state.inicio)
         fim = st.date_input("📅 Data final", st.session_state.fim)
         max_paginas = st.slider("📄 Limite de páginas da API", 1, 30, MAX_PAGINAS_PADRAO)
-        modo = st.radio("Modo de Consulta", ["⚡ Consulta por período", "🔄 Atualização incremental"], index=0)
+        modo = st.radio("Modo de Consulta", ["⚡ Consulta por período", "🔄 Atualização incremental"])
 
         meta = ler_meta()
-        historico = carregar_historico(tipo)
-
-        if meta.get("ultima_atualizacao"):
-            st.caption(f"Última atualização local: {meta['ultima_atualizacao']}")
-        else:
-            st.caption("Nenhuma atualização incremental registrada.")
-
-        if fim < inicio:
-            st.error("Data final anterior à data inicial.")
-            st.stop()
+        historico = carregar_historico(st.session_state.tipo)
+        if meta.get("ultima_atualizacao"): st.caption(f"Última atualização: {meta['ultima_atualizacao']}")
             
         buscar_btn = st.button("🔎 Carregar dados", type="primary", use_container_width=True)
 
     if buscar_btn:
+        # CORREÇÃO DE API: Editais e Avisos agora utilizam o endpoint correto de consulta de publicações!
         endpoints = {
             "Contratos": f"{BASE_CONSULTA}/contratos",
             "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
-            "Editais e Avisos de Contratações": f"{BASE_DOCUMENTOS}/orgaos/{CNPJ}/compras", 
+            "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes/publicacao", 
         }
         tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
         
         try:
-            with st.spinner("Consultando o PNCP... aplicando backoff exponencial via socket para prevenir timeouts."):
-                if modo == "🔄 Atualização incremental":
-                    ultima = meta.get("ultima_data_consultada")
-                    try:
-                        base_date = dt.date.fromisoformat(ultima) if ultima else inicio
-                    except ValueError:
-                        base_date = inicio
-                    data_ini = max(inicio, base_date - dt.timedelta(days=1))
-                    data_fim = min(fim, dt.date.today())
-                    if data_fim < data_ini:
-                        data_ini = data_fim
-                else:
-                    data_ini, data_fim = inicio, fim
+            with st.spinner("Consultando o PNCP (Aplicando Filtros Nativos e Backoff)..."):
+                data_ini = max(inicio, dt.date.fromisoformat(meta.get("ultima_data_consultada", inicio.isoformat())) - dt.timedelta(days=1)) if "incremental" in modo else inicio
+                data_fim = min(fim, dt.date.today())
 
                 params = {
                     "dataInicial": data_ini.strftime("%Y%m%d"), 
                     "dataFinal": data_fim.strftime("%Y%m%d"), 
-                    "tamanhoPagina": tamanhos[tipo], 
-                    "pagina": 1
+                    "tamanhoPagina": tamanhos[tipo_selecionado]
                 }
+                params["cnpjOrgao" if tipo_selecionado != "Atas de Registro de Preços" else "cnpj"] = CNPJ
                 
-                if tipo == "Contratos": 
-                    params["cnpjOrgao"] = CNPJ
-                elif tipo == "Atas de Registro de Preços": 
-                    params["cnpj"] = CNPJ
-                
-                regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
+                regs, _, _ = consultar(endpoints[tipo_selecionado], params, max_paginas)
                 novo = normalizar_pncp(regs)
                 novo = deduplicar(novo)
-                
-                if tipo != "Editais e Avisos de Contratações":
-                    novo = filtrar_cnpj(novo)
+                novo = filtrar_cnpj(novo)
 
-                combinado = mesclar_historico(historico, novo, tipo)
+                combinado = mesclar_historico(historico, novo, tipo_selecionado)
                 df = combinado.copy()
                 
+                # Filtragem Segura
                 col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
                 if col_data and not df.empty:
                     ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
                     df = df[(ds >= inicio) & (ds <= fim)].reset_index(drop=True)
 
-                meta["ultima_atualizacao"] = dt.datetime.now().isoformat(timespec="seconds")
-                meta["ultima_data_consultada"] = data_fim.isoformat()
-                meta["tipo"] = tipo
+                meta.update({"ultima_atualizacao": dt.datetime.now().isoformat("T", "seconds"), "ultima_data_consultada": data_fim.isoformat(), "tipo": tipo_selecionado})
                 salvar_meta(meta)
                 
-                st.session_state.df = df
-                st.session_state.tipo = tipo
-                st.session_state.paginas = pags
-                st.session_state.total_paginas_api = total_paginas
-                st.session_state.inicio = inicio
-                st.session_state.fim = fim
-                st.session_state.modo = modo
-                st.success(f"Consulta concluída com sucesso: {len(df)} registro(s) obtidos.")
-        
+                st.session_state.update({"df": df, "inicio": inicio, "fim": fim, "modo": modo})
+                st.rerun() # Atualiza a UI inteira limpa
+                
         except Exception as e:
             st.error(f"❌ Erro na consulta de rede: {e}")
 
     # ============================================================
-    # VISUALIZAÇÃO DE DADOS (FRONTEND)
+    # VISUALIZAÇÃO E SEGMENTAÇÃO (FRONTEND)
     # ============================================================
     
-    df = st.session_state.get("df")
-    tipo_atual = st.session_state.get("tipo", tipo)
+    df_bruto = st.session_state.df
+    tipo_atual = st.session_state.tipo
 
-    if df is None:
+    if df_bruto is None:
         st.info("👈 Defina os parâmetros na barra lateral e clique em **Carregar dados**.")
         st.stop()
-    if df.empty:
+    if df_bruto.empty:
         st.warning("Nenhum dado retornado para o filtro aplicado.")
         st.stop()
 
-    df_records = df.to_dict('records')
-    dados_processados = [dados_registro(row, tipo_atual) for row in df_records]
+    # Processamento Inicial
+    dados_totais = [dados_registro(row, tipo_atual) for row in df_bruto.to_dict('records')]
+    
+    # 🌟 NOVA FEATURE: Filtro Global de Segmentação por Modalidade 🌟
+    st.markdown("---")
+    st.subheader("🗂️ Segmentação de Dados")
+    todas_modalidades = sorted(list(set(d["modalidade"] for d in dados_totais if d["modalidade"] and d["modalidade"] != "N/D")))
+    
+    if todas_modalidades:
+        mod_escolhida = st.selectbox("Filtrar e Segmentar por Modalidade (Ex: Pregão Eletrônico):", ["Visão Geral (Todas as Modalidades)"] + todas_modalidades)
+    else:
+        mod_escolhida = "Visão Geral (Todas as Modalidades)"
+
+    # Aplicação do Filtro na Tabela e nos Processamentos
+    if mod_escolhida != "Visão Geral (Todas as Modalidades)":
+        indices_ativos = [i for i, d in enumerate(dados_totais) if d["modalidade"] == mod_escolhida]
+    else:
+        indices_ativos = list(range(len(dados_totais)))
+
+    df_filtrado = df_bruto.iloc[indices_ativos].reset_index(drop=True)
+    dados_processados = [dados_totais[i] for i in indices_ativos]
     contexto = pd.DataFrame(dados_processados)
     riscos = [calcular_risco(d, contexto, tipo_atual) for d in dados_processados]
 
+    if not dados_processados:
+        st.warning(f"Sem registros para a modalidade: {mod_escolhida}")
+        st.stop()
+
+    # Renderização de Métricas Dinâmicas
     altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
     medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
-    outliers = sum(r["outlier"] for r in riscos)
-    valor_total = contexto["valor_num"].sum(min_count=1) if "valor_num" in contexto else None
+    valor_total = contexto["valor_num"].sum(min_count=1) if "valor_num" in contexto.columns else None
 
-    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-    kpi1.metric("Registros Consolidados", len(df))
-    kpi2.metric("🔴 Alto risco", altos)
-    kpi3.metric("🟡 Médio risco", medios)
-    kpi4.metric("🚨 Outliers Financeiros", outliers)
-    kpi5.metric("Valor Total Analisado", moeda(valor_total))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Registros Segmentados", len(dados_processados))
+    k2.metric("🔴 Alto risco", altos)
+    k3.metric("🟡 Médio risco", medios)
+    k4.metric("Valor Analisado (Neste Segmento)", moeda(valor_total))
+
+    # Construção da Matriz
+    rows = []
+    for i_local, r in enumerate(riscos):
+        d = dados_processados[i_local]
+        rows.append({"Índice": i_local, "Risco": r["nivel"], "Score": r["pontos"], "Número": d["numero"], "Modalidade": d["modalidade"], "Fornecedor": d["fornecedor"], "Valor": d["valor"], "Objeto": d["objeto"], "Gatilhos": "; ".join(r["motivos"])})
+    df_risco = pd.DataFrame(rows).sort_values(["Score", "Índice"], ascending=[False, True])
 
     st.markdown("---")
-    
-    tab1, tab2 = st.tabs(["🚦 Matriz de Risco", "📋 Auditoria Detalhada"])
+    tab1, tab2 = st.tabs(["🚦 Matriz de Risco Geral", "📋 Auditoria e Semântica Individual"])
 
     with tab1:
-        st.subheader("Visão Consolidada")
-        rows = []
-        for i, r in enumerate(riscos):
-            d = dados_processados[i]
-            rows.append({
-                "Índice": i, 
-                "Risco": r["nivel"], 
-                "Score": r["pontos"], 
-                "Número": d["numero"], 
-                "Modalidade": d["modalidade"], 
-                "Fornecedor": d["fornecedor"], 
-                "Valor": d["valor"], 
-                "Objeto": d["objeto"], 
-                "Gatilhos": "; ".join(r["motivos"])
-            })
-        df_risco = pd.DataFrame(rows).sort_values(["Score", "Índice"], ascending=[False, True])
         st.dataframe(df_risco.drop(columns=["Índice"]), use_container_width=True, hide_index=True)
-
-        st.subheader("📤 Exportação")
-        excel = gerar_excel(df, tipo_atual, st.session_state.get("inicio", inicio), st.session_state.get("fim", fim), df_risco)
-        st.download_button(
-            "📊 Baixar Relatório (Excel)", 
-            excel, 
-            file_name=f"Relatorio_Auditoria_{slug(tipo_atual)}.xlsx", 
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        excel = gerar_excel(df_filtrado, tipo_atual, df_risco)
+        st.download_button("📊 Baixar Matriz Deste Segmento (Excel)", excel, file_name=f"Auditoria_{slug(mod_escolhida)}.xlsx")
 
     with tab2:
-        st.subheader("Investigação e Triagem")
         f1, f2 = st.columns(2)
         filtro_risco = f1.multiselect("Nível de Risco Alvo", ["🔴 ALTO", "🟡 MÉDIO", "🟢 BAIXO"], default=["🔴 ALTO", "🟡 MÉDIO"])
-        mostrar_outlier = f2.checkbox("Somente anomalias financeiras de IQR", False)
+        mostrar_outlier = f2.checkbox("Apenas anomalias financeiras")
 
-        indices = []
-        for i, r in enumerate(riscos):
-            if r["nivel"] not in filtro_risco: continue
-            if mostrar_outlier and not r["outlier"]: continue
-            indices.append(i)
+        idx_auditoria = [i for i, r in enumerate(riscos) if r["nivel"] in filtro_risco and (not mostrar_outlier or r["outlier"])]
 
-        st.caption(f"{len(indices)} registro(s) qualificado(s) pelo filtro.")
-
-        if not indices:
-            st.warning("Ajuste os filtros de priorização para carregar registros.")
+        if not idx_auditoria:
+            st.warning("Ajuste os filtros de priorização acima para investigar um dossiê.")
         else:
-            opcoes = []
-            mapa = {}
-            for i in indices:
-                d = dados_processados[i]
-                label = f"[{riscos[i]['nivel']} Score {riscos[i]['pontos']}] {d['numero']} — {d['fornecedor']} — {d['valor']}"
-                opcoes.append(label)
-                mapa[label] = i
-                
-            escolhido = st.selectbox("Selecione o dossiê da contratação:", opcoes)
-            i = mapa[escolhido]
-            d = dados_processados[i]
-            r = riscos[i]
+            mapa = {f"[{riscos[i]['nivel']} | Score {riscos[i]['pontos']}] {dados_processados[i]['numero']} — {dados_processados[i]['valor']}": i for i in idx_auditoria}
+            escolhido = st.selectbox("Selecione o dossiê da contratação:", list(mapa.keys()))
+            
+            i_alvo = mapa[escolhido]
+            d = dados_processados[i_alvo]
+            r = riscos[i_alvo]
 
             with st.container():
                 col_a, col_b, col_c = st.columns(3)
-                col_a.metric("Score Calculado", f"{r['pontos']} pts")
-                col_b.metric("Volume Financeiro", d["valor"])
-                col_c.metric("Enquadramento", d["modalidade"])
-                st.info(f"**Escopo da Contratação:** {d['objeto']}")
+                col_a.metric("Score de Risco", f"{r['pontos']} pts")
+                col_b.metric("Volume", d["valor"])
+                col_c.metric("Enquadramento Legal", d["modalidade"])
+                st.info(f"**Objeto Descrito:** {d['objeto']}")
 
-            with st.expander("🔎 Matriz de Justificativa Analítica", expanded=True):
-                st.markdown("**Variáveis de Acionamento (Features):**")
-                for m in r["motivos"]: 
-                    st.write(f"- {m}")
-                st.markdown("**Recomendação de Auditoria (Ações):**")
-                for t in r["testes"]: 
-                    st.write(f"- {t}")
+            with st.expander("🔎 Justificativa Analítica e Testes", expanded=True):
+                st.markdown("**Variáveis de Acionamento:**")
+                for m in r["motivos"]: st.write(f"- {m}")
+                st.markdown("**Roteiro de Auditoria Sugerido:**")
+                for t in r["testes"]: st.write(f"- {t}")
 
-            st.markdown("### 🤖 Clusterização Semântica")
-            if not SKLEARN_OK:
-                st.warning("O pacote `scikit-learn` não está instalado no ambiente.")
-            elif len(df) < 2:
-                st.info("Insuficiência de dados (N < 2) para modelo de vizinhos mais próximos (KNN/Cosseno).")
+            st.markdown("### 🤖 Clusterização Semântica (Apenas neste Segmento)")
+            if not SKLEARN_OK: st.warning("Scikit-Learn não instalado.")
             else:
-                sim = similares(df, i, tipo_atual, dados_processados)
-                if sim.empty:
-                    st.info("O modelo NLP não encontrou vizinhança semântica acima da nota de corte.")
-                else:
-                    st.dataframe(sim, use_container_width=True, hide_index=True)
+                sim = similares(df_filtrado, i_alvo, dados_processados)
+                if sim.empty: st.info("Nenhuma vizinhança semântica acima da nota de corte para este item.")
+                else: st.dataframe(sim, use_container_width=True, hide_index=True)
 
 if __name__ == "__main__":
     main()
