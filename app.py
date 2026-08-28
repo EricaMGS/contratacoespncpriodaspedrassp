@@ -13,7 +13,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Configuração de log para não silenciar erros importantes (substitui os 'pass' genéricos)
+# Configuração de log para não silenciar erros importantes
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 try:
@@ -63,6 +63,19 @@ HEADERS = {
 
 TIPOS = ["Contratos", "Atas de Registro de Preços", "Editais e Avisos de Contratações"]
 
+# Mapeamento oficial de Modalidades da API do PNCP
+MODALIDADES_PNCP = {
+    "Pregão": 5,
+    "Dispensa de Licitação": 6,
+    "Inexigibilidade de Licitação": 7,
+    "Concorrência": 4,
+    "Concurso": 3,
+    "Leilão": 1,
+    "Diálogo Competitivo": 2,
+    "Credenciamento": 10,
+    "Manifestação de Interesse": 8,
+    "Pré-qualificação": 9
+}
 
 # ============================================================
 # UTILITÁRIOS (Refatorados para alta performance)
@@ -115,19 +128,15 @@ def slug(valor: Any) -> str:
 
 
 def primeiro(row_dict: Dict[str, Any], campos: List[str], padrao: Any = "N/D") -> Any:
-    """Busca o primeiro valor válido em um dicionário plano (achatado pelo json_normalize)."""
     for campo in campos:
         valor = row_dict.get(campo)
-        
         if valor is None or pd.isna(valor):
             continue
-            
         if isinstance(valor, str):
             v_limpo = valor.strip()
             if v_limpo.lower() in {"", "nan", "none", "null", "n/d", "nat"}:
                 continue
             return v_limpo
-            
         return valor
     return padrao
 
@@ -146,7 +155,6 @@ def fuzzy_match(r_dict: Dict[str, Any], palavras: List[str]) -> Any:
 
 
 def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
-    """Mapeia os campos do PNCP diretamente das chaves achatadas do pandas."""
     r_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
     
     controle = primeiro(r_dict, ["numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"])
@@ -171,7 +179,7 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         dt_ = primeiro(r_dict, ["dataAssinatura", "dataPublicacaoPncp", "dataCelebracao"])
         sit = primeiro(r_dict, ["situacao", "status"])
         
-    else: # Editais e Avisos de Contratações
+    else: 
         num = primeiro(r_dict, ["numeroCompra", "compra.numeroCompra", "numeroEdital", "numero"])
         proc = primeiro(r_dict, ["processo", "compra.processo", "numeroProcesso"])
         obj = primeiro(r_dict, ["objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
@@ -214,7 +222,6 @@ def sessao_http():
     s.headers.update(HEADERS)
     return s
 
-
 def detalhe_http(r: requests.Response) -> str:
     try:
         j = r.json()
@@ -223,7 +230,6 @@ def detalhe_http(r: requests.Response) -> str:
     except ValueError:
         pass
     return r.text[:500].strip()
-
 
 def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     ultimo = None
@@ -256,7 +262,6 @@ def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
             raise RuntimeError("O PNCP não respondeu após várias tentativas.") from e
     raise RuntimeError("Falha inesperada na comunicação com o PNCP.") from ultimo
 
-
 def registros_api(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return data
@@ -266,7 +271,6 @@ def registros_api(data: Any) -> List[Dict[str, Any]]:
         if isinstance(data.get(k), list):
             return data[k]
     return []
-
 
 def paginacao(data: Any) -> Dict[str, Optional[int]]:
     if not isinstance(data, dict):
@@ -278,7 +282,6 @@ def paginacao(data: Any) -> Dict[str, Optional[int]]:
         except (ValueError, TypeError):
             out[k] = None
     return out
-
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_paginas: int) -> Tuple[List[Dict[str, Any]], int, Optional[int]]:
@@ -326,7 +329,6 @@ def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_pag
         
     return todos, limite, total
 
-
 def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[Dict[str, Any]], int, Optional[int]]:
     serial = tuple(sorted((str(k), str(v)) for k, v in params.items()))
     return consultar_cache(url, serial, max_paginas)
@@ -339,7 +341,6 @@ def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[
 def garantir_cache():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-
 def ler_meta():
     garantir_cache()
     if not META_PATH.exists():
@@ -349,11 +350,9 @@ def ler_meta():
     except json.JSONDecodeError:
         return {}
 
-
 def salvar_meta(meta):
     garantir_cache()
     META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 def carregar_historico(tipo: str) -> pd.DataFrame:
     garantir_cache()
@@ -367,7 +366,6 @@ def carregar_historico(tipo: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
 def chave_historico(row):
     for c in ("numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"):
         if c in row.index:
@@ -375,7 +373,6 @@ def chave_historico(row):
             if v:
                 return f"{c}:{v}"
     return "|".join(texto(row.get(c), "") for c in ("numero", "numeroCompra", "numeroContrato", "processo"))
-
 
 def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str) -> pd.DataFrame:
     partes = [x for x in (df_antigo, df_novo) if x is not None and not x.empty]
@@ -406,17 +403,14 @@ def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str)
         
     return out.drop(columns=["__tipo_controle"], errors="ignore").reset_index(drop=True)
 
-
 def normalizar_pncp(regs: List[Dict[str, Any]]) -> pd.DataFrame:
     if not regs:
         return pd.DataFrame()
     df = pd.json_normalize(regs)
-    
     for col in df.columns:
         if any(isinstance(v, (dict, list)) for v in df[col]):
             df[col] = df[col].astype(str)
     return df
-
 
 def deduplicar(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -428,7 +422,6 @@ def deduplicar(df: pd.DataFrame) -> pd.DataFrame:
             valid = s.notna() & ~s.isin({"", "nan", "None", "N/D"})
             return df.loc[~valid | ~s.duplicated(keep="first")].reset_index(drop=True)
     return df.drop_duplicates().reset_index(drop=True)
-
 
 def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -451,7 +444,6 @@ def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
     registros = [dados_registro(row, tipo) for row in df.to_dict('records')]
     return pd.DataFrame(registros)
 
-
 def limites_iqr(serie: pd.Series) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     s = pd.to_numeric(serie, errors="coerce").dropna()
     if len(s) < 5:
@@ -461,7 +453,6 @@ def limites_iqr(serie: pd.Series) -> Tuple[Optional[float], Optional[float], Opt
     if iqr <= 0:
         return None, None, float(s.median())
     return float(q1 - 1.5 * iqr), float(q3 + 1.5 * iqr), float(s.median())
-
 
 def avaliar_modalidade(modalidade: str, objeto: str) -> Tuple[int, List[str], List[str]]:
     pontos, motivos, testes = 0, [], []
@@ -474,7 +465,6 @@ def avaliar_modalidade(modalidade: str, objeto: str) -> Tuple[int, List[str], Li
         motivos.append("Indício de contratação emergencial")
         testes.append("Revisar motivação e prazo emergencial")
     return pontos, motivos, testes
-
 
 def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict[str, Any]:
     pontos = 0
@@ -560,7 +550,6 @@ def calcular_modelo_tfidf(textos: Tuple[str, ...]):
         return None
     
     vec = TfidfVectorizer(lowercase=True, strip_accents="unicode", ngram_range=(1, 2), min_df=1, max_features=8000, sublinear_tf=True)
-    
     textos_seguros = []
     for t in textos:
         t_str = str(t)
@@ -573,7 +562,6 @@ def calcular_modelo_tfidf(textos: Tuple[str, ...]):
         return vec.fit_transform(textos_seguros)
     except ValueError:
         return None
-
 
 def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = None, limite: int = 5) -> pd.DataFrame:
     if not SKLEARN_OK or len(df) < 2:
@@ -610,10 +598,8 @@ def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = N
 def extrair_ano_seq_controle(controle: str) -> Tuple[Optional[int], Optional[int]]:
     s = texto(controle, "")
     m = re.search(r"-(\d+)-(\d{4})$", s)
-    if not m:
-        return None, None
+    if not m: return None, None
     return int(m.group(2)), int(m.group(1))
-
 
 def identificador_compra(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
     cnpj = cnpj_limpo(primeiro(row_dict, ["cnpjOrgao", "cnpj", "cnpjCompra"], CNPJ))
@@ -632,7 +618,6 @@ def identificador_compra(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Optio
         
     return (cnpj if len(cnpj) == 14 else CNPJ), ano, seq
 
-
 def identificador_contrato(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
     cnpj = cnpj_limpo(primeiro(row_dict, ["cnpjOrgao", "cnpj"], CNPJ))
     ano = primeiro(row_dict, ["anoContrato", "anoContratoEmpenho", "ano"], None)
@@ -649,7 +634,6 @@ def identificador_contrato(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Opt
         ano, seq = ano or a, seq or s
         
     return (cnpj if len(cnpj) == 14 else CNPJ), ano, seq
-
 
 def listar_documentos(row_dict: Dict[str, Any], tipo: str) -> List[Dict[str, Any]]:
     docs = []
@@ -679,15 +663,13 @@ def listar_documentos(row_dict: Dict[str, Any], tipo: str) -> List[Dict[str, Any
         
     return docs
 
-
 def url_documento(row_dict: Dict[str, Any], tipo: str, doc: Dict[str, Any]) -> Optional[str]:
     for k in ("url", "uri", "link"):
         if texto(doc.get(k), "") not in {"", "N/D"}:
             return texto(doc[k])
             
     seq_doc = primeiro(doc, ["sequencialDocumento", "sequencial"], None)
-    if seq_doc is None:
-        return None
+    if seq_doc is None: return None
         
     ctx = doc.get("__contexto_doc", "")
     if ctx == "Contrato" or (tipo == "Contratos" and ctx == ""):
@@ -697,13 +679,11 @@ def url_documento(row_dict: Dict[str, Any], tipo: str, doc: Dict[str, Any]) -> O
         c, a, s = identificador_compra(row_dict)
         return f"{BASE_DOCUMENTOS}/orgaos/{c}/compras/{a}/{s}/arquivos/{seq_doc}"
 
-
 def baixar_bytes(url: str) -> bytes:
     r = sessao_http().get(url, timeout=TIMEOUT, allow_redirects=True)
     if r.status_code != 200:
         raise RuntimeError(f"Download HTTP {r.status_code}: {detalhe_http(r)}")
     return r.content
-
 
 def nome_documento(doc: Dict[str, Any], pos: int) -> str:
     nome = texto(doc.get("titulo") or doc.get("nomeArquivo") or doc.get("nome") or doc.get("tipoDocumentoNome"), f"documento_{pos}")
@@ -739,7 +719,6 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio, fim, df_risco: pd.DataFrame
 # ============================================================
 
 def init_session_state():
-    """Garante que as variáveis globais de estado sejam inicializadas corretamente."""
     defaults = {
         "df": None,
         "tipo": TIPOS[0],
@@ -762,6 +741,13 @@ st.info("ℹ️ Os alertas são instrumentos de priorização. Um alerta não si
 st.sidebar.header("⚙️ Parâmetros")
 tipo = st.sidebar.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
 
+# Adicionado seletor de modalidade caso a escolha seja "Editais e Avisos"
+modalidade_id = None
+if tipo == "Editais e Avisos de Contratações":
+    st.sidebar.info("A API do PNCP passou a exigir que a **Modalidade** seja informada obrigatoriamente nesta tela.")
+    mod_selecionada = st.sidebar.selectbox("Filtre a Modalidade:", list(MODALIDADES_PNCP.keys()))
+    modalidade_id = MODALIDADES_PNCP[mod_selecionada]
+
 if tipo != st.session_state.tipo and st.session_state.df is not None:
     st.warning("⚠️ Você alterou o escopo da consulta. Clique no botão **Carregar dados** para buscar os registros no PNCP e atualizar a tabela.")
 
@@ -783,11 +769,11 @@ if fim < inicio:
     st.stop()
 
 if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=True):
-    # CORREÇÃO APLICADA AQUI: Alteração do endpoint de Editais para a rota geral
+    # Endpoint de volta para '/publicacao', pois é o correto para esta consulta
     endpoints = {
         "Contratos": f"{BASE_CONSULTA}/contratos",
         "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
-        "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes",
+        "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes/publicacao", 
     }
     tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
     
@@ -808,12 +794,14 @@ if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=
 
             params = {"dataInicial": data_ini.strftime("%Y%m%d"), "dataFinal": data_fim.strftime("%Y%m%d"), "tamanhoPagina": tamanhos[tipo], "pagina": 1}
             
+            # Repassando a exigência da API
             if tipo == "Contratos": 
                 params["cnpjOrgao"] = CNPJ
             elif tipo == "Atas de Registro de Preços": 
                 params["cnpj"] = CNPJ
             elif tipo == "Editais e Avisos de Contratações": 
                 params["cnpjOrgao"] = CNPJ
+                params["codigoModalidadeContratacao"] = modalidade_id 
             
             regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
             
@@ -825,7 +813,7 @@ if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=
             
             df = combinado.copy()
             col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
-            if col_data:
+            if col_data and not df.empty:
                 ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
                 df = df[(ds >= inicio) & (ds <= fim)].reset_index(drop=True)
 
@@ -841,9 +829,9 @@ if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=
             st.session_state.inicio = inicio
             st.session_state.fim = fim
             st.session_state.modo = modo
-            st.success(f"Consulta concluída: {len(df)} registro(s). {pags} página(s) processada(s); API informou {total_paginas or 'N/D'} página(s).")
+            st.success(f"Consulta concluída: {len(df)} registro(s) nesta visão. A API respondeu {total_paginas or 'N/D'} página(s) disponíveis.")
     except Exception as e:
-        st.error(f"❌ {e}")
+        st.error(f"❌ Erro na consulta: {e}")
 
 # ============================================================
 # EXIBIÇÃO DE RESULTADOS
@@ -859,7 +847,7 @@ if df.empty:
     st.warning("Nenhum registro retornado pelo PNCP para os parâmetros informados.")
     st.stop()
 
-# Conversão otimizada de Dataframe para lista de dicionários
+# Conversão otimizada
 df_records = df.to_dict('records')
 dados_processados = [dados_registro(row, tipo_atual) for row in df_records]
 
@@ -872,12 +860,11 @@ outliers = sum(r["outlier"] for r in riscos)
 valor_total = contexto["valor_num"].sum(min_count=1) if "valor_num" in contexto else None
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Registros", len(df))
+c1.metric("Registros (Base Consolidada)", len(df))
 c2.metric("🔴 Alto risco", altos)
 c3.metric("🟡 Médio risco", medios)
 c4.metric("🚨 Outliers", outliers)
 c5.metric("Valor analisado", moeda(valor_total))
-st.caption(f"Páginas desta operação: {st.session_state.get('paginas', 'N/D')} | Total de páginas informado pela API: {st.session_state.get('total_paginas_api', 'N/D')} | Registros: {len(df)}")
 
 # Matriz
 st.subheader("🚦 Matriz de risco")
@@ -943,7 +930,7 @@ else:
             st.info("Não foi possível calcular similaridades para esta amostra.")
         else:
             st.dataframe(sim, use_container_width=True, hide_index=True)
-            st.caption("Método: TF-IDF + similaridade de cosseno. O resultado é apoio analítico, não conclusão de equivalência entre objetos.")
+            st.caption("Método: TF-IDF + similaridade de cosseno.")
 
     # Documentos
     st.markdown("### 📎 Documentos disponíveis no PNCP")
@@ -1019,5 +1006,3 @@ st.markdown("---")
 st.subheader("📤 Exportar consulta")
 excel = gerar_excel(df, tipo_atual, st.session_state.get("inicio", inicio), st.session_state.get("fim", fim), df_risco)
 st.download_button("📊 Excel — dados + matriz de risco", excel, file_name=f"Controle_Interno_{slug(tipo_atual)}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-st.caption("Sistema Integrado de Apoio ao Controle Interno — PNCP. Alertas automatizados devem ser validados pelo responsável mediante evidências e critérios aplicáveis.")
