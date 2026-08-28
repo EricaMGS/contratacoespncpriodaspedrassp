@@ -1,10 +1,12 @@
 """
 Painel de Inteligência e Apoio ao Controle Interno - PNCP
 Desenvolvido com Streamlit, Pandas e Scikit-Learn.
+Arquitetura otimizada para resiliência de rede e I/O.
 """
 
 import io
 import re
+import os
 import time
 import zipfile
 import datetime as dt
@@ -16,6 +18,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import streamlit as st
 
 # Configuração de log
@@ -28,9 +32,10 @@ try:
     SKLEARN_OK = True
 except ImportError:
     SKLEARN_OK = False
+    logging.warning("scikit-learn não encontrado. Funcionalidade de similaridade desativada.")
 
 # ============================================================
-# CONFIGURAÇÕES GLOBAIS
+# CONFIGURAÇÕES GLOBAIS (Preparadas para Env Vars)
 # ============================================================
 
 CNPJ = "44826840000183"
@@ -41,21 +46,23 @@ PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
 BASE_CONSULTA = "https://pncp.gov.br/api/consulta/v1"
 BASE_DOCUMENTOS = "https://pncp.gov.br/api/pncp/v1"
 
-# Limites e parâmetros de requisição
+# Ajuste dinâmico de workers baseado no ambiente
+MAX_WORKERS = int(os.getenv("PNCP_MAX_WORKERS", 6))
+TIMEOUT = (10, int(os.getenv("PNCP_TIMEOUT_READ", 45)))
+MAX_TENTATIVAS = 4
+
 PAGE_CONTRATOS = 100
 PAGE_ATAS = 100
 PAGE_EDITAIS = 50
 MAX_PAGINAS_PADRAO = 15
-MAX_TENTATIVAS = 3
-TIMEOUT = (10, 45)
-MAX_WORKERS = 6
+
 CACHE_TTL = 900
 CACHE_DIR = Path("dados")
 HISTORICO_PATH = CACHE_DIR / "contratacoes_controle_interno.parquet"
 META_PATH = CACHE_DIR / "controle_incremental.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/1.0",
     "Accept": "application/json",
     "Connection": "keep-alive",
 }
@@ -63,7 +70,63 @@ HEADERS = {
 TIPOS = ["Contratos", "Atas de Registro de Preços", "Editais e Avisos de Contratações"]
 
 # ============================================================
-# UTILITÁRIOS DE LIMPEZA E FORMATAÇÃO DE DADOS
+# INTEGRAÇÃO HTTP ROBUSTA (Engenharia de Ingestão)
+# ============================================================
+
+@st.cache_resource
+def sessao_http() -> requests.Session:
+    """
+    Cria uma sessão HTTP persistente com política de Exponential Backoff nativa.
+    Isso é vital para Data Engineering ao raspar APIs instáveis.
+    """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
+    # Configura tentativas automáticas para erros comuns de sobrecarga (429) e falha de servidor (5xx)
+    retries = Retry(
+        total=MAX_TENTATIVAS,
+        backoff_factor=1.5, # 1.5s, 3s, 6s...
+        status_forcelist=[408, 429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
+
+def detalhe_http(r: requests.Response) -> str:
+    try:
+        j = r.json()
+        if isinstance(j, dict):
+            return str(j.get("message") or j.get("error") or j.get("detail") or r.text[:100])
+    except ValueError:
+        pass
+    return r.text[:250].strip()
+
+def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """Faz a requisição HTTP com tratamento de erro simplificado, delegando retry ao urllib3."""
+    session = sessao_http()
+    try:
+        r = session.get(url, params=params, timeout=TIMEOUT)
+        
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 204:
+            return []
+            
+        r.raise_for_status() # Lança erro se não for 200/204, capturado abaixo
+        
+    except requests.exceptions.RetryError as e:
+        raise RuntimeError(f"Falha ao conectar no PNCP após múltiplas tentativas: Limite de taxa ou API indisponível.") from e
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(f"PNCP rejeitou a requisição (HTTP {e.response.status_code}): {detalhe_http(e.response)}") from e
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Erro de conexão ao acessar o PNCP: {e}") from e
+
+# ============================================================
+# UTILITÁRIOS DE LIMPEZA E FORMATAÇÃO
 # ============================================================
 
 def texto(valor: Any, padrao: str = "N/D") -> str:
@@ -109,7 +172,7 @@ def slug(valor: Any) -> str:
 def primeiro(row_dict: Dict[str, Any], campos: List[str], padrao: Any = "N/D") -> Any:
     for campo in campos:
         valor = row_dict.get(campo)
-        if valor is None or pd.isna(valor):
+        if pd.isna(valor) or valor is None:
             continue
         if isinstance(valor, str):
             v_limpo = valor.strip()
@@ -169,7 +232,6 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         
     mod = primeiro(r_dict, ["modalidadeNome", "modalidadeContratacaoNome", "compra.modalidadeNome", "modalidade"])
 
-    # Fallbacks inteligentes
     if texto(obj, "") == "": obj = fuzzy_match(r_dict, ["objeto", "descricao"])
     if texto(forn, "") == "": forn = fuzzy_match(r_dict, ["razaosocial", "fornecedornome", "fornecedor.nome"])
     if texto(val, "") == "": val = fuzzy_match(r_dict, ["valortotal", "valorglobal", "valorata", "valor"])
@@ -191,54 +253,8 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
     }
 
 # ============================================================
-# INTEGRAÇÃO HTTP (API DO PNCP)
+# PAGINAÇÃO E API HANDLERS
 # ============================================================
-
-@st.cache_resource
-def sessao_http() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    return s
-
-def detalhe_http(r: requests.Response) -> str:
-    try:
-        j = r.json()
-        if isinstance(j, dict):
-            return texto(j.get("message") or j.get("error") or j.get("detail"), "")
-    except ValueError:
-        pass
-    return r.text[:500].strip()
-
-def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    ultimo_erro = None
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
-        try:
-            r = sessao_http().get(url, params=params, timeout=TIMEOUT)
-            if r.status_code == 200:
-                try:
-                    return r.json()
-                except ValueError as e:
-                    raise RuntimeError("O PNCP respondeu 200, mas o conteúdo não é JSON válido.") from e
-            if r.status_code == 204:
-                return []
-            if r.status_code in (400, 422):
-                raise RuntimeError(f"PNCP rejeitou os parâmetros (HTTP {r.status_code}). {detalhe_http(r)}")
-            if r.status_code == 404:
-                raise RuntimeError(f"Recurso não encontrado no PNCP (HTTP 404). Endpoint: {r.url}")
-            if r.status_code in (408, 429, 500, 502, 503, 504):
-                ultimo_erro = RuntimeError(f"HTTP {r.status_code}: {detalhe_http(r)}")
-                if tentativa < MAX_TENTATIVAS:
-                    time.sleep(min(2 ** tentativa, 12))
-                    continue
-                raise ultimo_erro
-            raise RuntimeError(f"PNCP retornou HTTP {r.status_code}: {detalhe_http(r)}")
-        except (requests.Timeout, requests.ConnectionError) as e:
-            ultimo_erro = e
-            if tentativa < MAX_TENTATIVAS:
-                time.sleep(min(2 ** tentativa, 12))
-                continue
-            raise RuntimeError("O PNCP não respondeu após várias tentativas.") from e
-    raise RuntimeError("Falha inesperada na comunicação com o PNCP.") from ultimo_erro
 
 def registros_api(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
@@ -263,7 +279,6 @@ def paginacao(data: Any) -> Dict[str, Optional[int]]:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_paginas: int) -> Tuple[List[Dict[str, Any]], int, Optional[int]]:
-    """Consulta multithread paralela para acelerar requisições paginadas."""
     base = dict(params_tuple)
     base["pagina"] = 1
     
@@ -313,7 +328,7 @@ def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[
     return consultar_cache(url, serial, max_paginas)
 
 # ============================================================
-# GERENCIAMENTO DE DADOS E CACHE LOCAL
+# GERENCIAMENTO DE STORAGE LOCAL (Parquet IO)
 # ============================================================
 
 def garantir_cache():
@@ -337,11 +352,13 @@ def carregar_historico(tipo: str) -> pd.DataFrame:
     if not HISTORICO_PATH.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_parquet(HISTORICO_PATH)
+        # Engine pyarrow garantido para evitar falhas de cast de tipos
+        df = pd.read_parquet(HISTORICO_PATH, engine="pyarrow")
         if "__tipo_controle" in df.columns:
             df = df[df["__tipo_controle"] == tipo].drop(columns=["__tipo_controle"])
         return df.reset_index(drop=True)
-    except Exception:
+    except Exception as e:
+        logging.warning(f"Aviso ao ler parquet histórico: {e}")
         return pd.DataFrame()
 
 def chave_historico(row: pd.Series) -> str:
@@ -353,7 +370,7 @@ def chave_historico(row: pd.Series) -> str:
     return "|".join(texto(row.get(c), "") for c in ("numero", "numeroCompra", "numeroContrato", "processo"))
 
 def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str) -> pd.DataFrame:
-    """Mescla dados novos com base histórica no formato Parquet."""
+    """Mescla dados com segurança, usando engine explícito e gerenciando memória."""
     partes = [x for x in (df_antigo, df_novo) if x is not None and not x.empty]
     if not partes:
         return pd.DataFrame()
@@ -366,7 +383,7 @@ def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str)
     garantir_cache()
     try:
         if HISTORICO_PATH.exists():
-            df_completo = pd.read_parquet(HISTORICO_PATH)
+            df_completo = pd.read_parquet(HISTORICO_PATH, engine="pyarrow")
             if not df_completo.empty and "__tipo_controle" in df_completo.columns:
                 df_outros_tipos = df_completo[df_completo["__tipo_controle"] != tipo]
                 df_salvar = pd.concat([df_outros_tipos, out], ignore_index=True, sort=False)
@@ -375,9 +392,12 @@ def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str)
         else:
             df_salvar = out
             
-        df_salvar.to_parquet(HISTORICO_PATH, index=False)
+        # Forçar string nas colunas mistas antes de salvar no Parquet
+        df_salvar = df_salvar.astype(str)
+        df_salvar.to_parquet(HISTORICO_PATH, index=False, engine="pyarrow", compression="snappy")
     except Exception as e:
-        logging.error(f"Erro ao salvar histórico parquet: {e}")
+        logging.error(f"Erro crítico ao salvar histórico parquet: {e}")
+        # Fallback de emergência CSV
         out.to_csv(CACHE_DIR / "contratacoes_controle_interno.csv", index=False, encoding="utf-8-sig")
         
     return out.drop(columns=["__tipo_controle"], errors="ignore").reset_index(drop=True)
@@ -415,7 +435,7 @@ def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ============================================================
-# MOTOR DE RISCO (MACHINE LEARNING & REGRAS ESTATÍSTICAS)
+# MOTOR DE RISCO (ESTATÍSTICA)
 # ============================================================
 
 def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
@@ -423,7 +443,6 @@ def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
     return pd.DataFrame(registros)
 
 def limites_iqr(serie: pd.Series) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Calcula os limites interquartis para detecção de outliers de valor."""
     s = pd.to_numeric(serie, errors="coerce").dropna()
     if len(s) < 5:
         return None, None, None
@@ -446,7 +465,6 @@ def avaliar_modalidade(modalidade: str, objeto: str) -> Tuple[int, List[str], Li
     return pontos, motivos, testes
 
 def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict[str, Any]:
-    """Motor de pontuação de risco baseado em anomalias relativas e regras de negócio."""
     pontos = 0
     motivos = []
     testes = []
@@ -454,7 +472,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     modalidade = d.get("modalidade", "").lower()
     objeto = d.get("objeto", "").lower()
 
-    # Checagem de dados incompletos
     faltantes = []
     for campo, label in (("objeto", "objeto"), ("controle", "controle PNCP"), ("data", "data")):
         if texto(d.get(campo), "") in {"", "N/D"}:
@@ -465,13 +482,11 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
         motivos.append("Campos não identificados: " + ", ".join(faltantes))
         testes.append("Atenção na completude cadastral")
 
-    # Avaliação de Modalidade
     p_mod, m_mod, t_mod = avaliar_modalidade(modalidade, objeto)
     pontos += p_mod
     motivos.extend(m_mod)
     testes.extend(t_mod)
 
-    # Avaliação de Volumetria Financeira
     if valor is not None:
         if valor >= 500_000:
             pontos += 10
@@ -480,7 +495,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
             pontos += 5
             motivos.append("Valor relevante (>150k)")
 
-    # Detecção de Anomalia Estatística (IQR)
     baixo, alto, mediana = limites_iqr(contexto.get("valor_num", pd.Series(dtype=float)))
     outlier = False
     if valor is not None and alto is not None and valor > alto:
@@ -489,13 +503,11 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
         motivos.append("Valor anômalo (Acima do limite superior estatístico IQR)")
         testes.append("ALERTA: Avaliar composição de custos frente ao mercado")
 
-    # Avaliação de Prorrogações
     if any(k in objeto for k in ("prorroga", "aditivo", "continuado", "continuidade")):
         pontos += 10
         motivos.append("Contrato continuado/aditivo")
         testes.append("Revisar histórico e vantajosidade da prorrogação")
 
-    # Concentração de Fornecedor
     fornecedor = texto(d.get("fornecedor"), "N/D")
     if fornecedor != "N/D" and not contexto.empty and "fornecedor" in contexto.columns:
         qtd = int((contexto["fornecedor"].astype(str).str.strip() == fornecedor.strip()).sum())
@@ -504,7 +516,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
             motivos.append(f"Fornecedor concentrado ({qtd} ocorrências na amostra)")
             testes.append("ALERTA: Avaliar possível dependência/direcionamento")
 
-    # Fechamento de Pontuação
     pontos = min(100, int(pontos))
     if pontos >= 60:
         nivel = "🔴 ALTO"
@@ -527,12 +538,11 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     }
 
 # ============================================================
-# NLP (PROCESSAMENTO DE LINGUAGEM NATURAL)
+# NLP (PROCESSAMENTO SEMÂNTICO)
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def calcular_modelo_tfidf(textos: Tuple[str, ...]):
-    """Gera matriz TF-IDF para análise semântica de objetos de contratação."""
     if not SKLEARN_OK or len(textos) < 2:
         return None
     
@@ -547,11 +557,11 @@ def calcular_modelo_tfidf(textos: Tuple[str, ...]):
             
     try:
         return vec.fit_transform(textos_seguros)
-    except ValueError:
+    except ValueError as e:
+        logging.error(f"Erro no pipeline NLP (TfIdf): {e}")
         return None
 
 def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = None, limite: int = 5) -> pd.DataFrame:
-    """Encontra os registros mais similares utilizando Similaridade de Cosseno."""
     if not SKLEARN_OK or len(df) < 2:
         return pd.DataFrame()
         
@@ -584,7 +594,7 @@ def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = N
     return pd.DataFrame(saida)
 
 # ============================================================
-# EXPORTAÇÕES (RELATÓRIOS)
+# EXPORTAÇÕES
 # ============================================================
 
 def gerar_excel(df: pd.DataFrame, tipo: str, inicio: dt.date, fim: dt.date, df_risco: pd.DataFrame) -> bytes:
@@ -598,7 +608,6 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio: dt.date, fim: dt.date, df_r
         df_risco.to_excel(writer, sheet_name="Matriz de Risco", index=False)
         df.to_excel(writer, sheet_name="Dados PNCP", index=False)
         
-        # Formatação das colunas no Excel
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
@@ -610,7 +619,7 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio: dt.date, fim: dt.date, df_r
 
 
 # ============================================================
-# INTERFACE PRINCIPAL DO STREAMLIT (Encapsulada)
+# APPLICATION ENTRYPOINT (STREAMLIT APP)
 # ============================================================
 
 def main():
@@ -620,7 +629,6 @@ def main():
         layout="wide",
     )
 
-    # Inicialização de Estado da Sessão (Session State)
     defaults = {
         "df": None,
         "tipo": TIPOS[0],
@@ -634,12 +642,10 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = val
 
-    # Cabeçalho Principal
     st.title("🏛️ Painel de Inteligência e Apoio ao Controle Interno")
     st.caption("Monitoramento preventivo de contratações públicas de Rio das Pedras/SP com dados do PNCP.")
     st.info("ℹ️ Os alertas são instrumentos de priorização. Um alerta não significa irregularidade. A conclusão depende da análise do controlador.")
 
-    # Sidebar Configurações
     with st.sidebar:
         st.header("⚙️ Parâmetros de Pesquisa")
         tipo = st.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
@@ -666,7 +672,6 @@ def main():
             
         buscar_btn = st.button("🔎 Carregar dados", type="primary", use_container_width=True)
 
-    # Ação de Busca (Pipeline de Extração de Dados)
     if buscar_btn:
         endpoints = {
             "Contratos": f"{BASE_CONSULTA}/contratos",
@@ -676,7 +681,7 @@ def main():
         tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
         
         try:
-            with st.spinner("Consultando o PNCP... delimitando o período e usando paginação otimizada."):
+            with st.spinner("Consultando o PNCP... aplicando backoff exponencial via socket para prevenir timeouts."):
                 if modo == "🔄 Atualização incremental":
                     ultima = meta.get("ultima_data_consultada")
                     try:
@@ -712,19 +717,16 @@ def main():
                 combinado = mesclar_historico(historico, novo, tipo)
                 df = combinado.copy()
                 
-                # Filtragem de datas robusta
                 col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
                 if col_data and not df.empty:
                     ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
                     df = df[(ds >= inicio) & (ds <= fim)].reset_index(drop=True)
 
-                # Persistência de Metadata
                 meta["ultima_atualizacao"] = dt.datetime.now().isoformat(timespec="seconds")
                 meta["ultima_data_consultada"] = data_fim.isoformat()
                 meta["tipo"] = tipo
                 salvar_meta(meta)
                 
-                # Atualização do Session State
                 st.session_state.df = df
                 st.session_state.tipo = tipo
                 st.session_state.paginas = pags
@@ -732,32 +734,30 @@ def main():
                 st.session_state.inicio = inicio
                 st.session_state.fim = fim
                 st.session_state.modo = modo
-                st.success(f"Consulta concluída: {len(df)} registro(s) nesta visão. A API respondeu {total_paginas or 'N/D'} página(s) disponíveis.")
+                st.success(f"Consulta concluída com sucesso: {len(df)} registro(s) obtidos.")
         
         except Exception as e:
-            st.error(f"❌ Erro na consulta: {e}")
+            st.error(f"❌ Erro na consulta de rede: {e}")
 
     # ============================================================
-    # RENDERIZAÇÃO DO DASHBOARD E MÉTRICAS
+    # VISUALIZAÇÃO DE DADOS (FRONTEND)
     # ============================================================
     
     df = st.session_state.get("df")
     tipo_atual = st.session_state.get("tipo", tipo)
 
     if df is None:
-        st.info("👈 Escolha o escopo, período na barra lateral e clique em **Carregar dados**.")
+        st.info("👈 Defina os parâmetros na barra lateral e clique em **Carregar dados**.")
         st.stop()
     if df.empty:
-        st.warning("Nenhum registro retornado pelo PNCP para os parâmetros informados.")
+        st.warning("Nenhum dado retornado para o filtro aplicado.")
         st.stop()
 
-    # Processamento e Motor de Risco
     df_records = df.to_dict('records')
     dados_processados = [dados_registro(row, tipo_atual) for row in df_records]
     contexto = pd.DataFrame(dados_processados)
     riscos = [calcular_risco(d, contexto, tipo_atual) for d in dados_processados]
 
-    # KPIs Superiores
     altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
     medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
     outliers = sum(r["outlier"] for r in riscos)
@@ -772,11 +772,10 @@ def main():
 
     st.markdown("---")
     
-    # Criação de Abas para melhorar a Experiência do Usuário (UX)
-    tab1, tab2 = st.tabs(["🚦 Matriz de Risco Geral", "📋 Análise Aprofundada (Individual)"])
+    tab1, tab2 = st.tabs(["🚦 Matriz de Risco", "📋 Auditoria Detalhada"])
 
     with tab1:
-        st.subheader("Visão Geral de Riscos")
+        st.subheader("Visão Consolidada")
         rows = []
         for i, r in enumerate(riscos):
             d = dados_processados[i]
@@ -789,25 +788,25 @@ def main():
                 "Fornecedor": d["fornecedor"], 
                 "Valor": d["valor"], 
                 "Objeto": d["objeto"], 
-                "Alertas Identificados": "; ".join(r["motivos"])
+                "Gatilhos": "; ".join(r["motivos"])
             })
         df_risco = pd.DataFrame(rows).sort_values(["Score", "Índice"], ascending=[False, True])
         st.dataframe(df_risco.drop(columns=["Índice"]), use_container_width=True, hide_index=True)
 
-        st.subheader("📤 Exportar Análise")
+        st.subheader("📤 Exportação")
         excel = gerar_excel(df, tipo_atual, st.session_state.get("inicio", inicio), st.session_state.get("fim", fim), df_risco)
         st.download_button(
-            "📊 Download Excel (Dados Brutos + Matriz de Risco)", 
+            "📊 Baixar Relatório (Excel)", 
             excel, 
-            file_name=f"Controle_Interno_{slug(tipo_atual)}.xlsx", 
+            file_name=f"Relatorio_Auditoria_{slug(tipo_atual)}.xlsx", 
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
     with tab2:
-        st.subheader("Filtros de Priorização")
+        st.subheader("Investigação e Triagem")
         f1, f2 = st.columns(2)
-        filtro_risco = f1.multiselect("Filtrar por Nível de Risco", ["🔴 ALTO", "🟡 MÉDIO", "🟢 BAIXO"], default=["🔴 ALTO", "🟡 MÉDIO"])
-        mostrar_outlier = f2.checkbox("Exibir somente valores atípicos estatisticamente", False)
+        filtro_risco = f1.multiselect("Nível de Risco Alvo", ["🔴 ALTO", "🟡 MÉDIO", "🟢 BAIXO"], default=["🔴 ALTO", "🟡 MÉDIO"])
+        mostrar_outlier = f2.checkbox("Somente anomalias financeiras de IQR", False)
 
         indices = []
         for i, r in enumerate(riscos):
@@ -815,54 +814,50 @@ def main():
             if mostrar_outlier and not r["outlier"]: continue
             indices.append(i)
 
-        st.caption(f"Exibindo {len(indices)} registro(s) selecionado(s).")
+        st.caption(f"{len(indices)} registro(s) qualificado(s) pelo filtro.")
 
         if not indices:
-            st.warning("Nenhum registro atende aos filtros de priorização atuais.")
+            st.warning("Ajuste os filtros de priorização para carregar registros.")
         else:
             opcoes = []
             mapa = {}
             for i in indices:
                 d = dados_processados[i]
-                label = f"[{riscos[i]['nivel']} {riscos[i]['pontos']}/100] {d['numero']} — {d['fornecedor']} — {d['valor']}"
+                label = f"[{riscos[i]['nivel']} Score {riscos[i]['pontos']}] {d['numero']} — {d['fornecedor']} — {d['valor']}"
                 opcoes.append(label)
                 mapa[label] = i
                 
-            escolhido = st.selectbox("Selecione uma contratação para aprofundar:", opcoes)
+            escolhido = st.selectbox("Selecione o dossiê da contratação:", opcoes)
             i = mapa[escolhido]
-            row_dict = df_records[i] 
             d = dados_processados[i]
             r = riscos[i]
 
             with st.container():
                 col_a, col_b, col_c = st.columns(3)
-                col_a.metric("Score de Risco", f"{r['pontos']} / 100")
-                col_b.metric("Valor Contratado", d["valor"])
-                col_c.metric("Modalidade", d["modalidade"])
-                st.info(f"**Objeto Descrito:** {d['objeto']}")
+                col_a.metric("Score Calculado", f"{r['pontos']} pts")
+                col_b.metric("Volume Financeiro", d["valor"])
+                col_c.metric("Enquadramento", d["modalidade"])
+                st.info(f"**Escopo da Contratação:** {d['objeto']}")
 
-            with st.expander("🔎 Evidências e Motivação do Risco", expanded=True):
-                st.markdown("**Gatilhos acionados:**")
+            with st.expander("🔎 Matriz de Justificativa Analítica", expanded=True):
+                st.markdown("**Variáveis de Acionamento (Features):**")
                 for m in r["motivos"]: 
                     st.write(f"- {m}")
-                st.markdown("**Testes sugeridos para o auditor:**")
+                st.markdown("**Recomendação de Auditoria (Ações):**")
                 for t in r["testes"]: 
                     st.write(f"- {t}")
 
-            # Módulo de NLP (Scikit-Learn)
-            st.markdown("### 🤖 Contratações Semanticamente Semelhantes")
+            st.markdown("### 🤖 Clusterização Semântica")
             if not SKLEARN_OK:
-                st.warning("O pacote `scikit-learn` não está instalado. Adicione `scikit-learn` ao requirements.txt.")
+                st.warning("O pacote `scikit-learn` não está instalado no ambiente.")
             elif len(df) < 2:
-                st.info("São necessários pelo menos dois registros na base para calcular similaridade cruzada.")
+                st.info("Insuficiência de dados (N < 2) para modelo de vizinhos mais próximos (KNN/Cosseno).")
             else:
                 sim = similares(df, i, tipo_atual, dados_processados)
                 if sim.empty:
-                    st.info("Não foi possível calcular similaridades estatísticas relevantes para esta amostra.")
+                    st.info("O modelo NLP não encontrou vizinhança semântica acima da nota de corte.")
                 else:
                     st.dataframe(sim, use_container_width=True, hide_index=True)
-                    st.caption("Método de NLP utilizado: TF-IDF (Term Frequency-Inverse Document Frequency) com Similaridade de Cosseno.")
 
-# Ponto de Entrada Padrão (Evita execução automática se importado)
 if __name__ == "__main__":
     main()
