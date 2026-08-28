@@ -1,18 +1,14 @@
 """
 Painel de Inteligência e Apoio ao Controle Interno - PNCP
 Desenvolvido com Streamlit, Pandas e Scikit-Learn.
-Arquitetura otimizada para resiliência de rede e I/O.
+Arquitetura otimizada e minimalista.
 """
 
 import io
 import re
 import os
-import time
-import zipfile
 import datetime as dt
-import json
 import logging
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,14 +24,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Verificação de dependência opcional (Machine Learning)
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
     SKLEARN_OK = True
 except ImportError:
     SKLEARN_OK = False
     logging.warning("scikit-learn não encontrado. Funcionalidade de similaridade desativada.")
 
 # ============================================================
-# CONFIGURAÇÕES GLOBAIS (Preparadas para Env Vars)
+# CONFIGURAÇÕES GLOBAIS
 # ============================================================
 
 CNPJ = "44826840000183"
@@ -44,7 +39,6 @@ MUNICIPIO = "Rio das Pedras/SP"
 PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
 
 BASE_CONSULTA = "https://pncp.gov.br/api/consulta/v1"
-BASE_DOCUMENTOS = "https://pncp.gov.br/api/pncp/v1"
 
 MAX_WORKERS = int(os.getenv("PNCP_MAX_WORKERS", 6))
 TIMEOUT = (10, int(os.getenv("PNCP_TIMEOUT_READ", 45)))
@@ -53,15 +47,10 @@ MAX_TENTATIVAS = 4
 PAGE_CONTRATOS = 100
 PAGE_ATAS = 100
 PAGE_EDITAIS = 50
-MAX_PAGINAS_PADRAO = 15
-
-CACHE_TTL = 900
-CACHE_DIR = Path("dados")
-HISTORICO_PATH = CACHE_DIR / "contratacoes_controle_interno.parquet"
-META_PATH = CACHE_DIR / "controle_incremental.json"
+MAX_PAGINAS = 15 # Limite fixado nos bastidores para evitar quebra da API
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/3.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/4.0",
     "Accept": "application/json",
     "Connection": "keep-alive",
 }
@@ -69,7 +58,7 @@ HEADERS = {
 TIPOS = ["Contratos", "Atas de Registro de Preços", "Editais e Avisos de Contratações"]
 
 # ============================================================
-# INTEGRAÇÃO HTTP ROBUSTA (Engenharia de Ingestão)
+# INTEGRAÇÃO HTTP ROBUSTA
 # ============================================================
 
 @st.cache_resource
@@ -109,7 +98,7 @@ def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
             return []
         r.raise_for_status()
     except requests.exceptions.RetryError as e:
-        raise RuntimeError(f"Falha ao conectar no PNCP (Limite de Taxa ou Indisponibilidade).") from e
+        raise RuntimeError("Falha ao conectar no PNCP (Limite de Taxa ou Indisponibilidade).") from e
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"PNCP rejeitou a requisição (HTTP {e.response.status_code}): {detalhe_http(e.response)}") from e
     except requests.exceptions.RequestException as e:
@@ -196,7 +185,7 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         dt_ = primeiro(r_dict, ["dataAssinatura", "dataPublicacaoPncp", "dataCelebracao"])
         sit = primeiro(r_dict, ["situacao", "status"])
         
-    else: # Editais e Avisos (Compras)
+    else: 
         num = primeiro(r_dict, ["numeroCompra", "compra.numeroCompra", "numeroEdital", "numero"])
         proc = primeiro(r_dict, ["processo", "compra.processo", "numeroProcesso"])
         obj = primeiro(r_dict, ["objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
@@ -247,7 +236,7 @@ def paginacao(data: Any) -> Dict[str, Optional[int]]:
         except (ValueError, TypeError): out[k] = None
     return out
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_paginas: int) -> Tuple[List[Dict[str, Any]], int, Optional[int]]:
     base = dict(params_tuple)
     base["pagina"] = 1
@@ -294,65 +283,8 @@ def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[
     return consultar_cache(url, serial, max_paginas)
 
 # ============================================================
-# GERENCIAMENTO DE STORAGE E CACHE (Parquet)
+# DATAFRAME UTILS
 # ============================================================
-
-def garantir_cache():
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-def ler_meta() -> dict:
-    garantir_cache()
-    if not META_PATH.exists(): return {}
-    try: return json.loads(META_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError: return {}
-
-def salvar_meta(meta: dict):
-    garantir_cache()
-    META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def carregar_historico(tipo: str) -> pd.DataFrame:
-    garantir_cache()
-    if not HISTORICO_PATH.exists(): return pd.DataFrame()
-    try:
-        df = pd.read_parquet(HISTORICO_PATH, engine="pyarrow")
-        if "__tipo_controle" in df.columns:
-            df = df[df["__tipo_controle"] == tipo].drop(columns=["__tipo_controle"])
-        return df.reset_index(drop=True)
-    except Exception as e:
-        logging.warning(f"Falha ao ler parquet histórico: {e}")
-        return pd.DataFrame()
-
-def chave_historico(row: pd.Series) -> str:
-    for c in ("numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"):
-        if c in row.index and texto(row[c], ""): return f"{c}:{row[c]}"
-    return "|".join(texto(row.get(c), "") for c in ("numero", "numeroCompra", "numeroContrato", "processo"))
-
-def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str) -> pd.DataFrame:
-    partes = [x for x in (df_antigo, df_novo) if x is not None and not x.empty]
-    if not partes: return pd.DataFrame()
-        
-    out = pd.concat(partes, ignore_index=True, sort=False)
-    out["__chave"] = out.apply(chave_historico, axis=1)
-    out = out.drop_duplicates("__chave", keep="last").drop(columns=["__chave"])
-    out["__tipo_controle"] = tipo
-    
-    garantir_cache()
-    try:
-        if HISTORICO_PATH.exists():
-            df_completo = pd.read_parquet(HISTORICO_PATH, engine="pyarrow")
-            if not df_completo.empty and "__tipo_controle" in df_completo.columns:
-                df_outros_tipos = df_completo[df_completo["__tipo_controle"] != tipo]
-                df_salvar = pd.concat([df_outros_tipos, out], ignore_index=True, sort=False)
-            else:
-                df_salvar = out
-        else:
-            df_salvar = out
-            
-        df_salvar = df_salvar.astype(str)
-        df_salvar.to_parquet(HISTORICO_PATH, index=False, engine="pyarrow", compression="snappy")
-    except Exception as e:
-        logging.error(f"Erro ao salvar parquet: {e}")
-    return out.drop(columns=["__tipo_controle"], errors="ignore").reset_index(drop=True)
 
 def normalizar_pncp(regs: List[Dict[str, Any]]) -> pd.DataFrame:
     if not regs: return pd.DataFrame()
@@ -381,7 +313,7 @@ def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ============================================================
-# MOTOR DE RISCO (ESTATÍSTICO E REGRAS)
+# MOTOR DE RISCO 
 # ============================================================
 
 def limites_iqr(serie: pd.Series) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -437,7 +369,7 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
 # NLP (PROCESSAMENTO SEMÂNTICO)
 # ============================================================
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def calcular_modelo_tfidf(textos: Tuple[str, ...]):
     if not SKLEARN_OK or len(textos) < 2: return None
     vec = TfidfVectorizer(lowercase=True, strip_accents="unicode", ngram_range=(1, 2), min_df=1, max_features=8000, sublinear_tf=True)
@@ -485,15 +417,15 @@ def gerar_excel(df: pd.DataFrame, tipo: str, df_risco: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 # ============================================================
-# APPLICATION ENTRYPOINT (STREAMLIT APP)
+# APP PRINCIPAL (STREAMLIT APP)
 # ============================================================
 
 def main():
     st.set_page_config(page_title="Controle Interno — PNCP Rio das Pedras", page_icon="🛡️", layout="wide")
 
-    # Garante que o estado seja inicializado e previne ghosting
+    # Inicializa estado (Sem controles de cache complexos)
     if "df" not in st.session_state:
-        st.session_state.update({"df": None, "tipo": TIPOS[0], "inicio": dt.date(2026, 1, 1), "fim": dt.date.today(), "modo": "⚡ Consulta por período"})
+        st.session_state.update({"df": None, "tipo": TIPOS[0], "inicio": dt.date(2026, 1, 1), "fim": dt.date.today()})
 
     st.title("🏛️ Inteligência de Controle Interno PNCP")
     st.info("ℹ️ Sistema de alertas automáticos. Necessário validação e auditoria humana para tomada de decisão.")
@@ -501,7 +433,7 @@ def main():
     with st.sidebar:
         st.header("⚙️ Parâmetros")
         
-        # PREVENÇÃO DE GHOSTING (Bug das Atas resolvidas)
+        # Prevenção de Ghosting 
         tipo_selecionado = st.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
         if tipo_selecionado != st.session_state.tipo:
             st.session_state.tipo = tipo_selecionado
@@ -510,45 +442,33 @@ def main():
 
         inicio = st.date_input("📅 Data inicial", st.session_state.inicio)
         fim = st.date_input("📅 Data final", st.session_state.fim)
-        max_paginas = st.slider("📄 Limite de páginas da API", 1, 30, MAX_PAGINAS_PADRAO)
-        modo = st.radio("Modo de Consulta", ["⚡ Consulta por período", "🔄 Atualização incremental"])
-
-        meta = ler_meta()
-        historico = carregar_historico(st.session_state.tipo)
-        if meta.get("ultima_atualizacao"): st.caption(f"Última atualização: {meta['ultima_atualizacao']}")
-            
         buscar_btn = st.button("🔎 Carregar dados", type="primary", use_container_width=True)
 
     if buscar_btn:
         try:
             with st.spinner("Consultando o PNCP (Aplicando Filtros Nativos e Scanner Multithread)..."):
-                data_ini = max(inicio, dt.date.fromisoformat(meta.get("ultima_data_consultada", inicio.isoformat())) - dt.timedelta(days=1)) if "incremental" in modo else inicio
-                data_fim = min(fim, dt.date.today())
-
+                
                 tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
 
                 params = {
-                    "dataInicial": data_ini.strftime("%Y%m%d"), 
-                    "dataFinal": data_fim.strftime("%Y%m%d"), 
+                    "dataInicial": inicio.strftime("%Y%m%d"), 
+                    "dataFinal": fim.strftime("%Y%m%d"), 
                     "tamanhoPagina": tamanhos[tipo_selecionado]
                 }
                 
                 todas_regs = []
                 
-                # ENGENHARIA DE ROTEAMENTO
+                # ENGENHARIA DE BUSCA
                 if tipo_selecionado == "Contratos":
                     params["cnpjOrgao"] = CNPJ
-                    todas_regs, _, _ = consultar(f"{BASE_CONSULTA}/contratos", params, max_paginas)
+                    todas_regs, _, _ = consultar(f"{BASE_CONSULTA}/contratos", params, MAX_PAGINAS)
                 
                 elif tipo_selecionado == "Atas de Registro de Preços":
                     params["cnpj"] = CNPJ
-                    todas_regs, _, _ = consultar(f"{BASE_CONSULTA}/atas", params, max_paginas)
+                    todas_regs, _, _ = consultar(f"{BASE_CONSULTA}/atas", params, MAX_PAGINAS)
                 
                 elif tipo_selecionado == "Editais e Avisos de Contratações":
                     params["cnpj"] = CNPJ
-                    # SOLUÇÃO DEFINITIVA PARA O 404 E 400:
-                    # A API de publicação exige o código da modalidade. Fazemos um loop
-                    # inteligente pelas 15 modalidades possíveis do PNCP.
                     barra_progresso = st.progress(0)
                     modalidades_pncp = list(range(1, 16))
                     
@@ -558,39 +478,32 @@ def main():
                         p_loop["codigoModalidadeContratacao"] = mod
                         
                         try:
-                            regs, _, _ = consultar(f"{BASE_CONSULTA}/contratacoes/publicacao", p_loop, max_paginas)
+                            regs, _, _ = consultar(f"{BASE_CONSULTA}/contratacoes/publicacao", p_loop, MAX_PAGINAS)
                             if regs:
                                 todas_regs.extend(regs)
                         except Exception as e:
-                            # Modalidades inativas ou não preenchidas no município retornarão falhas silenciosas tratadas aqui
-                            logging.debug(f"Pulo na modalidade {mod} (Sem registros ou erro do servidor): {e}")
+                            logging.debug(f"Pulo na modalidade {mod}: {e}")
                             
-                    barra_progresso.empty() # Limpa a barra ao finalizar o loop
+                    barra_progresso.empty() 
                 
-                novo = normalizar_pncp(todas_regs)
-                novo = deduplicar(novo)
+                # NORMALIZAÇÃO
+                df = normalizar_pncp(todas_regs)
+                df = deduplicar(df)
                 
-                # A API de Editais já garante o CNPJ pelo link
                 if tipo_selecionado != "Editais e Avisos de Contratações":
-                    novo = filtrar_cnpj(novo)
+                    df = filtrar_cnpj(df)
 
-                combinado = mesclar_historico(historico, novo, tipo_selecionado)
-                df = combinado.copy()
-                
-                # O Pandas entra aqui fatiando cirurgicamente as datas finais
+                # FILTRAGEM FINAL PELA DATA
                 col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
                 if col_data and not df.empty:
                     ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
                     df = df[(ds >= inicio) & (ds <= fim)].reset_index(drop=True)
 
-                meta.update({"ultima_atualizacao": dt.datetime.now().isoformat("T", "seconds"), "ultima_data_consultada": data_fim.isoformat(), "tipo": tipo_selecionado})
-                salvar_meta(meta)
-                
-                st.session_state.update({"df": df, "inicio": inicio, "fim": fim, "modo": modo})
+                st.session_state.update({"df": df, "inicio": inicio, "fim": fim})
                 st.rerun() 
                 
         except Exception as e:
-            st.error(f"❌ Erro na consulta de rede global: {e}")
+            st.error(f"❌ Erro na consulta de rede: {e}")
 
     # ============================================================
     # VISUALIZAÇÃO E SEGMENTAÇÃO (FRONTEND)
@@ -606,20 +519,17 @@ def main():
         st.warning("Nenhum dado retornado para o filtro aplicado.")
         st.stop()
 
-    # Processamento Inicial
     dados_totais = [dados_registro(row, tipo_atual) for row in df_bruto.to_dict('records')]
     
-    # 🌟 FILTRO GLOBAL DE SEGMENTAÇÃO POR MODALIDADE 🌟
     st.markdown("---")
     st.subheader("🗂️ Segmentação Estratégica")
     todas_modalidades = sorted(list(set(d["modalidade"] for d in dados_totais if d["modalidade"] and d["modalidade"] != "N/D")))
     
     if todas_modalidades:
-        mod_escolhida = st.selectbox("Filtrar e Segmentar por Modalidade (Ex: Pregão Eletrônico):", ["Visão Geral (Todas as Modalidades)"] + todas_modalidades)
+        mod_escolhida = st.selectbox("Filtrar e Segmentar por Modalidade:", ["Visão Geral (Todas as Modalidades)"] + todas_modalidades)
     else:
         mod_escolhida = "Visão Geral (Todas as Modalidades)"
 
-    # Aplicação do Filtro na Tabela e nos Processamentos
     if mod_escolhida != "Visão Geral (Todas as Modalidades)":
         indices_ativos = [i for i, d in enumerate(dados_totais) if d["modalidade"] == mod_escolhida]
     else:
@@ -634,7 +544,6 @@ def main():
         st.warning(f"Sem registros para a modalidade: {mod_escolhida}")
         st.stop()
 
-    # Renderização de Métricas Dinâmicas
     altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
     medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
     valor_total = contexto["valor_num"].sum(min_count=1) if "valor_num" in contexto.columns else None
@@ -643,9 +552,8 @@ def main():
     k1.metric("Registros Segmentados", len(dados_processados))
     k2.metric("🔴 Alto risco", altos)
     k3.metric("🟡 Médio risco", medios)
-    k4.metric("Valor Analisado (Neste Segmento)", moeda(valor_total))
+    k4.metric("Valor Analisado", moeda(valor_total))
 
-    # Construção da Matriz
     rows = []
     for i_local, r in enumerate(riscos):
         d = dados_processados[i_local]
