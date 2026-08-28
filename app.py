@@ -966,24 +966,28 @@ else:
 
     # Documentos
     st.markdown("### 📎 Documentos disponíveis no PNCP")
-    if st.button("🔎 Consultar documentos desta contratação", key=f"docs_{i}"):
+    
+    btn_key = f"btn_docs_{i}"
+    data_key = f"data_docs_{i}"
+    
+    if st.button("🔎 Consultar documentos desta contratação", key=btn_key):
         try:
             docs = listar_documentos(row, tipo_atual)
-            st.session_state[f"docs_{i}"] = docs
+            st.session_state[data_key] = docs
         except Exception as e:
             st.error(f"❌ {e}")
             
-    docs = st.session_state.get(f"docs_{i}")
+    docs = st.session_state.get(data_key)
+    
     if docs is not None:
-        if not docs:
+        if isinstance(docs, list) and not docs:
             st.info("O serviço de documentos do PNCP não retornou arquivos para este registro.")
-        else:
+        elif isinstance(docs, list):
             st.success(f"{len(docs)} documento(s) retornado(s) pelo PNCP.")
             zipbuf = io.BytesIO()
             baixados = 0
             falhas = []
             
-            # Helper function para multithreading
             def baixar_arquivo(url, nome_final):
                 return nome_final, baixar_bytes(url)
 
@@ -1009,7 +1013,6 @@ else:
                         continue
                     tarefas.append((url, nome_final))
                 
-                # Executa os downloads simultaneamente para maior velocidade (Fix Streamlit threading)
                 resultados_download = []
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
                     futuros = {pool.submit(baixar_arquivo, t[0], t[1]): t[1] for t in tarefas}
@@ -1024,7 +1027,6 @@ else:
                             resultados_download.append((False, nome_final, str(e)))
                             falhas.append(f"{nome_final}: {e}")
                 
-                # Reporta o andamento fora da Thread para não conflitar com a UI do Streamlit
                 for sucesso, nome, erro in resultados_download:
                     if sucesso:
                         st.write(f"✅ {nome}")
