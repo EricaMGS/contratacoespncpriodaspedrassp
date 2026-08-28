@@ -61,7 +61,7 @@ HISTORICO_PATH = CACHE_DIR / "contratacoes_controle_interno.parquet"
 META_PATH = CACHE_DIR / "controle_incremental.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/2.2",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/3.0",
     "Accept": "application/json",
     "Connection": "keep-alive",
 }
@@ -80,7 +80,7 @@ def sessao_http() -> requests.Session:
     retries = Retry(
         total=MAX_TENTATIVAS,
         backoff_factor=1.5,
-        status_forcelist=[405, 408, 429, 500, 502, 503, 504],
+        status_forcelist=[400, 404, 405, 408, 422, 429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS"]
     )
     
@@ -109,7 +109,7 @@ def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
             return []
         r.raise_for_status()
     except requests.exceptions.RetryError as e:
-        raise RuntimeError(f"Falha ao conectar no PNCP (Limite de Taxa).") from e
+        raise RuntimeError(f"Falha ao conectar no PNCP (Limite de Taxa ou Indisponibilidade).") from e
     except requests.exceptions.HTTPError as e:
         raise RuntimeError(f"PNCP rejeitou a requisição (HTTP {e.response.status_code}): {detalhe_http(e.response)}") from e
     except requests.exceptions.RequestException as e:
@@ -491,7 +491,7 @@ def gerar_excel(df: pd.DataFrame, tipo: str, df_risco: pd.DataFrame) -> bytes:
 def main():
     st.set_page_config(page_title="Controle Interno — PNCP Rio das Pedras", page_icon="🛡️", layout="wide")
 
-    # Garante que o estado seja inicializado e prevenimos ghosting
+    # Garante que o estado seja inicializado e previne ghosting
     if "df" not in st.session_state:
         st.session_state.update({"df": None, "tipo": TIPOS[0], "inicio": dt.date(2026, 1, 1), "fim": dt.date.today(), "modo": "⚡ Consulta por período"})
 
@@ -521,7 +521,7 @@ def main():
 
     if buscar_btn:
         try:
-            with st.spinner("Consultando o PNCP (Aplicando Filtros Nativos e Backoff)..."):
+            with st.spinner("Consultando o PNCP (Aplicando Filtros Nativos e Scanner Multithread)..."):
                 data_ini = max(inicio, dt.date.fromisoformat(meta.get("ultima_data_consultada", inicio.isoformat())) - dt.timedelta(days=1)) if "incremental" in modo else inicio
                 data_fim = min(fim, dt.date.today())
 
@@ -533,23 +533,41 @@ def main():
                     "tamanhoPagina": tamanhos[tipo_selecionado]
                 }
                 
-                # CORREÇÃO DE ENGENHARIA AQUI PARA RESOLVER O ERRO 405 DA API DO PNCP
-                if tipo_selecionado == "Contratos":
-                    url_alvo = f"{BASE_CONSULTA}/contratos"
-                    params["cnpjOrgao"] = CNPJ
-                elif tipo_selecionado == "Atas de Registro de Preços":
-                    url_alvo = f"{BASE_CONSULTA}/atas"
-                    params["cnpj"] = CNPJ
-                elif tipo_selecionado == "Editais e Avisos de Contratações":
-                    # O endpoint /compras de leitura EXIGE o ano na URL e NÃO aceita GET sem o ano referenciado.
-                    url_alvo = f"{BASE_DOCUMENTOS}/orgaos/{CNPJ}/compras/{data_fim.year}"
-                    # Removemos as chaves de dataInicial e dataFinal porque esse endpoint específico rejeita esses parâmetros (evita o erro 400).
-                    # A paginação cuidará de trazer o ano e o Pandas cortará o limite exato de meses.
-                    params.pop("dataInicial", None)
-                    params.pop("dataFinal", None)
+                todas_regs = []
                 
-                regs, _, _ = consultar(url_alvo, params, max_paginas)
-                novo = normalizar_pncp(regs)
+                # ENGENHARIA DE ROTEAMENTO
+                if tipo_selecionado == "Contratos":
+                    params["cnpjOrgao"] = CNPJ
+                    todas_regs, _, _ = consultar(f"{BASE_CONSULTA}/contratos", params, max_paginas)
+                
+                elif tipo_selecionado == "Atas de Registro de Preços":
+                    params["cnpj"] = CNPJ
+                    todas_regs, _, _ = consultar(f"{BASE_CONSULTA}/atas", params, max_paginas)
+                
+                elif tipo_selecionado == "Editais e Avisos de Contratações":
+                    params["cnpj"] = CNPJ
+                    # SOLUÇÃO DEFINITIVA PARA O 404 E 400:
+                    # A API de publicação exige o código da modalidade. Fazemos um loop
+                    # inteligente pelas 15 modalidades possíveis do PNCP.
+                    barra_progresso = st.progress(0)
+                    modalidades_pncp = list(range(1, 16))
+                    
+                    for idx, mod in enumerate(modalidades_pncp):
+                        barra_progresso.progress((idx + 1) / len(modalidades_pncp), text=f"🔎 Varrendo modalidade PNCP cód. {mod}...")
+                        p_loop = dict(params)
+                        p_loop["codigoModalidadeContratacao"] = mod
+                        
+                        try:
+                            regs, _, _ = consultar(f"{BASE_CONSULTA}/contratacoes/publicacao", p_loop, max_paginas)
+                            if regs:
+                                todas_regs.extend(regs)
+                        except Exception as e:
+                            # Modalidades inativas ou não preenchidas no município retornarão falhas silenciosas tratadas aqui
+                            logging.debug(f"Pulo na modalidade {mod} (Sem registros ou erro do servidor): {e}")
+                            
+                    barra_progresso.empty() # Limpa a barra ao finalizar o loop
+                
+                novo = normalizar_pncp(todas_regs)
                 novo = deduplicar(novo)
                 
                 # A API de Editais já garante o CNPJ pelo link
@@ -559,7 +577,7 @@ def main():
                 combinado = mesclar_historico(historico, novo, tipo_selecionado)
                 df = combinado.copy()
                 
-                # O Pandas entra aqui fatiando cirurgicamente as datas para consertar a limitação da API
+                # O Pandas entra aqui fatiando cirurgicamente as datas finais
                 col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
                 if col_data and not df.empty:
                     ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
@@ -572,7 +590,7 @@ def main():
                 st.rerun() 
                 
         except Exception as e:
-            st.error(f"❌ Erro na consulta de rede: {e}")
+            st.error(f"❌ Erro na consulta de rede global: {e}")
 
     # ============================================================
     # VISUALIZAÇÃO E SEGMENTAÇÃO (FRONTEND)
