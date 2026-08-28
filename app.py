@@ -61,7 +61,7 @@ HISTORICO_PATH = CACHE_DIR / "contratacoes_controle_interno.parquet"
 META_PATH = CACHE_DIR / "controle_incremental.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/2.1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitoramentoControleInterno/2.2",
     "Accept": "application/json",
     "Connection": "keep-alive",
 }
@@ -80,7 +80,7 @@ def sessao_http() -> requests.Session:
     retries = Retry(
         total=MAX_TENTATIVAS,
         backoff_factor=1.5,
-        status_forcelist=[408, 429, 500, 502, 503, 504],
+        status_forcelist=[405, 408, 429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS"]
     )
     
@@ -520,18 +520,12 @@ def main():
         buscar_btn = st.button("🔎 Carregar dados", type="primary", use_container_width=True)
 
     if buscar_btn:
-        # CORREÇÃO DE ENDPOINT: Revertido para a API do Órgão, que não sofre bloqueio do código 400
-        endpoints = {
-            "Contratos": f"{BASE_CONSULTA}/contratos",
-            "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
-            "Editais e Avisos de Contratações": f"{BASE_DOCUMENTOS}/orgaos/{CNPJ}/compras", 
-        }
-        tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
-        
         try:
             with st.spinner("Consultando o PNCP (Aplicando Filtros Nativos e Backoff)..."):
                 data_ini = max(inicio, dt.date.fromisoformat(meta.get("ultima_data_consultada", inicio.isoformat())) - dt.timedelta(days=1)) if "incremental" in modo else inicio
                 data_fim = min(fim, dt.date.today())
+
+                tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
 
                 params = {
                     "dataInicial": data_ini.strftime("%Y%m%d"), 
@@ -539,28 +533,33 @@ def main():
                     "tamanhoPagina": tamanhos[tipo_selecionado]
                 }
                 
-                # Setup Específico dos Parâmetros
+                # CORREÇÃO DE ENGENHARIA AQUI PARA RESOLVER O ERRO 405 DA API DO PNCP
                 if tipo_selecionado == "Contratos":
+                    url_alvo = f"{BASE_CONSULTA}/contratos"
                     params["cnpjOrgao"] = CNPJ
                 elif tipo_selecionado == "Atas de Registro de Preços":
+                    url_alvo = f"{BASE_CONSULTA}/atas"
                     params["cnpj"] = CNPJ
                 elif tipo_selecionado == "Editais e Avisos de Contratações":
-                    # O endpoint /compras trabalha muito bem se informarmos o anoCompra caso a consulta seja dentro do mesmo ano
-                    if data_ini.year == data_fim.year:
-                        params["anoCompra"] = data_ini.year
+                    # O endpoint /compras de leitura EXIGE o ano na URL e NÃO aceita GET sem o ano referenciado.
+                    url_alvo = f"{BASE_DOCUMENTOS}/orgaos/{CNPJ}/compras/{data_fim.year}"
+                    # Removemos as chaves de dataInicial e dataFinal porque esse endpoint específico rejeita esses parâmetros (evita o erro 400).
+                    # A paginação cuidará de trazer o ano e o Pandas cortará o limite exato de meses.
+                    params.pop("dataInicial", None)
+                    params.pop("dataFinal", None)
                 
-                regs, _, _ = consultar(endpoints[tipo_selecionado], params, max_paginas)
+                regs, _, _ = consultar(url_alvo, params, max_paginas)
                 novo = normalizar_pncp(regs)
                 novo = deduplicar(novo)
                 
-                # A API de Editais já garante o CNPJ pelo link, os outros necessitam checagem no código
+                # A API de Editais já garante o CNPJ pelo link
                 if tipo_selecionado != "Editais e Avisos de Contratações":
                     novo = filtrar_cnpj(novo)
 
                 combinado = mesclar_historico(historico, novo, tipo_selecionado)
                 df = combinado.copy()
                 
-                # Filtragem Segura por Datas com Pandas
+                # O Pandas entra aqui fatiando cirurgicamente as datas para consertar a limitação da API
                 col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
                 if col_data and not df.empty:
                     ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
@@ -570,7 +569,7 @@ def main():
                 salvar_meta(meta)
                 
                 st.session_state.update({"df": df, "inicio": inicio, "fim": fim, "modo": modo})
-                st.rerun() # Atualiza a UI inteira limpa
+                st.rerun() 
                 
         except Exception as e:
             st.error(f"❌ Erro na consulta de rede: {e}")
