@@ -1,45 +1,21 @@
-Consulta de dados de Contratações do Portal Nacional de Contratações Públicas (PNCP)
-Desenvolvido para facilitar o controle social, este painel permite a consulta ágil e a análise de dados públicos de Rio das Pedras/SP. Através da integração com o PNCP, o projeto centraliza o monitoramento de editais, contratos e seus respectivos aditivos, oferecendo ferramentas nativas para exportação de relatórios e visualização de indicadores financeiros e operacionais.
+# 🛡️ Painel de Inteligência e Apoio ao Controle Interno — PNCP
 
-🚀 Funcionalidades
-Consulta Direta à API: Integração em tempo real com a API oficial do PNCP.
-Dashboards Interativos: Visualização de métricas (KPIs) e gráficos de evolução temporal das contratações.
-Gestão de Aditivos: Ferramenta dedicada para consultar documentos vinculados (Aditivos e Apostilamentos) de cada contrato selecionado.
-Exportação de Relatórios: Geração automática de documentos para auxiliar a fiscalização e controle:
-📊 Excel (.xlsx)
-📄 CSV (.csv)
-📝 Word (.docx) - Formatado com detalhes executivos.
-📕 PDF (.pdf) - Relatório limpo e profissional.
-Robustez: Implementação de retentativas automáticas (retry logic) para lidar com instabilidades da API e timeouts.
+Sistema analítico desenvolvido em **Python (Streamlit, Pandas e Scikit-Learn)** para o monitoramento preventivo, triagem de riscos e auditoria de contratações públicas municipais, consumindo dados abertos da API do **PNCP (Portal Nacional de Contratações Públicas)**.
 
-🛠️ Tecnologias Utilizadas
-Python: Linguagem base para processamento e lógica.
-Streamlit: Framework para criação do dashboard web interativo.
-Pandas: Manipulação e tratamento de dataframes.
-Requests: Consumo da API do PNCP.
-FPDF & python-docx: Geração de relatórios em PDF e Word.
+---
 
-📋 Como executar localmente
-Clone o repositório:
-Bash
-git clone https://github.com/EricaMGS/contratacoespncpriodaspedrassp.git
-cd seu-repositorio
+## 🚀 Principais Funcionalidades
+- **Consulta Dinâmica e Multithread:** Extração de contratos, atas de registro de preços e editais/compras diretamente do PNCP com alta performance e tratamento automático de falhas (*Retry / Exponential Backoff*).
+- **Motor de Classificação de Risco (Rule-Based + Statistical):** Avaliação automatizada de anomalias com base em desvios estatísticos (IQR), valores limiar, completude cadastral e concentração de fornecedores.
+- **Clusterização Semântica (NLP):** Uso de **TF-IDF** e **Similaridade de Cosseno** para encontrar contratações historicamente semelhantes na mesma amostra, auxiliando na verificação de preços e padrões de objetos.
+- **Segmentação Estratégica:** Filtros globais por modalidade de contratação (Pregão Eletrônico, Dispensa, Inexigibilidade, etc.).
+- **Exportação de Relatórios:** Geração de planilhas formatadas em Excel (`.xlsx`) com abas separadas para a Matriz de Risco e Dados Brutos.
 
+---
 
-Instale as dependências:
-Bash
-pip install -r requirements.txt
+## ⚙️ Instalação e Execução Local
 
-(Caso não tenha o arquivo, instale: pip install streamlit pandas requests fpdf python-docx openpyxl)
-Execute o aplicativo:
-Bash
-streamlit run app.py
-
-🏗️ Estrutura do Código
-app.py: Arquivo principal contendo a lógica de interface, integração com API e geração de relatórios.
-consultar_pncp(): Função robusta com controle de erros e retentativas para evitar falhas durante a carga de dados.
-consultar_detalhes_contrato(): Módulo específico para buscar aditivos vinculados aos contratos.
-
-⚖️ Aviso Legal
-Este software é uma ferramenta de auxílio à transparência pública. A precisão dos dados depende exclusivamente da alimentação e disponibilidade da API do Portal Nacional de Contratações Públicas (PNCP).
-
+1. **Clone o repositório ou salve o script principal como `app.py`**.
+2. **Instale as dependências necessárias**:
+   ```bash
+   pip install streamlit pandas requests urllib3 openpyxl scikit-learn pyarrow
