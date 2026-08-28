@@ -448,7 +448,6 @@ def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 
 def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
-    # Otimização extrema usando list comprehension sobre to_dict('records')
     registros = [dados_registro(row, tipo) for row in df.to_dict('records')]
     return pd.DataFrame(registros)
 
@@ -495,7 +494,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
         motivos.append("Campos não identificados: " + ", ".join(faltantes))
         testes.append("Atenção na completude cadastral")
 
-    # Regras segregadas para maior clareza
     p_mod, m_mod, t_mod = avaliar_modalidade(modalidade, objeto)
     pontos += p_mod
     motivos.extend(m_mod)
@@ -785,10 +783,11 @@ if fim < inicio:
     st.stop()
 
 if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=True):
+    # CORREÇÃO APLICADA AQUI: Alteração do endpoint de Editais para a rota geral
     endpoints = {
         "Contratos": f"{BASE_CONSULTA}/contratos",
         "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
-        "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes/publicacao",
+        "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes",
     }
     tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
     
