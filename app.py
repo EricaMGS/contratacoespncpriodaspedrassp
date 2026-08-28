@@ -12,10 +12,6 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from docx import Document
-from docx.shared import Pt, RGBColor
-from fpdf import FPDF
-
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -370,11 +366,8 @@ def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str)
 def normalizar_pncp(regs: List[Dict[str, Any]]) -> pd.DataFrame:
     if not regs:
         return pd.DataFrame()
-    # OTIMIZAÇÃO E CORREÇÃO: "Achata" (flatten) as estruturas aninhadas enviadas pelo governo.
-    # Ex: {"compra": {"objeto": "X"}} vira a coluna "compra.objeto"
     df = pd.json_normalize(regs)
     
-    # Previne erros de drop_duplicates transformando listas/dicts residuais em texto
     for col in df.columns:
         if any(isinstance(v, (dict, list)) for v in df[col]):
             df[col] = df[col].astype(str)
@@ -407,7 +400,6 @@ def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fuzzy_match(r_dict: Dict[str, Any], palavras: List[str]) -> Any:
-    """Busca em todas as chaves disponíveis qualquer uma que contenha as palavras alvo (Evita falhas se a API mudar)"""
     for k, v in r_dict.items():
         if pd.isna(v) or v is None or str(v).strip() in ("", "nan", "None", "N/D"):
             continue
@@ -418,12 +410,10 @@ def fuzzy_match(r_dict: Dict[str, Any], palavras: List[str]) -> Any:
 
 
 def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
-    # Garante que row é um dicionário para leitura fácil
     r_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
     
     controle = primeiro(r_dict, ["numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"])
     
-    # 1. Tentativa explícita focada na estrutura do PNCP (antiga e achatada)
     if tipo == "Contratos":
         num = primeiro(r_dict, ["numeroContratoEmpenho", "numeroContrato", "numero"])
         proc = primeiro(r_dict, ["processo", "numeroProcesso", "compra.processo"])
@@ -456,7 +446,6 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         
     mod = primeiro(r_dict, ["modalidadeNome", "modalidadeContratacaoNome", "compra.modalidadeNome", "modalidade"])
 
-    # 2. Fallback de Segurança: Se mesmo assim a API escondeu algo, busca por palavra-chave em todo o dicionário
     if texto(obj, "") == "": obj = fuzzy_match(r_dict, ["objeto", "descricao"])
     if texto(forn, "") == "": forn = fuzzy_match(r_dict, ["razaosocial", "fornecedornome", "fornecedor.nome"])
     if texto(val, "") == "": val = fuzzy_match(r_dict, ["valortotal", "valorglobal", "valorata", "valor"])
@@ -605,7 +594,6 @@ def calcular_modelo_tfidf(textos: Tuple[str, ...]):
     
     vec = TfidfVectorizer(lowercase=True, strip_accents="unicode", ngram_range=(1, 2), min_df=1, max_features=8000, sublinear_tf=True)
     
-    # Prepara os textos: injeta palavra de segurança se a prefeitura enviou "lixo" (ex: apenas traços ou "N/D")
     textos_seguros = []
     for t in textos:
         t_str = str(t)
@@ -781,79 +769,6 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio, fim, df_risco: pd.DataFrame
     return buf.getvalue()
 
 
-def gerar_word(row: Any, tipo: str, risco: Dict[str, Any]) -> bytes:
-    d = dados_registro(row, tipo)
-    doc = Document()
-    sec = doc.sections[0]
-    sec.header.paragraphs[0].text = PREFEITURA
-    p = doc.add_paragraph()
-    p.alignment = 1
-    r = p.add_run("PAPEL DE TRABALHO — CONTROLE INTERNO")
-    r.bold = True; r.font.size = Pt(16); r.font.color.rgb = RGBColor(31, 78, 121)
-    doc.add_paragraph("Indicador automatizado de apoio à análise. Não constitui conclusão de irregularidade.")
-    tabela = doc.add_table(rows=0, cols=2)
-    for k, v in [("Escopo", tipo), ("Número", d["numero"]), ("Processo", d["processo"]), ("Controle PNCP", d["controle"]), ("Objeto", d["objeto"]), ("Fornecedor", d["fornecedor"]), ("Valor", d["valor"]), ("Data", d["data"]), ("Modalidade", d["modalidade"])]:
-        cells = tabela.add_row().cells; cells[0].text = k; cells[1].text = v
-    doc.add_heading("1. Matriz de risco", level=1)
-    doc.add_paragraph(f"Classificação: {risco['nivel']} — {risco['pontos']}/100")
-    for m in risco["motivos"]:
-        doc.add_paragraph(m, style="List Bullet")
-    doc.add_heading("2. Testes automatizados", level=1)
-    for t in risco["testes"]:
-        doc.add_paragraph(t, style="List Bullet")
-    doc.add_heading("3. Evidências / documentos a verificar", level=1)
-    for x in ["Edital/aviso ou instrumento convocatório", "Termo de Referência/ETP, quando aplicável", "Pesquisa/estimativa de preços", "Justificativas e autorizações", "Contrato/ata e eventuais termos", "Publicações e demais documentos disponíveis no PNCP"]:
-        doc.add_paragraph(x, style="List Bullet")
-    doc.add_heading("4. Observação do Controlador", level=1)
-    doc.add_paragraph("________________________________________________________________________________")
-    doc.add_paragraph("________________________________________________________________________________")
-    doc.add_heading("5. Conclusão", level=1)
-    doc.add_paragraph("________________________________________________________________________________")
-    doc.add_paragraph("Documento gerado automaticamente para apoio ao trabalho do Controle Interno. A conclusão deve ser realizada pelo responsável, mediante análise das evidências e critérios aplicáveis.")
-    buf = io.BytesIO(); doc.save(buf); buf.seek(0); return buf.getvalue()
-
-
-def gerar_pdf(row: Any, tipo: str, risco: Dict[str, Any]) -> bytes:
-    def limpa(t):
-        if not t: return ""
-        t = str(t)
-        rep = {'—': '-', '–': '-', '”': '"', '“': '"', '’': "'", '‘': "'", '•': '-', '🔴': 'ALTO', '🟡': 'MEDIO', '🟢': 'BAIXO'}
-        for k, v in rep.items(): t = t.replace(k, v)
-        return t.encode('latin-1', 'replace').decode('latin-1')
-
-    d = dados_registro(row, tipo)
-    pdf = FPDF()
-    pdf.set_auto_page_break(True, 15)
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 15)
-    pdf.cell(0, 10, limpa("PAPEL DE TRABALHO - CONTROLE INTERNO"), ln=True, align="C")
-    pdf.set_font("Arial", "", 9)
-    pdf.multi_cell(0, 5, limpa(f"{PREFEITURA}\nIndicador automatizado de apoio; nao constitui conclusao de irregularidade."))
-    pdf.ln(3)
-    pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, limpa("1. Identificacao"), ln=True)
-    pdf.set_font("Arial", "", 9)
-    for k, v in [("Escopo", tipo), ("Numero", d["numero"]), ("Processo", d["processo"]), ("Controle PNCP", d["controle"]), ("Objeto", d["objeto"]), ("Fornecedor", d["fornecedor"]), ("Valor", d["valor"]), ("Data", d["data"]), ("Modalidade", d["modalidade"])]:
-        pdf.multi_cell(0, 5, limpa(f"{k}: {v}"))
-    pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, limpa("2. Matriz de risco"), ln=True)
-    pdf.set_font("Arial", "", 9)
-    pdf.multi_cell(0, 5, limpa(f"Classificacao: {risco['nivel']} - {risco['pontos']}/100"))
-    for m in risco["motivos"]: pdf.multi_cell(0, 5, limpa("- " + m))
-    pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, limpa("3. Testes automatizados"), ln=True)
-    pdf.set_font("Arial", "", 9)
-    for t in risco["testes"]: pdf.multi_cell(0, 5, limpa("- " + t))
-    pdf.set_font("Arial", "B", 11)
-    pdf.cell(0, 7, limpa("4. Observacao e conclusao"), ln=True)
-    pdf.set_font("Arial", "", 9)
-    pdf.multi_cell(0, 8, limpa("Observacao do Controlador:\n\n________________________________________________________________________________\n\nConclusao:\n\n________________________________________________________________________________"))
-    
-    saida = pdf.output(dest="S")
-    if isinstance(saida, str): return saida.encode('latin-1', 'ignore')
-    return bytes(saida)
-
-
 # ============================================================
 # INTERFACE
 # ============================================================
@@ -915,7 +830,6 @@ if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=
             
             regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
             
-            # NORMALIZAÇÃO AVANÇADA (Achata os dicionários JSON)
             novo = normalizar_pncp(regs)
             novo = deduplicar(novo)
             
@@ -923,7 +837,6 @@ if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=
 
             combinado = mesclar_historico(historico, novo, tipo)
             
-            # Resultado da tela
             df = combinado.copy()
             col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
             if col_data:
@@ -960,11 +873,9 @@ if df.empty:
     st.warning("Nenhum registro retornado pelo PNCP para os parâmetros informados.")
     st.stop()
 
-# OTIMIZAÇÃO: Processa as linhas uma única vez, removendo iterrows()
 df_records = df.to_dict('records')
 dados_processados = [dados_registro(row, tipo_atual) for row in df_records]
 
-# Constrói o contexto a partir da lista já processada
 contexto = pd.DataFrame(dados_processados)
 riscos = [calcular_risco(d, contexto, tipo_atual) for d in dados_processados]
 
@@ -1115,16 +1026,6 @@ else:
             if falhas:
                 with st.expander("Detalhes dos documentos que falharam"):
                     for f in falhas: st.write(f)
-
-    # Papel de trabalho
-    st.markdown("### 📝 Exportar papel de trabalho")
-    colw, colp = st.columns(2)
-    with colw:
-        word = gerar_word(row, tipo_atual, r)
-        st.download_button("⬇️ Word", word, file_name=f"Papel_Trabalho_{slug(d['numero'])}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"word_{i}")
-    with colp:
-        pdf = gerar_pdf(row, tipo_atual, r)
-        st.download_button("⬇️ PDF", pdf, file_name=f"Papel_Trabalho_{slug(d['numero'])}.pdf", mime="application/pdf", key=f"pdf_{i}")
 
 # Exportação geral
 st.markdown("---")
