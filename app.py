@@ -1,3 +1,8 @@
+"""
+Painel de Inteligência e Apoio ao Controle Interno - PNCP
+Desenvolvido com Streamlit, Pandas e Scikit-Learn.
+"""
+
 import io
 import re
 import time
@@ -13,9 +18,10 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Configuração de log para não silenciar erros importantes
+# Configuração de log
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Verificação de dependência opcional (Machine Learning)
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -23,16 +29,9 @@ try:
 except ImportError:
     SKLEARN_OK = False
 
-
 # ============================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÕES GLOBAIS
 # ============================================================
-
-st.set_page_config(
-    page_title="Controle Interno — PNCP Rio das Pedras/SP",
-    page_icon="🛡️",
-    layout="wide",
-)
 
 CNPJ = "44826840000183"
 IBGE = "3544004"
@@ -42,7 +41,7 @@ PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
 BASE_CONSULTA = "https://pncp.gov.br/api/consulta/v1"
 BASE_DOCUMENTOS = "https://pncp.gov.br/api/pncp/v1"
 
-# Limites conservadores para reduzir timeout/instabilidade do PNCP.
+# Limites e parâmetros de requisição
 PAGE_CONTRATOS = 100
 PAGE_ATAS = 100
 PAGE_EDITAIS = 50
@@ -64,7 +63,7 @@ HEADERS = {
 TIPOS = ["Contratos", "Atas de Registro de Preços", "Editais e Avisos de Contratações"]
 
 # ============================================================
-# UTILITÁRIOS (Refatorados para alta performance)
+# UTILITÁRIOS DE LIMPEZA E FORMATAÇÃO DE DADOS
 # ============================================================
 
 def texto(valor: Any, padrao: str = "N/D") -> str:
@@ -133,6 +132,7 @@ def fuzzy_match(r_dict: Dict[str, Any], palavras: List[str]) -> Any:
     return None
 
 def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
+    """Padroniza as chaves do dicionário de acordo com o tipo de contratação."""
     r_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
     
     controle = primeiro(r_dict, ["numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"])
@@ -169,6 +169,7 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         
     mod = primeiro(r_dict, ["modalidadeNome", "modalidadeContratacaoNome", "compra.modalidadeNome", "modalidade"])
 
+    # Fallbacks inteligentes
     if texto(obj, "") == "": obj = fuzzy_match(r_dict, ["objeto", "descricao"])
     if texto(forn, "") == "": forn = fuzzy_match(r_dict, ["razaosocial", "fornecedornome", "fornecedor.nome"])
     if texto(val, "") == "": val = fuzzy_match(r_dict, ["valortotal", "valorglobal", "valorata", "valor"])
@@ -190,11 +191,11 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
     }
 
 # ============================================================
-# HTTP / PNCP
+# INTEGRAÇÃO HTTP (API DO PNCP)
 # ============================================================
 
 @st.cache_resource
-def sessao_http():
+def sessao_http() -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
     return s
@@ -209,7 +210,7 @@ def detalhe_http(r: requests.Response) -> str:
     return r.text[:500].strip()
 
 def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    ultimo = None
+    ultimo_erro = None
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
             r = sessao_http().get(url, params=params, timeout=TIMEOUT)
@@ -225,19 +226,19 @@ def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
             if r.status_code == 404:
                 raise RuntimeError(f"Recurso não encontrado no PNCP (HTTP 404). Endpoint: {r.url}")
             if r.status_code in (408, 429, 500, 502, 503, 504):
-                ultimo = RuntimeError(f"HTTP {r.status_code}: {detalhe_http(r)}")
+                ultimo_erro = RuntimeError(f"HTTP {r.status_code}: {detalhe_http(r)}")
                 if tentativa < MAX_TENTATIVAS:
                     time.sleep(min(2 ** tentativa, 12))
                     continue
-                raise ultimo
+                raise ultimo_erro
             raise RuntimeError(f"PNCP retornou HTTP {r.status_code}: {detalhe_http(r)}")
         except (requests.Timeout, requests.ConnectionError) as e:
-            ultimo = e
+            ultimo_erro = e
             if tentativa < MAX_TENTATIVAS:
                 time.sleep(min(2 ** tentativa, 12))
                 continue
             raise RuntimeError("O PNCP não respondeu após várias tentativas.") from e
-    raise RuntimeError("Falha inesperada na comunicação com o PNCP.") from ultimo
+    raise RuntimeError("Falha inesperada na comunicação com o PNCP.") from ultimo_erro
 
 def registros_api(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
@@ -262,6 +263,7 @@ def paginacao(data: Any) -> Dict[str, Optional[int]]:
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_paginas: int) -> Tuple[List[Dict[str, Any]], int, Optional[int]]:
+    """Consulta multithread paralela para acelerar requisições paginadas."""
     base = dict(params_tuple)
     base["pagina"] = 1
     
@@ -311,13 +313,13 @@ def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[
     return consultar_cache(url, serial, max_paginas)
 
 # ============================================================
-# BASE HISTÓRICA E NORMALIZAÇÃO
+# GERENCIAMENTO DE DADOS E CACHE LOCAL
 # ============================================================
 
 def garantir_cache():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-def ler_meta():
+def ler_meta() -> dict:
     garantir_cache()
     if not META_PATH.exists():
         return {}
@@ -326,7 +328,7 @@ def ler_meta():
     except json.JSONDecodeError:
         return {}
 
-def salvar_meta(meta):
+def salvar_meta(meta: dict):
     garantir_cache()
     META_PATH.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -342,7 +344,7 @@ def carregar_historico(tipo: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def chave_historico(row):
+def chave_historico(row: pd.Series) -> str:
     for c in ("numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"):
         if c in row.index:
             v = texto(row[c], "")
@@ -351,6 +353,7 @@ def chave_historico(row):
     return "|".join(texto(row.get(c), "") for c in ("numero", "numeroCompra", "numeroContrato", "processo"))
 
 def mesclar_historico(df_antigo: pd.DataFrame, df_novo: pd.DataFrame, tipo: str) -> pd.DataFrame:
+    """Mescla dados novos com base histórica no formato Parquet."""
     partes = [x for x in (df_antigo, df_novo) if x is not None and not x.empty]
     if not partes:
         return pd.DataFrame()
@@ -403,7 +406,6 @@ def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     alvo = cnpj_limpo(CNPJ)
-    # Procura em todas as colunas que podem conter CNPJ na resposta achatada
     for col in ("cnpjOrgao", "cnpj", "cnpjCompra", "orgaoEntidade.cnpj", "orgao.cnpj"):
         if col in df.columns:
             s = df[col].map(cnpj_limpo)
@@ -413,7 +415,7 @@ def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ============================================================
-# RISCO — REGRAS TRANSPARENTES + ANOMALIA RELATIVA
+# MOTOR DE RISCO (MACHINE LEARNING & REGRAS ESTATÍSTICAS)
 # ============================================================
 
 def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
@@ -421,6 +423,7 @@ def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
     return pd.DataFrame(registros)
 
 def limites_iqr(serie: pd.Series) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Calcula os limites interquartis para detecção de outliers de valor."""
     s = pd.to_numeric(serie, errors="coerce").dropna()
     if len(s) < 5:
         return None, None, None
@@ -443,6 +446,7 @@ def avaliar_modalidade(modalidade: str, objeto: str) -> Tuple[int, List[str], Li
     return pontos, motivos, testes
 
 def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict[str, Any]:
+    """Motor de pontuação de risco baseado em anomalias relativas e regras de negócio."""
     pontos = 0
     motivos = []
     testes = []
@@ -450,6 +454,7 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     modalidade = d.get("modalidade", "").lower()
     objeto = d.get("objeto", "").lower()
 
+    # Checagem de dados incompletos
     faltantes = []
     for campo, label in (("objeto", "objeto"), ("controle", "controle PNCP"), ("data", "data")):
         if texto(d.get(campo), "") in {"", "N/D"}:
@@ -460,11 +465,13 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
         motivos.append("Campos não identificados: " + ", ".join(faltantes))
         testes.append("Atenção na completude cadastral")
 
+    # Avaliação de Modalidade
     p_mod, m_mod, t_mod = avaliar_modalidade(modalidade, objeto)
     pontos += p_mod
     motivos.extend(m_mod)
     testes.extend(t_mod)
 
+    # Avaliação de Volumetria Financeira
     if valor is not None:
         if valor >= 500_000:
             pontos += 10
@@ -473,6 +480,7 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
             pontos += 5
             motivos.append("Valor relevante (>150k)")
 
+    # Detecção de Anomalia Estatística (IQR)
     baixo, alto, mediana = limites_iqr(contexto.get("valor_num", pd.Series(dtype=float)))
     outlier = False
     if valor is not None and alto is not None and valor > alto:
@@ -481,11 +489,13 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
         motivos.append("Valor anômalo (Acima do limite superior estatístico IQR)")
         testes.append("ALERTA: Avaliar composição de custos frente ao mercado")
 
+    # Avaliação de Prorrogações
     if any(k in objeto for k in ("prorroga", "aditivo", "continuado", "continuidade")):
         pontos += 10
         motivos.append("Contrato continuado/aditivo")
         testes.append("Revisar histórico e vantajosidade da prorrogação")
 
+    # Concentração de Fornecedor
     fornecedor = texto(d.get("fornecedor"), "N/D")
     if fornecedor != "N/D" and not contexto.empty and "fornecedor" in contexto.columns:
         qtd = int((contexto["fornecedor"].astype(str).str.strip() == fornecedor.strip()).sum())
@@ -494,6 +504,7 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
             motivos.append(f"Fornecedor concentrado ({qtd} ocorrências na amostra)")
             testes.append("ALERTA: Avaliar possível dependência/direcionamento")
 
+    # Fechamento de Pontuação
     pontos = min(100, int(pontos))
     if pontos >= 60:
         nivel = "🔴 ALTO"
@@ -516,11 +527,12 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     }
 
 # ============================================================
-# MACHINE LEARNING — SIMILARIDADE DE OBJETOS
+# NLP (PROCESSAMENTO DE LINGUAGEM NATURAL)
 # ============================================================
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def calcular_modelo_tfidf(textos: Tuple[str, ...]):
+    """Gera matriz TF-IDF para análise semântica de objetos de contratação."""
     if not SKLEARN_OK or len(textos) < 2:
         return None
     
@@ -539,6 +551,7 @@ def calcular_modelo_tfidf(textos: Tuple[str, ...]):
         return None
 
 def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = None, limite: int = 5) -> pd.DataFrame:
+    """Encontra os registros mais similares utilizando Similaridade de Cosseno."""
     if not SKLEARN_OK or len(df) < 2:
         return pd.DataFrame()
         
@@ -559,124 +572,33 @@ def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = N
         if j == idx:
             continue
         d = dados_processados[int(j)] if dados_processados else dados_registro(df.iloc[int(j)].to_dict(), tipo)
-        saida.append({"Similaridade": f"{float(scores[j])*100:.1f}%", "Número": d["numero"], 
-                      "Objeto": d["objeto"], "Fornecedor": d["fornecedor"], "Valor": d["valor"]})
+        saida.append({
+            "Similaridade": f"{float(scores[j])*100:.1f}%", 
+            "Número": d["numero"], 
+            "Objeto": d["objeto"], 
+            "Fornecedor": d["fornecedor"], 
+            "Valor": d["valor"]
+        })
         if len(saida) >= limite:
             break
     return pd.DataFrame(saida)
 
 # ============================================================
-# DOCUMENTOS PNCP
+# EXPORTAÇÕES (RELATÓRIOS)
 # ============================================================
 
-def extrair_ano_seq_controle(controle: str) -> Tuple[Optional[int], Optional[int]]:
-    s = texto(controle, "")
-    m = re.search(r"-(\d+)-(\d{4})$", s)
-    if not m: return None, None
-    return int(m.group(2)), int(m.group(1))
-
-def identificador_compra(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    cnpj = cnpj_limpo(primeiro(row_dict, ["cnpjOrgao", "cnpj", "cnpjCompra", "orgaoEntidade.cnpj"], CNPJ))
-    ano = primeiro(row_dict, ["anoCompra", "ano", "anoContratacao"], None)
-    seq = primeiro(row_dict, ["sequencialCompra", "sequencialContratacao", "sequencial"], None)
-    
-    try: ano = int(ano)
-    except (ValueError, TypeError): ano = None
-    
-    try: seq = int(seq)
-    except (ValueError, TypeError): seq = None
-    
-    if ano is None or seq is None:
-        a, s = extrair_ano_seq_controle(primeiro(row_dict, ["numeroControlePNCPCompra", "numeroControlePNCP"], ""))
-        ano, seq = ano or a, seq or s
-        
-    return (cnpj if len(cnpj) == 14 else CNPJ), ano, seq
-
-def identificador_contrato(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    cnpj = cnpj_limpo(primeiro(row_dict, ["cnpjOrgao", "cnpj", "orgaoEntidade.cnpj"], CNPJ))
-    ano = primeiro(row_dict, ["anoContrato", "anoContratoEmpenho", "ano"], None)
-    seq = primeiro(row_dict, ["sequencialContrato", "sequencialContratoEmpenho", "sequencial"], None)
-    
-    try: ano = int(ano)
-    except (ValueError, TypeError): ano = None
-    
-    try: seq = int(seq)
-    except (ValueError, TypeError): seq = None
-    
-    if ano is None or seq is None:
-        a, s = extrair_ano_seq_controle(primeiro(row_dict, ["idContratoPNCP", "numeroControlePNCP"], ""))
-        ano, seq = ano or a, seq or s
-        
-    return (cnpj if len(cnpj) == 14 else CNPJ), ano, seq
-
-def listar_documentos(row_dict: Dict[str, Any], tipo: str) -> List[Dict[str, Any]]:
-    docs = []
-    urls_buscadas = set()
-    
-    def buscar_e_adicionar(url: str, contexto_doc: str):
-        if url in urls_buscadas: return
-        urls_buscadas.add(url)
-        try:
-            data = get_json(url)
-            regs = data if isinstance(data, list) else registros_api(data)
-            for d in regs:
-                if isinstance(d, dict):
-                    d["__contexto_doc"] = contexto_doc
-                    docs.append(d)
-        except Exception as e:
-            logging.debug(f"Falha ao buscar documentos na URL {url}: {e}")
-
-    if tipo in ["Contratos", "Atas de Registro de Preços"]:
-        c_c, a_c, s_c = identificador_contrato(row_dict)
-        if a_c and s_c:
-            buscar_e_adicionar(f"{BASE_DOCUMENTOS}/orgaos/{c_c}/contratos/{a_c}/{s_c}/arquivos", "Contrato")
-            
-    c_comp, a_comp, s_comp = identificador_compra(row_dict)
-    if a_comp and s_comp:
-        buscar_e_adicionar(f"{BASE_DOCUMENTOS}/orgaos/{c_comp}/compras/{a_comp}/{s_comp}/arquivos", "Compra")
-        
-    return docs
-
-def url_documento(row_dict: Dict[str, Any], tipo: str, doc: Dict[str, Any]) -> Optional[str]:
-    for k in ("url", "uri", "link"):
-        if texto(doc.get(k), "") not in {"", "N/D"}:
-            return texto(doc[k])
-            
-    seq_doc = primeiro(doc, ["sequencialDocumento", "sequencial"], None)
-    if seq_doc is None: return None
-        
-    ctx = doc.get("__contexto_doc", "")
-    if ctx == "Contrato" or (tipo == "Contratos" and ctx == ""):
-        c, a, s = identificador_contrato(row_dict)
-        return f"{BASE_DOCUMENTOS}/orgaos/{c}/contratos/{a}/{s}/arquivos/{seq_doc}"
-    else:
-        c, a, s = identificador_compra(row_dict)
-        return f"{BASE_DOCUMENTOS}/orgaos/{c}/compras/{a}/{s}/arquivos/{seq_doc}"
-
-def baixar_bytes(url: str) -> bytes:
-    r = sessao_http().get(url, timeout=TIMEOUT, allow_redirects=True)
-    if r.status_code != 200:
-        raise RuntimeError(f"Download HTTP {r.status_code}: {detalhe_http(r)}")
-    return r.content
-
-def nome_documento(doc: Dict[str, Any], pos: int) -> str:
-    nome = texto(doc.get("titulo") or doc.get("nomeArquivo") or doc.get("nome") or doc.get("tipoDocumentoNome"), f"documento_{pos}")
-    ctx = doc.get("__contexto_doc", "")
-    prefixo = f"{ctx}_" if ctx else ""
-    nome = prefixo + re.sub(r"[^\w\-. ]+", "_", nome, flags=re.UNICODE).strip()
-    return nome[:120] or f"documento_{pos}"
-
-# ============================================================
-# EXPORTAÇÕES
-# ============================================================
-
-def gerar_excel(df: pd.DataFrame, tipo: str, inicio, fim, df_risco: pd.DataFrame) -> bytes:
+def gerar_excel(df: pd.DataFrame, tipo: str, inicio: dt.date, fim: dt.date, df_risco: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        resumo = pd.DataFrame({"Informação": ["Órgão", "Consulta", "Período", "Registros", "Fonte"], "Valor": [PREFEITURA, tipo, f"{inicio:%d/%m/%Y} a {fim:%d/%m/%Y}", len(df), "PNCP"]})
+        resumo = pd.DataFrame({
+            "Informação": ["Órgão", "Consulta", "Período", "Registros", "Fonte"], 
+            "Valor": [PREFEITURA, tipo, f"{inicio:%d/%m/%Y} a {fim:%d/%m/%Y}", len(df), "PNCP"]
+        })
         resumo.to_excel(writer, sheet_name="Resumo", index=False)
         df_risco.to_excel(writer, sheet_name="Matriz de Risco", index=False)
         df.to_excel(writer, sheet_name="Dados PNCP", index=False)
+        
+        # Formatação das colunas no Excel
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
@@ -686,11 +608,19 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio, fim, df_risco: pd.DataFrame
     buf.seek(0)
     return buf.getvalue()
 
+
 # ============================================================
-# INTERFACE STREAMLIT
+# INTERFACE PRINCIPAL DO STREAMLIT (Encapsulada)
 # ============================================================
 
-def init_session_state():
+def main():
+    st.set_page_config(
+        page_title="Controle Interno — PNCP Rio das Pedras/SP",
+        page_icon="🛡️",
+        layout="wide",
+    )
+
+    # Inicialização de Estado da Sessão (Session State)
     defaults = {
         "df": None,
         "tipo": TIPOS[0],
@@ -704,272 +634,235 @@ def init_session_state():
         if key not in st.session_state:
             st.session_state[key] = val
 
-init_session_state()
+    # Cabeçalho Principal
+    st.title("🏛️ Painel de Inteligência e Apoio ao Controle Interno")
+    st.caption("Monitoramento preventivo de contratações públicas de Rio das Pedras/SP com dados do PNCP.")
+    st.info("ℹ️ Os alertas são instrumentos de priorização. Um alerta não significa irregularidade. A conclusão depende da análise do controlador.")
 
-st.title("🏛️ Painel de Inteligência e Apoio ao Controle Interno")
-st.caption("Monitoramento preventivo de contratações públicas de Rio das Pedras/SP com dados do PNCP.")
-st.info("ℹ️ Os alertas são instrumentos de priorização. Um alerta não significa, por si só, irregularidade. A conclusão depende da análise do controlador e das evidências.")
-
-st.sidebar.header("⚙️ Parâmetros")
-tipo = st.sidebar.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
-
-if tipo != st.session_state.tipo and st.session_state.df is not None:
-    st.warning("⚠️ Você alterou o escopo da consulta. Clique no botão **Carregar dados** para buscar os registros no PNCP e atualizar a tabela.")
-
-inicio = st.sidebar.date_input("📅 Data inicial", st.session_state.inicio)
-fim = st.sidebar.date_input("📅 Data final", st.session_state.fim)
-max_paginas = st.sidebar.slider("📄 Limite máximo de páginas", 1, 30, MAX_PAGINAS_PADRAO)
-modo = st.sidebar.radio("Modo", ["⚡ Consulta por período", "🔄 Atualização incremental"], index=0)
-
-meta = ler_meta()
-historico = carregar_historico(tipo)
-
-if meta.get("ultima_atualizacao"):
-    st.sidebar.caption(f"Última atualização local: {meta['ultima_atualizacao']}")
-else:
-    st.sidebar.caption("Nenhuma atualização incremental registrada.")
-
-if fim < inicio:
-    st.sidebar.error("Data final anterior à data inicial.")
-    st.stop()
-
-if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=True):
-    # SOLUÇÃO APLICADA AQUI: 
-    # Trocamos a API geral de publicações (que ignorava o município)
-    # pela API explícita de COMPRAS DO ÓRGÃO (que garante ser apenas Rio das Pedras).
-    endpoints = {
-        "Contratos": f"{BASE_CONSULTA}/contratos",
-        "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
-        "Editais e Avisos de Contratações": f"{BASE_DOCUMENTOS}/orgaos/{CNPJ}/compras", 
-    }
-    tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
-    
-    try:
-        with st.spinner("Consultando o PNCP... delimitando o período e usando paginação otimizada."):
-            if modo == "🔄 Atualização incremental":
-                ultima = meta.get("ultima_data_consultada")
-                try:
-                    base_date = dt.date.fromisoformat(ultima) if ultima else inicio
-                except ValueError:
-                    base_date = inicio
-                data_ini = max(inicio, base_date - dt.timedelta(days=1))
-                data_fim = min(fim, dt.date.today())
-                if data_fim < data_ini:
-                    data_ini = data_fim
-            else:
-                data_ini, data_fim = inicio, fim
-
-            params = {"dataInicial": data_ini.strftime("%Y%m%d"), "dataFinal": data_fim.strftime("%Y%m%d"), "tamanhoPagina": tamanhos[tipo], "pagina": 1}
-            
-            if tipo == "Contratos": 
-                params["cnpjOrgao"] = CNPJ
-            elif tipo == "Atas de Registro de Preços": 
-                params["cnpj"] = CNPJ
-            # Para Editais (Compras do Órgão), o CNPJ já está fixo no endpoint (na URL), não enviamos nos params.
-            
-            regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
-            
-            novo = normalizar_pncp(regs)
-            novo = deduplicar(novo)
-            
-            # Garantia extra de filtragem
-            if tipo != "Editais e Avisos de Contratações":
-                novo = filtrar_cnpj(novo)
-
-            combinado = mesclar_historico(historico, novo, tipo)
-            
-            df = combinado.copy()
-            col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
-            if col_data and not df.empty:
-                ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
-                df = df[(ds >= inicio) & (ds <= fim)].reset_index(drop=True)
-
-            meta["ultima_atualizacao"] = dt.datetime.now().isoformat(timespec="seconds")
-            meta["ultima_data_consultada"] = data_fim.isoformat()
-            meta["tipo"] = tipo
-            salvar_meta(meta)
-            
-            st.session_state.df = df
-            st.session_state.tipo = tipo
-            st.session_state.paginas = pags
-            st.session_state.total_paginas_api = total_paginas
-            st.session_state.inicio = inicio
-            st.session_state.fim = fim
-            st.session_state.modo = modo
-            st.success(f"Consulta concluída: {len(df)} registro(s) nesta visão. A API respondeu {total_paginas or 'N/D'} página(s) disponíveis.")
-    except Exception as e:
-        st.error(f"❌ Erro na consulta: {e}")
-
-# ============================================================
-# EXIBIÇÃO DE RESULTADOS
-# ============================================================
-
-df = st.session_state.get("df")
-tipo_atual = st.session_state.get("tipo", tipo)
-
-if df is None:
-    st.info("👈 Escolha o escopo, período e clique em **Carregar dados**.")
-    st.stop()
-if df.empty:
-    st.warning("Nenhum registro retornado pelo PNCP para os parâmetros informados.")
-    st.stop()
-
-# Conversão otimizada
-df_records = df.to_dict('records')
-dados_processados = [dados_registro(row, tipo_atual) for row in df_records]
-
-contexto = pd.DataFrame(dados_processados)
-riscos = [calcular_risco(d, contexto, tipo_atual) for d in dados_processados]
-
-altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
-medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
-outliers = sum(r["outlier"] for r in riscos)
-valor_total = contexto["valor_num"].sum(min_count=1) if "valor_num" in contexto else None
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Registros (Base Consolidada)", len(df))
-c2.metric("🔴 Alto risco", altos)
-c3.metric("🟡 Médio risco", medios)
-c4.metric("🚨 Outliers", outliers)
-c5.metric("Valor analisado", moeda(valor_total))
-
-# Matriz
-st.subheader("🚦 Matriz de risco")
-rows = []
-for i, r in enumerate(riscos):
-    d = dados_processados[i]
-    rows.append({"Índice": i, "Risco": r["nivel"], "Pontuação": r["pontos"], "Número": d["numero"], "Modalidade": d["modalidade"], "Fornecedor": d["fornecedor"], "Valor": d["valor"], "Objeto": d["objeto"], "Alertas": "; ".join(r["motivos"])})
-df_risco = pd.DataFrame(rows).sort_values(["Pontuação", "Índice"], ascending=[False, True])
-st.dataframe(df_risco.drop(columns=["Índice"]), use_container_width=True, hide_index=True)
-
-# Filtros de priorização
-st.subheader("🎯 Priorização")
-f1, f2 = st.columns(2)
-filtro_risco = f1.multiselect("Níveis", ["🔴 ALTO", "🟡 MÉDIO", "🟢 BAIXO"], default=["🔴 ALTO", "🟡 MÉDIO"])
-mostrar_outlier = f2.checkbox("Somente valores atípicos", False)
-
-indices = []
-for i, r in enumerate(riscos):
-    if r["nivel"] not in filtro_risco: continue
-    if mostrar_outlier and not r["outlier"]: continue
-    indices.append(i)
-
-st.caption(f"{len(indices)} registro(s) selecionado(s) para análise.")
-
-# Processo selecionado
-st.subheader("📋 Análise individual")
-if not indices:
-    st.warning("Nenhum registro atende aos filtros atuais.")
-else:
-    opcoes = []
-    mapa = {}
-    for i in indices:
-        d = dados_processados[i]
-        label = f"[{riscos[i]['nivel']} {riscos[i]['pontos']}/100] {d['numero']} — {d['fornecedor']} — {d['valor']}"
-        opcoes.append(label); mapa[label] = i
+    # Sidebar Configurações
+    with st.sidebar:
+        st.header("⚙️ Parâmetros de Pesquisa")
+        tipo = st.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
         
-    escolhido = st.selectbox("Selecione uma contratação", opcoes)
-    i = mapa[escolhido]
-    row_dict = df_records[i] 
-    d = dados_processados[i]
-    r = riscos[i]
+        if tipo != st.session_state.tipo and st.session_state.df is not None:
+            st.warning("⚠️ Você alterou o escopo. Clique em **Carregar dados** para atualizar.")
 
-    a, b, c = st.columns(3)
-    a.metric("Risco", f"{r['pontos']}/100")
-    b.metric("Valor", d["valor"])
-    c.metric("Modalidade", d["modalidade"])
-    st.markdown(f"**Objeto:** {d['objeto']}")
+        inicio = st.date_input("📅 Data inicial", st.session_state.inicio)
+        fim = st.date_input("📅 Data final", st.session_state.fim)
+        max_paginas = st.slider("📄 Limite de páginas da API", 1, 30, MAX_PAGINAS_PADRAO)
+        modo = st.radio("Modo de Consulta", ["⚡ Consulta por período", "🔄 Atualização incremental"], index=0)
 
-    with st.expander("🔎 Por que o registro foi priorizado", expanded=True):
-        for m in r["motivos"]: st.write("• " + m)
-        st.write("**Testes:**")
-        for t in r["testes"]: st.write("• " + t)
+        meta = ler_meta()
+        historico = carregar_historico(tipo)
 
-    # ML
-    st.markdown("### 🤖 Contratações semelhantes")
-    if not SKLEARN_OK:
-        st.warning("scikit-learn não está instalado. Adicione `scikit-learn` ao requirements.txt para habilitar a similaridade semântica.")
-    elif len(df) < 2:
-        st.info("São necessários pelo menos dois registros para calcular similaridade.")
-    else:
-        sim = similares(df, i, tipo_atual, dados_processados)
-        if sim.empty:
-            st.info("Não foi possível calcular similaridades para esta amostra.")
+        if meta.get("ultima_atualizacao"):
+            st.caption(f"Última atualização local: {meta['ultima_atualizacao']}")
         else:
-            st.dataframe(sim, use_container_width=True, hide_index=True)
-            st.caption("Método: TF-IDF + similaridade de cosseno.")
+            st.caption("Nenhuma atualização incremental registrada.")
 
-    # Documentos
-    st.markdown("### 📎 Documentos disponíveis no PNCP")
-    btn_key = f"btn_docs_{i}"
-    data_key = f"data_docs_{i}"
-    
-    if st.button("🔎 Consultar documentos desta contratação", key=btn_key):
+        if fim < inicio:
+            st.error("Data final anterior à data inicial.")
+            st.stop()
+            
+        buscar_btn = st.button("🔎 Carregar dados", type="primary", use_container_width=True)
+
+    # Ação de Busca (Pipeline de Extração de Dados)
+    if buscar_btn:
+        endpoints = {
+            "Contratos": f"{BASE_CONSULTA}/contratos",
+            "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
+            "Editais e Avisos de Contratações": f"{BASE_DOCUMENTOS}/orgaos/{CNPJ}/compras", 
+        }
+        tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
+        
         try:
-            docs = listar_documentos(row_dict, tipo_atual)
-            st.session_state[data_key] = docs
+            with st.spinner("Consultando o PNCP... delimitando o período e usando paginação otimizada."):
+                if modo == "🔄 Atualização incremental":
+                    ultima = meta.get("ultima_data_consultada")
+                    try:
+                        base_date = dt.date.fromisoformat(ultima) if ultima else inicio
+                    except ValueError:
+                        base_date = inicio
+                    data_ini = max(inicio, base_date - dt.timedelta(days=1))
+                    data_fim = min(fim, dt.date.today())
+                    if data_fim < data_ini:
+                        data_ini = data_fim
+                else:
+                    data_ini, data_fim = inicio, fim
+
+                params = {
+                    "dataInicial": data_ini.strftime("%Y%m%d"), 
+                    "dataFinal": data_fim.strftime("%Y%m%d"), 
+                    "tamanhoPagina": tamanhos[tipo], 
+                    "pagina": 1
+                }
+                
+                if tipo == "Contratos": 
+                    params["cnpjOrgao"] = CNPJ
+                elif tipo == "Atas de Registro de Preços": 
+                    params["cnpj"] = CNPJ
+                
+                regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
+                novo = normalizar_pncp(regs)
+                novo = deduplicar(novo)
+                
+                if tipo != "Editais e Avisos de Contratações":
+                    novo = filtrar_cnpj(novo)
+
+                combinado = mesclar_historico(historico, novo, tipo)
+                df = combinado.copy()
+                
+                # Filtragem de datas robusta
+                col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
+                if col_data and not df.empty:
+                    ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
+                    df = df[(ds >= inicio) & (ds <= fim)].reset_index(drop=True)
+
+                # Persistência de Metadata
+                meta["ultima_atualizacao"] = dt.datetime.now().isoformat(timespec="seconds")
+                meta["ultima_data_consultada"] = data_fim.isoformat()
+                meta["tipo"] = tipo
+                salvar_meta(meta)
+                
+                # Atualização do Session State
+                st.session_state.df = df
+                st.session_state.tipo = tipo
+                st.session_state.paginas = pags
+                st.session_state.total_paginas_api = total_paginas
+                st.session_state.inicio = inicio
+                st.session_state.fim = fim
+                st.session_state.modo = modo
+                st.success(f"Consulta concluída: {len(df)} registro(s) nesta visão. A API respondeu {total_paginas or 'N/D'} página(s) disponíveis.")
+        
         except Exception as e:
-            st.error(f"❌ Erro ao listar documentos: {e}")
-            
-    docs = st.session_state.get(data_key)
-    if docs is not None:
-        if isinstance(docs, list) and not docs:
-            st.info("O serviço de documentos do PNCP não retornou arquivos para este registro.")
-        elif isinstance(docs, list):
-            st.success(f"{len(docs)} documento(s) retornado(s) pelo PNCP.")
-            zipbuf = io.BytesIO()
-            baixados = 0
-            falhas = []
-            
-            def baixar_arquivo(url, nome_final):
-                return nome_final, baixar_bytes(url)
+            st.error(f"❌ Erro na consulta: {e}")
 
-            with zipfile.ZipFile(zipbuf, "w", zipfile.ZIP_DEFLATED) as z:
-                usados = set()
-                tarefas = []
-                for pos, doc in enumerate(docs, 1):
-                    url = url_documento(row_dict, tipo_atual, doc)
-                    nome = nome_documento(doc, pos)
-                    if "." not in nome: nome += ".bin"
-                    base, ext = nome.rsplit(".", 1)
-                    nome_final = nome
-                    n = 2
-                    while nome_final.lower() in usados:
-                        nome_final = f"{base}_{n}.{ext}"
-                        n += 1
-                    usados.add(nome_final.lower())
-                    if not url:
-                        falhas.append(f"{nome_final}: URL não identificada")
-                        continue
-                    tarefas.append((url, nome_final))
+    # ============================================================
+    # RENDERIZAÇÃO DO DASHBOARD E MÉTRICAS
+    # ============================================================
+    
+    df = st.session_state.get("df")
+    tipo_atual = st.session_state.get("tipo", tipo)
+
+    if df is None:
+        st.info("👈 Escolha o escopo, período na barra lateral e clique em **Carregar dados**.")
+        st.stop()
+    if df.empty:
+        st.warning("Nenhum registro retornado pelo PNCP para os parâmetros informados.")
+        st.stop()
+
+    # Processamento e Motor de Risco
+    df_records = df.to_dict('records')
+    dados_processados = [dados_registro(row, tipo_atual) for row in df_records]
+    contexto = pd.DataFrame(dados_processados)
+    riscos = [calcular_risco(d, contexto, tipo_atual) for d in dados_processados]
+
+    # KPIs Superiores
+    altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
+    medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
+    outliers = sum(r["outlier"] for r in riscos)
+    valor_total = contexto["valor_num"].sum(min_count=1) if "valor_num" in contexto else None
+
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    kpi1.metric("Registros Consolidados", len(df))
+    kpi2.metric("🔴 Alto risco", altos)
+    kpi3.metric("🟡 Médio risco", medios)
+    kpi4.metric("🚨 Outliers Financeiros", outliers)
+    kpi5.metric("Valor Total Analisado", moeda(valor_total))
+
+    st.markdown("---")
+    
+    # Criação de Abas para melhorar a Experiência do Usuário (UX)
+    tab1, tab2 = st.tabs(["🚦 Matriz de Risco Geral", "📋 Análise Aprofundada (Individual)"])
+
+    with tab1:
+        st.subheader("Visão Geral de Riscos")
+        rows = []
+        for i, r in enumerate(riscos):
+            d = dados_processados[i]
+            rows.append({
+                "Índice": i, 
+                "Risco": r["nivel"], 
+                "Score": r["pontos"], 
+                "Número": d["numero"], 
+                "Modalidade": d["modalidade"], 
+                "Fornecedor": d["fornecedor"], 
+                "Valor": d["valor"], 
+                "Objeto": d["objeto"], 
+                "Alertas Identificados": "; ".join(r["motivos"])
+            })
+        df_risco = pd.DataFrame(rows).sort_values(["Score", "Índice"], ascending=[False, True])
+        st.dataframe(df_risco.drop(columns=["Índice"]), use_container_width=True, hide_index=True)
+
+        st.subheader("📤 Exportar Análise")
+        excel = gerar_excel(df, tipo_atual, st.session_state.get("inicio", inicio), st.session_state.get("fim", fim), df_risco)
+        st.download_button(
+            "📊 Download Excel (Dados Brutos + Matriz de Risco)", 
+            excel, 
+            file_name=f"Controle_Interno_{slug(tipo_atual)}.xlsx", 
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    with tab2:
+        st.subheader("Filtros de Priorização")
+        f1, f2 = st.columns(2)
+        filtro_risco = f1.multiselect("Filtrar por Nível de Risco", ["🔴 ALTO", "🟡 MÉDIO", "🟢 BAIXO"], default=["🔴 ALTO", "🟡 MÉDIO"])
+        mostrar_outlier = f2.checkbox("Exibir somente valores atípicos estatisticamente", False)
+
+        indices = []
+        for i, r in enumerate(riscos):
+            if r["nivel"] not in filtro_risco: continue
+            if mostrar_outlier and not r["outlier"]: continue
+            indices.append(i)
+
+        st.caption(f"Exibindo {len(indices)} registro(s) selecionado(s).")
+
+        if not indices:
+            st.warning("Nenhum registro atende aos filtros de priorização atuais.")
+        else:
+            opcoes = []
+            mapa = {}
+            for i in indices:
+                d = dados_processados[i]
+                label = f"[{riscos[i]['nivel']} {riscos[i]['pontos']}/100] {d['numero']} — {d['fornecedor']} — {d['valor']}"
+                opcoes.append(label)
+                mapa[label] = i
                 
-                resultados_download = []
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                    futuros = {pool.submit(baixar_arquivo, t[0], t[1]): t[1] for t in tarefas}
-                    for f in as_completed(futuros):
-                        nome_final = futuros[f]
-                        try:
-                            nome, bts = f.result()
-                            z.writestr(nome, bts)
-                            baixados += 1
-                            resultados_download.append((True, nome, ""))
-                        except Exception as e:
-                            resultados_download.append((False, nome_final, str(e)))
-                            falhas.append(f"{nome_final}: {e}")
-                
-                for sucesso, nome, erro in resultados_download:
-                    if sucesso: st.write(f"✅ {nome}")
-                    else: st.write(f"⚠️ {nome}: não foi possível baixar")
+            escolhido = st.selectbox("Selecione uma contratação para aprofundar:", opcoes)
+            i = mapa[escolhido]
+            row_dict = df_records[i] 
+            d = dados_processados[i]
+            r = riscos[i]
 
-            if baixados:
-                zipbuf.seek(0)
-                st.download_button("📦 Baixar todos os documentos", zipbuf.getvalue(), file_name=f"Documentos_{slug(d['numero'])}.zip", mime="application/zip", key=f"zip_{i}")
-            if falhas:
-                with st.expander("Detalhes dos documentos que falharam"):
-                    for f in falhas: st.write(f)
+            with st.container():
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("Score de Risco", f"{r['pontos']} / 100")
+                col_b.metric("Valor Contratado", d["valor"])
+                col_c.metric("Modalidade", d["modalidade"])
+                st.info(f"**Objeto Descrito:** {d['objeto']}")
 
-# Exportação geral
-st.markdown("---")
-st.subheader("📤 Exportar consulta")
-excel = gerar_excel(df, tipo_atual, st.session_state.get("inicio", inicio), st.session_state.get("fim", fim), df_risco)
-st.download_button("📊 Excel — dados + matriz de risco", excel, file_name=f"Controle_Interno_{slug(tipo_atual)}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with st.expander("🔎 Evidências e Motivação do Risco", expanded=True):
+                st.markdown("**Gatilhos acionados:**")
+                for m in r["motivos"]: 
+                    st.write(f"- {m}")
+                st.markdown("**Testes sugeridos para o auditor:**")
+                for t in r["testes"]: 
+                    st.write(f"- {t}")
+
+            # Módulo de NLP (Scikit-Learn)
+            st.markdown("### 🤖 Contratações Semanticamente Semelhantes")
+            if not SKLEARN_OK:
+                st.warning("O pacote `scikit-learn` não está instalado. Adicione `scikit-learn` ao requirements.txt.")
+            elif len(df) < 2:
+                st.info("São necessários pelo menos dois registros na base para calcular similaridade cruzada.")
+            else:
+                sim = similares(df, i, tipo_atual, dados_processados)
+                if sim.empty:
+                    st.info("Não foi possível calcular similaridades estatísticas relevantes para esta amostra.")
+                else:
+                    st.dataframe(sim, use_container_width=True, hide_index=True)
+                    st.caption("Método de NLP utilizado: TF-IDF (Term Frequency-Inverse Document Frequency) com Similaridade de Cosseno.")
+
+# Ponto de Entrada Padrão (Evita execução automática se importado)
+if __name__ == "__main__":
+    main()
