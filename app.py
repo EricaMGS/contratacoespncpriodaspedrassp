@@ -619,8 +619,13 @@ def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = N
 # DOCUMENTOS PNCP
 # ============================================================
 
+# ============================================================
+# DOCUMENTOS PNCP
+# ============================================================
+
 def extrair_ano_seq_controle(controle: str) -> Tuple[Optional[int], Optional[int]]:
     s = texto(controle, "")
+    # O PNCP usa o padrão: [CNPJ]-[1 ou 2]-[sequencial]-[ano]
     m = re.search(r"-(\d+)-(\d{4})$", s)
     if not m:
         return None, None
@@ -631,13 +636,18 @@ def identificador_compra(row: Any) -> Tuple[Optional[str], Optional[int], Option
     cnpj = cnpj_limpo(primeiro(row, ["cnpjOrgao", "cnpj", "cnpjCompra"], CNPJ))
     ano = primeiro(row, ["anoCompra", "ano", "anoContratacao"], None)
     seq = primeiro(row, ["sequencialCompra", "sequencialContratacao", "sequencial"], None)
+    
     try: ano = int(ano)
     except Exception: ano = None
+    
     try: seq = int(seq)
     except Exception: seq = None
+    
     if ano is None or seq is None:
-        a, s = extrair_ano_seq_controle(primeiro(row, ["numeroControlePNCP", "numeroControlePNCPCompra"], ""))
+        # Tenta extrair primeiro do controle da COMPRA (crucial para contratos) e depois do genérico
+        a, s = extrair_ano_seq_controle(primeiro(row, ["numeroControlePNCPCompra", "numeroControlePNCP"], ""))
         ano, seq = ano or a, seq or s
+        
     return (cnpj if len(cnpj) == 14 else CNPJ), ano, seq
 
 
@@ -645,72 +655,72 @@ def identificador_contrato(row: Any) -> Tuple[Optional[str], Optional[int], Opti
     cnpj = cnpj_limpo(primeiro(row, ["cnpjOrgao", "cnpj"], CNPJ))
     ano = primeiro(row, ["anoContrato", "anoContratoEmpenho", "ano"], None)
     seq = primeiro(row, ["sequencialContrato", "sequencialContratoEmpenho", "sequencial"], None)
+    
     try: ano = int(ano)
     except Exception: ano = None
+    
     try: seq = int(seq)
     except Exception: seq = None
+    
+    if ano is None or seq is None:
+        a, s = extrair_ano_seq_controle(primeiro(row, ["idContratoPNCP", "numeroControlePNCP"], ""))
+        ano, seq = ano or a, seq or s
+        
     return (cnpj if len(cnpj) == 14 else CNPJ), ano, seq
 
 
-def consultar_documentos(url: str) -> List[Dict[str, Any]]:
-    todos_documentos = []
-    pagina = 1
-    
-    # Busca até 5 páginas (250 documentos no máximo, limite de segurança)
-    while pagina <= 5: 
-        try:
-            # Força o PNCP a devolver até 50 documentos por vez
-            data = get_json(url, params={"pagina": pagina, "tamanhoPagina": 50})
-        except Exception:
-            # Se a API rejeitar os parâmetros (alguns endpoints antigos não paginam), busca sem eles
-            if pagina == 1:
-                data = get_json(url)
-            else:
-                break
-                
-        regs = registros_api(data)
-        if not regs:
-            break
-            
-        todos_documentos.extend(regs)
-        
-        # Verifica se a API informou que há mais páginas de documentos
-        info = paginacao(data)
-        total_paginas = info.get("totalPaginas")
-        
-        if total_paginas is None or pagina >= total_paginas:
-            break
-            
-        pagina += 1
-        
-    return todos_documentos
-
 def listar_documentos(row: Any, tipo: str) -> List[Dict[str, Any]]:
-    if tipo == "Contratos":
-        c, a, s = identificador_contrato(row)
-        if a is None or s is None:
-            raise RuntimeError("Não foi possível identificar ano e sequencial do contrato no registro retornado pelo PNCP.")
-        url = f"{BASE_DOCUMENTOS}/orgaos/{c}/contratos/{a}/{s}/arquivos"
-        return consultar_documentos(url)
-    c, a, s = identificador_compra(row)
-    if a is None or s is None:
-        raise RuntimeError("Não foi possível identificar ano e sequencial da contratação no registro retornado pelo PNCP.")
-    url = f"{BASE_DOCUMENTOS}/orgaos/{c}/compras/{a}/{s}/arquivos"
-    return consultar_documentos(url)
+    docs = []
+    urls_buscadas = set()
+    
+    def buscar_e_adicionar(url: str, contexto_doc: str):
+        if url in urls_buscadas: return
+        urls_buscadas.add(url)
+        try:
+            data = get_json(url)
+            # O endpoint de arquivos retorna a lista diretamente (ou vazio se não tiver)
+            regs = data if isinstance(data, list) else registros_api(data)
+            for d in regs:
+                if isinstance(d, dict):
+                    d["__contexto_doc"] = contexto_doc
+                    docs.append(d)
+        except Exception:
+            pass
+
+    # 1. Se for Contrato ou Ata, tenta buscar primeiro os arquivos anexados diretamente ao Contrato/Ata
+    if tipo in ["Contratos", "Atas de Registro de Preços"]:
+        c_c, a_c, s_c = identificador_contrato(row)
+        if a_c and s_c:
+            buscar_e_adicionar(f"{BASE_DOCUMENTOS}/orgaos/{c_c}/contratos/{a_c}/{s_c}/arquivos", "Contrato")
+            
+    # 2. Busca SEMPRE os arquivos da Compra/Licitação originária (Edital, Termo de Ref, anexos)
+    c_comp, a_comp, s_comp = identificador_compra(row)
+    if a_comp and s_comp:
+        buscar_e_adicionar(f"{BASE_DOCUMENTOS}/orgaos/{c_comp}/compras/{a_comp}/{s_comp}/arquivos", "Compra")
+        
+    return docs
 
 
 def url_documento(row: Any, tipo: str, doc: Dict[str, Any]) -> Optional[str]:
+    # Se o PNCP já fornecer a URL pronta, usamos
     for k in ("url", "uri", "link"):
         if texto(doc.get(k), "") not in {"", "N/D"}:
             return texto(doc[k])
+            
+    # Senão, construímos a URL manualmente
     seq_doc = primeiro(doc, ["sequencialDocumento", "sequencial"], None)
     if seq_doc is None:
         return None
-    if tipo == "Contratos":
+        
+    ctx = doc.get("__contexto_doc", "")
+    
+    # Roteia corretamente dependendo de onde o documento foi extraído
+    if ctx == "Contrato" or (tipo == "Contratos" and ctx == ""):
         c, a, s = identificador_contrato(row)
         return f"{BASE_DOCUMENTOS}/orgaos/{c}/contratos/{a}/{s}/arquivos/{seq_doc}"
-    c, a, s = identificador_compra(row)
-    return f"{BASE_DOCUMENTOS}/orgaos/{c}/compras/{a}/{s}/arquivos/{seq_doc}"
+    else:
+        c, a, s = identificador_compra(row)
+        return f"{BASE_DOCUMENTOS}/orgaos/{c}/compras/{a}/{s}/arquivos/{seq_doc}"
 
 
 def baixar_bytes(url: str) -> bytes:
@@ -722,9 +732,13 @@ def baixar_bytes(url: str) -> bytes:
 
 def nome_documento(doc: Dict[str, Any], pos: int) -> str:
     nome = texto(doc.get("titulo") or doc.get("nomeArquivo") or doc.get("nome") or doc.get("tipoDocumentoNome"), f"documento_{pos}")
-    nome = re.sub(r"[^\w\-. ]+", "_", nome, flags=re.UNICODE).strip() or f"documento_{pos}"
-    return nome[:120]
-
+    
+    # Adiciona prefixo se o documento veio do Contrato ou da Compra para organizar o ZIP
+    ctx = doc.get("__contexto_doc", "")
+    prefixo = f"{ctx}_" if ctx else ""
+    
+    nome = prefixo + re.sub(r"[^\w\-. ]+", "_", nome, flags=re.UNICODE).strip()
+    return nome[:120] or f"documento_{pos}"
 
 # ============================================================
 # EXPORTAÇÕES
