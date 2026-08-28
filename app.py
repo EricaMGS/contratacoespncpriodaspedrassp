@@ -754,4 +754,5 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio, fim, df_risco: pd.DataFrame
 def gerar_word(row: Any, tipo: str, risco: Dict[str, Any]) -> bytes:
     d = dados_registro(row, tipo)
     doc = Document()
-    sec = doc.sections[0
+    sec = doc.sections[0]
+    sec.header
