@@ -1,12 +1,8 @@
 streamlit
 pandas
 requests
-xlsxwriter
-openpyxl
 python-docx
-fpdf
-plotly
 fpdf2
-httpx
+openpyxl
 scikit-learn
-numpy
+pyarrow
