@@ -415,7 +415,7 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         campos = {
             "numero": ["numeroContratoEmpenho", "numeroContrato", "numero"],
             "processo": ["processo", "numeroProcesso"],
-            "objeto": ["objetoContrato", "objetoCompra", "objeto"],
+            "objeto": ["objetoContrato", "objetoCompra", "objeto", "descricaoObjeto"],
             "fornecedor": ["nomeRazaoSocialFornecedor", "razaoSocialFornecedor", "nomeFornecedor"],
             "cnpj_fornecedor": ["niFornecedor", "cnpjFornecedor"],
             "valor": ["valorGlobal", "valorInicial", "valorTotal", "valorContrato"],
@@ -426,10 +426,10 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         campos = {
             "numero": ["numeroAtaRegistroPreco", "numeroAta", "numero"],
             "processo": ["processo", "numeroProcesso", "processoAdministrativo"],
-            "objeto": ["objetoCompra", "objeto", "descricaoObjeto"],
+            "objeto": ["objetoAta", "objetoAtaRegistroPreco", "objetoCompra", "objeto", "descricaoObjeto"],
             "fornecedor": ["nomeRazaoSocialFornecedor", "razaoSocialFornecedor", "nomeFornecedor"],
             "cnpj_fornecedor": ["niFornecedor", "cnpjFornecedor", "ni"],
-            "valor": ["valorTotal", "valorGlobal", "valorAta"],
+            "valor": ["valorTotalAta", "valorTotal", "valorGlobal", "valorAta"],
             "data": ["dataAssinatura", "dataPublicacaoPncp", "dataCelebracao"],
             "situacao": ["situacao", "status"],
         }
@@ -632,9 +632,6 @@ def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = N
             break
     return pd.DataFrame(saida)
 
-# ============================================================
-# DOCUMENTOS PNCP
-# ============================================================
 
 # ============================================================
 # DOCUMENTOS PNCP
@@ -756,6 +753,7 @@ def nome_documento(doc: Dict[str, Any], pos: int) -> str:
     
     nome = prefixo + re.sub(r"[^\w\-. ]+", "_", nome, flags=re.UNICODE).strip()
     return nome[:120] or f"documento_{pos}"
+
 
 # ============================================================
 # EXPORTAÇÕES
