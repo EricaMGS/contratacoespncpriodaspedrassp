@@ -583,8 +583,24 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
 def calcular_modelo_tfidf(textos: Tuple[str, ...]):
     if not SKLEARN_OK or len(textos) < 2:
         return None
+    
     vec = TfidfVectorizer(lowercase=True, strip_accents="unicode", ngram_range=(1, 2), min_df=1, max_features=8000, sublinear_tf=True)
-    return vec.fit_transform([t if t.strip() else "sem objeto" for t in textos])
+    
+    # Prepara os textos: se o objeto for apenas pontuação, traços ou tiver menos de 2 letras válidas, injeta uma palavra segura.
+    textos_seguros = []
+    for t in textos:
+        t_str = str(t)
+        # Verifica se há pelo menos duas letras ou números no texto
+        if len(re.sub(r'[^a-zA-Z0-9]', '', t_str)) > 1:
+            textos_seguros.append(t_str)
+        else:
+            textos_seguros.append("objeto_nao_informado_pelo_orgao")
+            
+    try:
+        return vec.fit_transform(textos_seguros)
+    except ValueError:
+        # Se mesmo assim o vocabulário ficar vazio (ex: prefeitura usou apenas "stop words"), aborta silenciosamente
+        return None
 
 
 def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = None, limite: int = 5) -> pd.DataFrame:
@@ -597,6 +613,8 @@ def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = N
         objetos = [dados_registro(row, tipo)["objeto"] for row in df.to_dict('records')]
         
     matriz = calcular_modelo_tfidf(tuple(objetos))
+    
+    # Se o modelo retornou None (devido a vocabulário vazio), encerra a similaridade
     if matriz is None:
         return pd.DataFrame()
         
@@ -613,7 +631,6 @@ def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = N
         if len(saida) >= limite:
             break
     return pd.DataFrame(saida)
-
 
 # ============================================================
 # DOCUMENTOS PNCP
