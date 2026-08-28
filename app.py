@@ -184,6 +184,7 @@ def primeiro(row: Any, campos: List[str], padrao: Any = "N/D") -> Any:
 # ============================================================
 
 @st.cache_resource
+
 def sessao_http():
     s = requests.Session()
     s.headers.update(HEADERS)
@@ -205,39 +206,6 @@ def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
             r = sessao_http().get(url, params=params, timeout=TIMEOUT)
-            if r.status_code == 200:
-                try:
-                    return r.json()
-                except ValueError as e:
-                    raise RuntimeError("O PNCP respondeu 200, mas o conteúdo não é JSON válido.") from e
-            if r.status_code == 204:
-                return []
-            if r.status_code in (400, 422):
-                raise RuntimeError(f"PNCP rejeitou os parâmetros (HTTP {r.status_code}). {detalhe_http(r)}")
-            if r.status_code == 404:
-                raise RuntimeError(f"Recurso não encontrado no PNCP (HTTP 404). Endpoint: {r.url}")
-            if r.status_code in (408, 429, 500, 502, 503, 504):
-                ultimo = RuntimeError(f"HTTP {r.status_code}: {detalhe_http(r)}")
-                if tentativa < MAX_TENTATIVAS:
-                    time.sleep(min(2 ** tentativa, 12))
-                    continue
-                raise ultimo
-            raise RuntimeError(f"PNCP retornou HTTP {r.status_code}: {detalhe_http(r)}")
-        except (requests.Timeout, requests.ConnectionError) as e:
-            ultimo = e
-            if tentativa < MAX_TENTATIVAS:
-                time.sleep(min(2 ** tentativa, 12))
-                continue
-            raise RuntimeError("O PNCP não respondeu após várias tentativas. O portal pode estar instável ou sobrecarregado.") from e
-    raise RuntimeError("Falha inesperada na comunicação com o PNCP.") from ultimo
-
-
-def get_json_com_sessao(sessao: requests.Session, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    """Versão da função get_json que usa uma sessão específica (para uso em threads)."""
-    ultimo = None
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
-        try:
-            r = sessao.get(url, params=params, timeout=TIMEOUT)
             if r.status_code == 200:
                 try:
                     return r.json()
@@ -307,11 +275,9 @@ def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_pag
         return todos, 1, total
 
     def buscar(pagina: int):
-        p = dict(base)
-        p["pagina"] = pagina
+        p = dict(base); p["pagina"] = pagina
         # Cada worker usa sua própria Session para evitar concorrência sobre a mesma Session.
-        r = requests.Session()
-        r.headers.update(HEADERS)
+        r = requests.Session(); r.headers.update(HEADERS)
         data = get_json_com_sessao(r, url, p)
         return pagina, registros_api(data)
 
@@ -329,7 +295,7 @@ def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_pag
     return todos, limite, total
 
 
-def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[Dict[str, Any]], int, Optional[int]]:
+def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[Dict[str, Any]], int]:
     serial = tuple(sorted((str(k), str(v)) for k, v in params.items()))
     return consultar_cache(url, serial, max_paginas)
 
@@ -652,14 +618,10 @@ def identificador_compra(row: Any) -> Tuple[Optional[str], Optional[int], Option
     cnpj = cnpj_limpo(primeiro(row, ["cnpjOrgao", "cnpj", "cnpjCompra"], CNPJ))
     ano = primeiro(row, ["anoCompra", "ano", "anoContratacao"], None)
     seq = primeiro(row, ["sequencialCompra", "sequencialContratacao", "sequencial"], None)
-    try: 
-        ano = int(ano)
-    except Exception: 
-        ano = None
-    try: 
-        seq = int(seq)
-    except Exception: 
-        seq = None
+    try: ano = int(ano)
+    except Exception: ano = None
+    try: seq = int(seq)
+    except Exception: seq = None
     if ano is None or seq is None:
         a, s = extrair_ano_seq_controle(primeiro(row, ["numeroControlePNCP", "numeroControlePNCPCompra"], ""))
         ano, seq = ano or a, seq or s
@@ -670,14 +632,10 @@ def identificador_contrato(row: Any) -> Tuple[Optional[str], Optional[int], Opti
     cnpj = cnpj_limpo(primeiro(row, ["cnpjOrgao", "cnpj"], CNPJ))
     ano = primeiro(row, ["anoContrato", "anoContratoEmpenho", "ano"], None)
     seq = primeiro(row, ["sequencialContrato", "sequencialContratoEmpenho", "sequencial"], None)
-    try: 
-        ano = int(ano)
-    except Exception: 
-        ano = None
-    try: 
-        seq = int(seq)
-    except Exception: 
-        seq = None
+    try: ano = int(ano)
+    except Exception: ano = None
+    try: seq = int(seq)
+    except Exception: seq = None
     return (cnpj if len(cnpj) == 14 else CNPJ), ano, seq
 
 
@@ -734,10 +692,7 @@ def nome_documento(doc: Dict[str, Any], pos: int) -> str:
 def gerar_excel(df: pd.DataFrame, tipo: str, inicio, fim, df_risco: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        resumo = pd.DataFrame({
-            "Informação": ["Órgão", "Consulta", "Período", "Registros", "Fonte"],
-            "Valor": [PREFEITURA, tipo, f"{inicio:%d/%m/%Y} a {fim:%d/%m/%Y}", len(df), "PNCP"]
-        })
+        resumo = pd.DataFrame({"Informação": ["Órgão", "Consulta", "Período", "Registros", "Fonte"], "Valor": [PREFEITURA, tipo, f"{inicio:%d/%m/%Y} a {fim:%d/%m/%Y}", len(df), "PNCP"]})
         resumo.to_excel(writer, sheet_name="Resumo", index=False)
         df_risco.to_excel(writer, sheet_name="Matriz de Risco", index=False)
         df.to_excel(writer, sheet_name="Dados PNCP", index=False)
@@ -755,4 +710,280 @@ def gerar_word(row: Any, tipo: str, risco: Dict[str, Any]) -> bytes:
     d = dados_registro(row, tipo)
     doc = Document()
     sec = doc.sections[0]
-    sec.header
+    sec.header.paragraphs[0].text = PREFEITURA
+    p = doc.add_paragraph()
+    p.alignment = 1
+    r = p.add_run("PAPEL DE TRABALHO — CONTROLE INTERNO")
+    r.bold = True; r.font.size = Pt(16); r.font.color.rgb = RGBColor(31, 78, 121)
+    doc.add_paragraph("Indicador automatizado de apoio à análise. Não constitui conclusão de irregularidade.")
+    tabela = doc.add_table(rows=0, cols=2)
+    for k, v in [("Escopo", tipo), ("Número", d["numero"]), ("Processo", d["processo"]), ("Controle PNCP", d["controle"]), ("Objeto", d["objeto"]), ("Fornecedor", d["fornecedor"]), ("Valor", d["valor"]), ("Data", d["data"]), ("Modalidade", d["modalidade"])]:
+        cells = tabela.add_row().cells; cells[0].text = k; cells[1].text = v
+    doc.add_heading("1. Matriz de risco", level=1)
+    doc.add_paragraph(f"Classificação: {risco['nivel']} — {risco['pontos']}/100")
+    for m in risco["motivos"]:
+        doc.add_paragraph(m, style="List Bullet")
+    doc.add_heading("2. Testes automatizados", level=1)
+    for t in risco["testes"]:
+        doc.add_paragraph(t, style="List Bullet")
+    doc.add_heading("3. Evidências / documentos a verificar", level=1)
+    for x in ["Edital/aviso ou instrumento convocatório", "Termo de Referência/ETP, quando aplicável", "Pesquisa/estimativa de preços", "Justificativas e autorizações", "Contrato/ata e eventuais termos", "Publicações e demais documentos disponíveis no PNCP"]:
+        doc.add_paragraph(x, style="List Bullet")
+    doc.add_heading("4. Observação do Controlador", level=1)
+    doc.add_paragraph("________________________________________________________________________________")
+    doc.add_paragraph("________________________________________________________________________________")
+    doc.add_heading("5. Conclusão", level=1)
+    doc.add_paragraph("________________________________________________________________________________")
+    doc.add_paragraph("Documento gerado automaticamente para apoio ao trabalho do Controle Interno. A conclusão deve ser realizada pelo responsável, mediante análise das evidências e critérios aplicáveis.")
+    buf = io.BytesIO(); doc.save(buf); buf.seek(0); return buf.getvalue()
+
+
+def gerar_pdf(row: Any, tipo: str, risco: Dict[str, Any]) -> bytes:
+    d = dados_registro(row, tipo)
+    pdf = FPDF(); pdf.set_auto_page_break(True, 15); pdf.add_page(); pdf.set_font("Arial", "B", 15)
+    pdf.cell(0, 10, "PAPEL DE TRABALHO - CONTROLE INTERNO", ln=True, align="C")
+    pdf.set_font("Arial", "", 9); pdf.multi_cell(0, 5, f"{PREFEITURA}\nIndicador automatizado de apoio; nao constitui conclusao de irregularidade.")
+    pdf.ln(3); pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "1. Identificacao", ln=True); pdf.set_font("Arial", "", 9)
+    for k, v in [("Escopo", tipo), ("Numero", d["numero"]), ("Processo", d["processo"]), ("Controle PNCP", d["controle"]), ("Objeto", d["objeto"]), ("Fornecedor", d["fornecedor"]), ("Valor", d["valor"]), ("Data", d["data"]), ("Modalidade", d["modalidade"])]:
+        pdf.multi_cell(0, 5, f"{k}: {v}")
+    pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "2. Matriz de risco", ln=True); pdf.set_font("Arial", "", 9)
+    pdf.multi_cell(0, 5, f"Classificacao: {risco['nivel']} - {risco['pontos']}/100")
+    for m in risco["motivos"]: pdf.multi_cell(0, 5, "- " + m)
+    pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "3. Testes automatizados", ln=True); pdf.set_font("Arial", "", 9)
+    for t in risco["testes"]: pdf.multi_cell(0, 5, "- " + t)
+    pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "4. Observacao e conclusao", ln=True); pdf.set_font("Arial", "", 9)
+    pdf.multi_cell(0, 8, "Observacao do Controlador:\n\n________________________________________________________________________________\n\nConclusao:\n\n________________________________________________________________________________")
+    return bytes(pdf.output(dest="S"))
+
+
+# ============================================================
+# INTERFACE
+# ============================================================
+
+st.title("🏛️ Painel de Inteligência e Apoio ao Controle Interno")
+st.caption("Monitoramento preventivo de contratações públicas de Rio das Pedras/SP com dados do PNCP.")
+st.info("ℹ️ Os alertas são instrumentos de priorização. Um alerta não significa, por si só, irregularidade. A conclusão depende da análise do controlador e das evidências.")
+
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "tipo" not in st.session_state:
+    st.session_state.tipo = TIPOS[0]
+
+st.sidebar.header("⚙️ Parâmetros")
+tipo = st.sidebar.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
+inicio = st.sidebar.date_input("📅 Data inicial", dt.date(2026, 1, 1))
+fim = st.sidebar.date_input("📅 Data final", dt.date.today())
+max_paginas = st.sidebar.slider("📄 Limite máximo de páginas", 1, 30, MAX_PAGINAS_PADRAO)
+modo = st.sidebar.radio("Modo", ["⚡ Consulta por período", "🔄 Atualização incremental"], index=0)
+meta = ler_meta()
+historico = carregar_historico(tipo)
+if meta.get("ultima_atualizacao"):
+    st.sidebar.caption(f"Última atualização local: {meta["ultima_atualizacao"]}")
+else:
+    st.sidebar.caption("Nenhuma atualização incremental registrada.")
+
+if fim < inicio:
+    st.sidebar.error("Data final anterior à data inicial.")
+    st.stop()
+
+if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=True):
+    endpoints = {
+        "Contratos": f"{BASE_CONSULTA}/contratos",
+        "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
+        "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes/publicacao",
+    }
+    tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
+    try:
+        with st.spinner("Consultando o PNCP... delimitando o período e usando paginação otimizada."):
+            if modo == "🔄 Atualização incremental":
+                ultima = meta.get("ultima_data_consultada")
+                try:
+                    base_date = dt.date.fromisoformat(ultima) if ultima else inicio
+                except Exception:
+                    base_date = inicio
+                data_ini = max(inicio, base_date - dt.timedelta(days=1))
+                data_fim = min(fim, dt.date.today())
+                if data_fim < data_ini:
+                    data_ini = data_fim
+            else:
+                data_ini, data_fim = inicio, fim
+
+            params = {"dataInicial": data_ini.strftime("%Y%m%d"), "dataFinal": data_fim.strftime("%Y%m%d"), "tamanhoPagina": tamanhos[tipo], "pagina": 1}
+            if tipo == "Contratos": params["cnpjOrgao"] = CNPJ
+            if tipo == "Atas de Registro de Preços": params["cnpj"] = CNPJ
+            regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
+            novo = deduplicar(tratar_df(pd.DataFrame(regs)))
+            if tipo == "Contratos": novo = filtrar_cnpj(novo)
+
+            combinado = mesclar_historico(historico, novo, tipo)
+            # Resultado da tela continua respeitando o período solicitado.
+            df = combinado.copy()
+            col_data = next((c for c in ("dataPublicacaoPncp", "dataPublicacao", "dataInclusao", "dataAssinatura", "dataCelebracao") if c in df.columns), None)
+            if col_data:
+                ds = pd.to_datetime(df[col_data], errors="coerce").dt.date
+                df = df[(ds >= inicio) & (ds <= fim)].reset_index(drop=True)
+
+            meta["ultima_atualizacao"] = dt.datetime.now().isoformat(timespec="seconds")
+            meta["ultima_data_consultada"] = data_fim.isoformat()
+            meta["tipo"] = tipo
+            salvar_meta(meta)
+            st.session_state.df = df
+            st.session_state.tipo = tipo
+            st.session_state.paginas = pags
+            st.session_state.total_paginas_api = total_paginas
+            st.session_state.inicio = inicio
+            st.session_state.fim = fim
+            st.session_state.modo = modo
+            st.success(f"Consulta concluída: {len(df)} registro(s). {pags} página(s) processada(s); API informou {total_paginas or 'N/D'} página(s).")
+    except Exception as e:
+        st.error(f"❌ {e}")
+
+# Resultado
+
+df = st.session_state.get("df")
+tipo_atual = st.session_state.get("tipo", tipo)
+
+if df is None:
+    st.info("👈 Escolha o escopo, período e clique em **Carregar dados**.")
+    st.stop()
+if df.empty:
+    st.warning("Nenhum registro retornado pelo PNCP para os parâmetros informados.")
+    st.stop()
+
+contexto = construir_contexto_risco(df, tipo_atual)
+riscos = [calcular_risco(dados_registro(df.iloc[i], tipo_atual), contexto, tipo_atual) for i in range(len(df))]
+
+altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
+medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
+outliers = sum(r["outlier"] for r in riscos)
+valor_total = contexto["valor_num"].sum(min_count=1) if "valor_num" in contexto else None
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Registros", len(df)); c2.metric("🔴 Alto risco", altos); c3.metric("🟡 Médio risco", medios); c4.metric("🚨 Outliers", outliers); c5.metric("Valor analisado", moeda(valor_total))
+st.caption(f"Páginas desta operação: {st.session_state.get('paginas', 'N/D')} | Total de páginas informado pela API: {st.session_state.get('total_paginas_api', 'N/D')} | Registros: {len(df)}")
+
+# Matriz
+st.subheader("🚦 Matriz de risco")
+rows = []
+for i, r in enumerate(riscos):
+    d = dados_registro(df.iloc[i], tipo_atual)
+    rows.append({"Índice": i, "Risco": r["nivel"], "Pontuação": r["pontos"], "Número": d["numero"], "Modalidade": d["modalidade"], "Fornecedor": d["fornecedor"], "Valor": d["valor"], "Objeto": d["objeto"], "Alertas": "; ".join(r["motivos"])})
+df_risco = pd.DataFrame(rows).sort_values(["Pontuação", "Índice"], ascending=[False, True])
+st.dataframe(df_risco.drop(columns=["Índice"]), use_container_width=True, hide_index=True)
+
+# Filtros de priorização
+st.subheader("🎯 Priorização")
+f1, f2 = st.columns(2)
+filtro_risco = f1.multiselect("Níveis", ["🔴 ALTO", "🟡 MÉDIO", "🟢 BAIXO"], default=["🔴 ALTO", "🟡 MÉDIO"])
+mostrar_outlier = f2.checkbox("Somente valores atípicos", False)
+
+indices = []
+for i, r in enumerate(riscos):
+    if r["nivel"] not in filtro_risco:
+        continue
+    if mostrar_outlier and not r["outlier"]:
+        continue
+    indices.append(i)
+
+st.caption(f"{len(indices)} registro(s) selecionado(s) para análise.")
+
+# Processo selecionado
+st.subheader("📋 Análise individual / Papel de Trabalho")
+if not indices:
+    st.warning("Nenhum registro atende aos filtros atuais.")
+else:
+    opcoes = []
+    mapa = {}
+    for i in indices:
+        d = dados_registro(df.iloc[i], tipo_atual)
+        label = f"[{riscos[i]['nivel']} {riscos[i]['pontos']}/100] {d['numero']} — {d['fornecedor']} — {d['valor']}"
+        opcoes.append(label); mapa[label] = i
+    escolhido = st.selectbox("Selecione uma contratação", opcoes)
+    i = mapa[escolhido]
+    row = df.iloc[i]
+    d = dados_registro(row, tipo_atual)
+    r = riscos[i]
+
+    a, b, c = st.columns(3)
+    a.metric("Risco", f"{r['pontos']}/100")
+    b.metric("Valor", d["valor"])
+    c.metric("Modalidade", d["modalidade"])
+    st.markdown(f"**Objeto:** {d['objeto']}")
+
+    with st.expander("🔎 Por que o registro foi priorizado", expanded=True):
+        for m in r["motivos"]: st.write("• " + m)
+        st.write("**Testes:**")
+        for t in r["testes"]: st.write("• " + t)
+
+    # ML
+    st.markdown("### 🤖 Contratações semelhantes")
+    if not SKLEARN_OK:
+        st.warning("scikit-learn não está instalado. Adicione `scikit-learn` ao requirements.txt para habilitar a similaridade semântica.")
+    elif len(df) < 2:
+        st.info("São necessários pelo menos dois registros para calcular similaridade.")
+    else:
+        sim = similares(df, i, tipo_atual)
+        if sim.empty:
+            st.info("Não foi possível calcular similaridades para esta amostra.")
+        else:
+            st.dataframe(sim, use_container_width=True, hide_index=True)
+            st.caption("Método: TF-IDF + similaridade de cosseno. O resultado é apoio analítico, não conclusão de equivalência entre objetos.")
+
+    # Documentos
+    st.markdown("### 📎 Documentos disponíveis no PNCP")
+    if st.button("🔎 Consultar documentos desta contratação", key=f"docs_{i}"):
+        try:
+            docs = listar_documentos(row, tipo_atual)
+            st.session_state[f"docs_{i}"] = docs
+        except Exception as e:
+            st.error(f"❌ {e}")
+    docs = st.session_state.get(f"docs_{i}")
+    if docs is not None:
+        if not docs:
+            st.info("O serviço de documentos do PNCP não retornou arquivos para este registro.")
+        else:
+            st.success(f"{len(docs)} documento(s) retornado(s) pelo PNCP.")
+            zipbuf = io.BytesIO(); baixados = 0; falhas = []
+            with zipfile.ZipFile(zipbuf, "w", zipfile.ZIP_DEFLATED) as z:
+                usados = set()
+                for pos, doc in enumerate(docs, 1):
+                    url = url_documento(row, tipo_atual, doc)
+                    nome = nome_documento(doc, pos)
+                    if "." not in nome:
+                        nome += ".bin"
+                    base, ext = nome.rsplit(".", 1); nome_final = nome; n = 2
+                    while nome_final.lower() in usados:
+                        nome_final = f"{base}_{n}.{ext}"; n += 1
+                    usados.add(nome_final.lower())
+                    try:
+                        if not url: raise RuntimeError("URL do documento não identificada")
+                        bts = baixar_bytes(url)
+                        z.writestr(nome_final, bts); baixados += 1
+                        st.write(f"✅ {nome_final}")
+                    except Exception as e:
+                        falhas.append(f"{nome_final}: {e}")
+                        st.write(f"⚠️ {nome_final}: não foi possível baixar")
+            if baixados:
+                zipbuf.seek(0)
+                st.download_button("📦 Baixar todos os documentos", zipbuf.getvalue(), file_name=f"Documentos_{slug(d['numero'])}.zip", mime="application/zip", key=f"zip_{i}")
+            if falhas:
+                with st.expander("Detalhes dos documentos que falharam"):
+                    for f in falhas: st.write(f)
+
+    # Papel de trabalho
+    st.markdown("### 📝 Exportar papel de trabalho")
+    colw, colp = st.columns(2)
+    with colw:
+        word = gerar_word(row, tipo_atual, r)
+        st.download_button("⬇️ Word", word, file_name=f"Papel_Trabalho_{slug(d['numero'])}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key=f"word_{i}")
+    with colp:
+        pdf = gerar_pdf(row, tipo_atual, r)
+        st.download_button("⬇️ PDF", pdf, file_name=f"Papel_Trabalho_{slug(d['numero'])}.pdf", mime="application/pdf", key=f"pdf_{i}")
+
+# Exportação geral
+st.markdown("---")
+st.subheader("📤 Exportar consulta")
+excel = gerar_excel(df, tipo_atual, st.session_state.get("inicio", inicio), st.session_state.get("fim", fim), df_risco)
+st.download_button("📊 Excel — dados + matriz de risco", excel, file_name=f"Controle_Interno_{slug(tipo_atual)}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.caption("Sistema Integrado de Apoio ao Controle Interno — PNCP. Alertas automatizados devem ser validados pelo responsável mediante evidências e critérios aplicáveis.")
