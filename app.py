@@ -63,20 +63,6 @@ HEADERS = {
 
 TIPOS = ["Contratos", "Atas de Registro de Preços", "Editais e Avisos de Contratações"]
 
-# Mapeamento oficial de Modalidades da API do PNCP
-MODALIDADES_PNCP = {
-    "Pregão": 5,
-    "Dispensa de Licitação": 6,
-    "Inexigibilidade de Licitação": 7,
-    "Concorrência": 4,
-    "Concurso": 3,
-    "Leilão": 1,
-    "Diálogo Competitivo": 2,
-    "Credenciamento": 10,
-    "Manifestação de Interesse": 8,
-    "Pré-qualificação": 9
-}
-
 # ============================================================
 # UTILITÁRIOS (Refatorados para alta performance)
 # ============================================================
@@ -86,7 +72,6 @@ def texto(valor: Any, padrao: str = "N/D") -> str:
         return padrao
     s = str(valor).strip()
     return padrao if s.lower() in {"", "none", "nan", "null", "n/d", "nat"} else s
-
 
 def numero(valor: Any) -> Optional[float]:
     if pd.isna(valor) or valor is None or isinstance(valor, bool):
@@ -103,13 +88,11 @@ def numero(valor: Any) -> Optional[float]:
     except ValueError:
         return None
 
-
 def moeda(valor: Any) -> str:
     n = numero(valor)
     if n is None:
         return "N/D"
     return f"R$ {n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
 
 def data_br(valor: Any) -> str:
     if pd.isna(valor) or valor is None:
@@ -117,15 +100,12 @@ def data_br(valor: Any) -> str:
     d = pd.to_datetime(valor, errors="coerce")
     return "N/D" if pd.isna(d) else d.strftime("%d/%m/%Y")
 
-
 def cnpj_limpo(valor: Any) -> str:
     return re.sub(r"\D", "", texto(valor, ""))
-
 
 def slug(valor: Any) -> str:
     s = re.sub(r"[^A-Za-z0-9_-]+", "_", texto(valor, "registro"))
     return s.strip("_")[:100] or "registro"
-
 
 def primeiro(row_dict: Dict[str, Any], campos: List[str], padrao: Any = "N/D") -> Any:
     for campo in campos:
@@ -140,7 +120,6 @@ def primeiro(row_dict: Dict[str, Any], campos: List[str], padrao: Any = "N/D") -
         return valor
     return padrao
 
-
 def fuzzy_match(r_dict: Dict[str, Any], palavras: List[str]) -> Any:
     for k, v in r_dict.items():
         if pd.isna(v) or v is None:
@@ -152,7 +131,6 @@ def fuzzy_match(r_dict: Dict[str, Any], palavras: List[str]) -> Any:
         if any(p in k_lower for p in palavras):
             return v
     return None
-
 
 def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
     r_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
@@ -210,7 +188,6 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
         "situacao": texto(sit),
         "modalidade": texto(mod),
     }
-
 
 # ============================================================
 # HTTP / PNCP
@@ -333,7 +310,6 @@ def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[
     serial = tuple(sorted((str(k), str(v)) for k, v in params.items()))
     return consultar_cache(url, serial, max_paginas)
 
-
 # ============================================================
 # BASE HISTÓRICA E NORMALIZAÇÃO
 # ============================================================
@@ -427,14 +403,14 @@ def filtrar_cnpj(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     alvo = cnpj_limpo(CNPJ)
-    for col in ("cnpjOrgao", "cnpj", "cnpjCompra", "cnpjOrgaoEntidade"):
+    # Procura em todas as colunas que podem conter CNPJ na resposta achatada
+    for col in ("cnpjOrgao", "cnpj", "cnpjCompra", "orgaoEntidade.cnpj", "orgao.cnpj"):
         if col in df.columns:
             s = df[col].map(cnpj_limpo)
             m = s == alvo
             if m.any():
                 return df.loc[m].reset_index(drop=True)
     return df
-
 
 # ============================================================
 # RISCO — REGRAS TRANSPARENTES + ANOMALIA RELATIVA
@@ -539,7 +515,6 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
         "limite_iqr": alto,
     }
 
-
 # ============================================================
 # MACHINE LEARNING — SIMILARIDADE DE OBJETOS
 # ============================================================
@@ -590,7 +565,6 @@ def similares(df: pd.DataFrame, idx: int, tipo: str, dados_processados: list = N
             break
     return pd.DataFrame(saida)
 
-
 # ============================================================
 # DOCUMENTOS PNCP
 # ============================================================
@@ -602,7 +576,7 @@ def extrair_ano_seq_controle(controle: str) -> Tuple[Optional[int], Optional[int
     return int(m.group(2)), int(m.group(1))
 
 def identificador_compra(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    cnpj = cnpj_limpo(primeiro(row_dict, ["cnpjOrgao", "cnpj", "cnpjCompra"], CNPJ))
+    cnpj = cnpj_limpo(primeiro(row_dict, ["cnpjOrgao", "cnpj", "cnpjCompra", "orgaoEntidade.cnpj"], CNPJ))
     ano = primeiro(row_dict, ["anoCompra", "ano", "anoContratacao"], None)
     seq = primeiro(row_dict, ["sequencialCompra", "sequencialContratacao", "sequencial"], None)
     
@@ -619,7 +593,7 @@ def identificador_compra(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Optio
     return (cnpj if len(cnpj) == 14 else CNPJ), ano, seq
 
 def identificador_contrato(row_dict: Dict[str, Any]) -> Tuple[Optional[str], Optional[int], Optional[int]]:
-    cnpj = cnpj_limpo(primeiro(row_dict, ["cnpjOrgao", "cnpj"], CNPJ))
+    cnpj = cnpj_limpo(primeiro(row_dict, ["cnpjOrgao", "cnpj", "orgaoEntidade.cnpj"], CNPJ))
     ano = primeiro(row_dict, ["anoContrato", "anoContratoEmpenho", "ano"], None)
     seq = primeiro(row_dict, ["sequencialContrato", "sequencialContratoEmpenho", "sequencial"], None)
     
@@ -692,7 +666,6 @@ def nome_documento(doc: Dict[str, Any], pos: int) -> str:
     nome = prefixo + re.sub(r"[^\w\-. ]+", "_", nome, flags=re.UNICODE).strip()
     return nome[:120] or f"documento_{pos}"
 
-
 # ============================================================
 # EXPORTAÇÕES
 # ============================================================
@@ -712,7 +685,6 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio, fim, df_risco: pd.DataFrame
                 ws.column_dimensions[letra].width = min(55, max(12, max(len(str(x.value or "")) for x in col) + 2))
     buf.seek(0)
     return buf.getvalue()
-
 
 # ============================================================
 # INTERFACE STREAMLIT
@@ -741,13 +713,6 @@ st.info("ℹ️ Os alertas são instrumentos de priorização. Um alerta não si
 st.sidebar.header("⚙️ Parâmetros")
 tipo = st.sidebar.selectbox("Escopo", TIPOS, index=TIPOS.index(st.session_state.tipo))
 
-# Adicionado seletor de modalidade caso a escolha seja "Editais e Avisos"
-modalidade_id = None
-if tipo == "Editais e Avisos de Contratações":
-    st.sidebar.info("A API do PNCP passou a exigir que a **Modalidade** seja informada obrigatoriamente nesta tela.")
-    mod_selecionada = st.sidebar.selectbox("Filtre a Modalidade:", list(MODALIDADES_PNCP.keys()))
-    modalidade_id = MODALIDADES_PNCP[mod_selecionada]
-
 if tipo != st.session_state.tipo and st.session_state.df is not None:
     st.warning("⚠️ Você alterou o escopo da consulta. Clique no botão **Carregar dados** para buscar os registros no PNCP e atualizar a tabela.")
 
@@ -769,11 +734,13 @@ if fim < inicio:
     st.stop()
 
 if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=True):
-    # Endpoint de volta para '/publicacao', pois é o correto para esta consulta
+    # SOLUÇÃO APLICADA AQUI: 
+    # Trocamos a API geral de publicações (que ignorava o município)
+    # pela API explícita de COMPRAS DO ÓRGÃO (que garante ser apenas Rio das Pedras).
     endpoints = {
         "Contratos": f"{BASE_CONSULTA}/contratos",
         "Atas de Registro de Preços": f"{BASE_CONSULTA}/atas",
-        "Editais e Avisos de Contratações": f"{BASE_CONSULTA}/contratacoes/publicacao", 
+        "Editais e Avisos de Contratações": f"{BASE_DOCUMENTOS}/orgaos/{CNPJ}/compras", 
     }
     tamanhos = {"Contratos": PAGE_CONTRATOS, "Atas de Registro de Preços": PAGE_ATAS, "Editais e Avisos de Contratações": PAGE_EDITAIS}
     
@@ -794,20 +761,20 @@ if st.sidebar.button("🔎 Carregar dados", type="primary", use_container_width=
 
             params = {"dataInicial": data_ini.strftime("%Y%m%d"), "dataFinal": data_fim.strftime("%Y%m%d"), "tamanhoPagina": tamanhos[tipo], "pagina": 1}
             
-            # Repassando a exigência da API
             if tipo == "Contratos": 
                 params["cnpjOrgao"] = CNPJ
             elif tipo == "Atas de Registro de Preços": 
                 params["cnpj"] = CNPJ
-            elif tipo == "Editais e Avisos de Contratações": 
-                params["cnpjOrgao"] = CNPJ
-                params["codigoModalidadeContratacao"] = modalidade_id 
+            # Para Editais (Compras do Órgão), o CNPJ já está fixo no endpoint (na URL), não enviamos nos params.
             
             regs, pags, total_paginas = consultar(endpoints[tipo], params, max_paginas)
             
             novo = normalizar_pncp(regs)
             novo = deduplicar(novo)
-            novo = filtrar_cnpj(novo)
+            
+            # Garantia extra de filtragem
+            if tipo != "Editais e Avisos de Contratações":
+                novo = filtrar_cnpj(novo)
 
             combinado = mesclar_historico(historico, novo, tipo)
             
