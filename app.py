@@ -3,6 +3,7 @@ import re
 import time
 import zipfile
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -43,9 +44,13 @@ BASE_DOCUMENTOS = "https://pncp.gov.br/api/pncp/v1"
 PAGE_CONTRATOS = 100
 PAGE_ATAS = 100
 PAGE_EDITAIS = 50
-MAX_PAGINAS_PADRAO = 30
-MAX_TENTATIVAS = 4
-TIMEOUT = (20, 90)
+
+# A consulta agora carrega as páginas restantes em paralelo depois da 1ª.
+# Isso reduz bastante o tempo quando existem muitas páginas.
+MAX_PAGINAS_PADRAO = 15
+MAX_WORKERS = 6
+MAX_TENTATIVAS = 3
+TIMEOUT = (8, 45)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
@@ -248,27 +253,60 @@ def paginacao(data: Any) -> Dict[str, Optional[int]]:
     return out
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_paginas: int) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Consulta otimizada:
+    1) busca a primeira página para descobrir o total;
+    2) baixa as demais páginas em paralelo;
+    3) não usa sleep artificial entre páginas;
+    4) mantém cache por 15 minutos.
+    """
     base = dict(params_tuple)
-    todos, pagina = [], 1
-    while pagina <= max_paginas:
+    tamanho = int(base.get("tamanhoPagina", 50))
+    limite = max(1, int(max_paginas))
+
+    primeira = get_json(url, {**base, "pagina": 1})
+    regs1 = registros_api(primeira)
+    if not regs1:
+        return [], 0
+
+    info = paginacao(primeira)
+    total_paginas = info.get("totalPaginas")
+    if total_paginas:
+        total_paginas = min(int(total_paginas), limite)
+    else:
+        total_paginas = 1
+
+    paginas = list(range(2, total_paginas + 1))
+    todos = list(regs1)
+
+    if not paginas:
+        return todos, 1
+
+    def buscar_pagina(pagina: int):
         p = dict(base)
         p["pagina"] = pagina
-        data = get_json(url, p)
-        regs = registros_api(data)
-        if not regs:
-            break
-        todos.extend(regs)
-        info = paginacao(data)
-        if info.get("totalPaginas") and pagina >= info["totalPaginas"]:
-            break
-        tamanho = int(base.get("tamanhoPagina", 50))
-        if len(regs) < tamanho:
-            break
-        pagina += 1
-        time.sleep(0.15)
-    return todos, pagina if todos else 0
+        return pagina, registros_api(get_json(url, p))
+
+    # Paralelismo moderado para não sobrecarregar o PNCP.
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(paginas))) as executor:
+        futures = [executor.submit(buscar_pagina, p) for p in paginas]
+        resultados = {}
+        for future in as_completed(futures):
+            pagina, regs = future.result()
+            resultados[pagina] = regs
+
+    paginas_ok = 1
+    for pagina in sorted(resultados):
+        regs = resultados[pagina]
+        if regs:
+            todos.extend(regs)
+            paginas_ok = pagina
+        # Se uma página intermediária vier vazia, não descartamos as outras:
+        # o PNCP pode apresentar paginação inconsistente temporariamente.
+
+    return todos, paginas_ok
 
 
 def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[Dict[str, Any]], int]:
@@ -371,12 +409,24 @@ def dados_registro(row: Any, tipo: str) -> Dict[str, Any]:
 # RISCO — REGRAS TRANSPARENTES + ANOMALIA RELATIVA
 # ============================================================
 
+@st.cache_data(ttl=900, show_spinner=False)
 def construir_contexto_risco(df: pd.DataFrame, tipo: str) -> pd.DataFrame:
     rows = []
     for _, row in df.iterrows():
-        d = dados_registro(row, tipo)
-        rows.append(d)
-    return pd.DataFrame(rows)
+        rows.append(dados_registro(row, tipo))
+    ctx = pd.DataFrame(rows)
+
+    # Pré-calcula estatísticas usadas repetidamente pela matriz de risco.
+    if "valor_num" in ctx:
+        baixo, alto, mediana = limites_iqr(ctx["valor_num"])
+        ctx.attrs["iqr_baixo"] = baixo
+        ctx.attrs["iqr_alto"] = alto
+        ctx.attrs["mediana"] = mediana
+    if "fornecedor" in ctx:
+        ctx.attrs["fornecedor_counts"] = (
+            ctx["fornecedor"].fillna("N/D").astype(str).str.strip().value_counts().to_dict()
+        )
+    return ctx
 
 
 def limites_iqr(serie: pd.Series) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -435,7 +485,9 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
         testes.append("Materialidade: valor não identificado")
 
     # 4) Outlier relativo ao conjunto consultado.
-    baixo, alto, mediana = limites_iqr(contexto.get("valor_num", pd.Series(dtype=float)))
+    baixo = contexto.attrs.get("iqr_baixo")
+    alto = contexto.attrs.get("iqr_alto")
+    mediana = contexto.attrs.get("mediana")
     outlier = False
     if valor is not None and alto is not None and valor > alto:
         outlier = True
@@ -454,7 +506,8 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
     # 6) Fornecedor — concentração na própria amostra.
     fornecedor = texto(d.get("fornecedor"), "N/D")
     if fornecedor != "N/D" and not contexto.empty and "fornecedor" in contexto.columns:
-        qtd = int((contexto["fornecedor"].astype(str).str.strip() == fornecedor.strip()).sum())
+        counts = contexto.attrs.get("fornecedor_counts", {})
+        qtd = int(counts.get(fornecedor.strip(), 0))
         if qtd >= max(3, len(contexto) * 0.10):
             pontos += 10
             motivos.append(f"Fornecedor aparece {qtd} vezes na amostra consultada")
@@ -487,24 +540,37 @@ def calcular_risco(d: Dict[str, Any], contexto: pd.DataFrame, tipo: str) -> Dict
 # MACHINE LEARNING — SIMILARIDADE DE OBJETOS
 # ============================================================
 
-@st.cache_data(ttl=600, show_spinner=False)
-def calcular_similaridades(textos: Tuple[str, ...]) -> Optional[List[List[float]]]:
-    if not SKLEARN_OK or len(textos) < 2:
+@st.cache_data(ttl=900, show_spinner=False)
+def calcular_scores_similares(textos: Tuple[str, ...], idx: int) -> Optional[List[float]]:
+    """
+    Calcula somente a similaridade da contratação escolhida contra as demais.
+    A versão anterior construía uma matriz NxN inteira, o que ficava caro
+    quando a consulta retornava muitos registros.
+    """
+    if not SKLEARN_OK or len(textos) < 2 or idx < 0 or idx >= len(textos):
         return None
     limpos = [t if t.strip() else "sem objeto" for t in textos]
-    vec = TfidfVectorizer(lowercase=True, strip_accents="unicode", ngram_range=(1, 2), min_df=1, max_features=8000)
+    vec = TfidfVectorizer(
+        lowercase=True,
+        strip_accents="unicode",
+        ngram_range=(1, 2),
+        min_df=1,
+        max_features=8000,
+        sublinear_tf=True,
+    )
     matriz = vec.fit_transform(limpos)
-    return cosine_similarity(matriz).tolist()
+    consulta = matriz[idx]
+    return cosine_similarity(consulta, matriz).ravel().tolist()
 
 
 def similares(df: pd.DataFrame, idx: int, tipo: str, limite: int = 5) -> pd.DataFrame:
     if not SKLEARN_OK or len(df) < 2:
         return pd.DataFrame()
     objetos = [dados_registro(row, tipo)["objeto"] for _, row in df.iterrows()]
-    matriz = calcular_similaridades(tuple(objetos))
-    if matriz is None:
+    scores_matriz = calcular_scores_similares(tuple(objetos), idx)
+    if scores_matriz is None:
         return pd.DataFrame()
-    scores = [(i, float(matriz[idx][i])) for i in range(len(df)) if i != idx]
+    scores = [(i, float(scores_matriz[i])) for i in range(len(df)) if i != idx]
     scores.sort(key=lambda x: x[1], reverse=True)
     saida = []
     for i, score in scores[:limite]:
