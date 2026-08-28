@@ -752,21 +752,61 @@ def gerar_word(row: Any, tipo: str, risco: Dict[str, Any]) -> bytes:
 
 
 def gerar_pdf(row: Any, tipo: str, risco: Dict[str, Any]) -> bytes:
+    # CORREÇÃO: Função de limpeza para evitar o erro de enconding do Latin-1 no FPDF
+    def limpa(t):
+        if not t: return ""
+        t = str(t)
+        # Substitui caracteres que não existem no latin-1 básico por equivalentes simples
+        rep = {
+            '—': '-', '–': '-', '”': '"', '“': '"', '’': "'", '‘': "'", '•': '-',
+            '🔴': 'ALTO', '🟡': 'MEDIO', '🟢': 'BAIXO'
+        }
+        for k, v in rep.items(): 
+            t = t.replace(k, v)
+        # Codifica e decodifica forçando a substituição de qualquer outro caractere problemático
+        return t.encode('latin-1', 'replace').decode('latin-1')
+
     d = dados_registro(row, tipo)
-    pdf = FPDF(); pdf.set_auto_page_break(True, 15); pdf.add_page(); pdf.set_font("Arial", "B", 15)
-    pdf.cell(0, 10, "PAPEL DE TRABALHO - CONTROLE INTERNO", ln=True, align="C")
-    pdf.set_font("Arial", "", 9); pdf.multi_cell(0, 5, f"{PREFEITURA}\nIndicador automatizado de apoio; nao constitui conclusao de irregularidade.")
-    pdf.ln(3); pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "1. Identificacao", ln=True); pdf.set_font("Arial", "", 9)
+    pdf = FPDF()
+    pdf.set_auto_page_break(True, 15)
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 15)
+    
+    pdf.cell(0, 10, limpa("PAPEL DE TRABALHO - CONTROLE INTERNO"), ln=True, align="C")
+    pdf.set_font("Arial", "", 9)
+    pdf.multi_cell(0, 5, limpa(f"{PREFEITURA}\nIndicador automatizado de apoio; nao constitui conclusao de irregularidade."))
+    pdf.ln(3)
+    
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 7, limpa("1. Identificacao"), ln=True)
+    pdf.set_font("Arial", "", 9)
     for k, v in [("Escopo", tipo), ("Numero", d["numero"]), ("Processo", d["processo"]), ("Controle PNCP", d["controle"]), ("Objeto", d["objeto"]), ("Fornecedor", d["fornecedor"]), ("Valor", d["valor"]), ("Data", d["data"]), ("Modalidade", d["modalidade"])]:
-        pdf.multi_cell(0, 5, f"{k}: {v}")
-    pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "2. Matriz de risco", ln=True); pdf.set_font("Arial", "", 9)
-    pdf.multi_cell(0, 5, f"Classificacao: {risco['nivel']} - {risco['pontos']}/100")
-    for m in risco["motivos"]: pdf.multi_cell(0, 5, "- " + m)
-    pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "3. Testes automatizados", ln=True); pdf.set_font("Arial", "", 9)
-    for t in risco["testes"]: pdf.multi_cell(0, 5, "- " + t)
-    pdf.set_font("Arial", "B", 11); pdf.cell(0, 7, "4. Observacao e conclusao", ln=True); pdf.set_font("Arial", "", 9)
-    pdf.multi_cell(0, 8, "Observacao do Controlador:\n\n________________________________________________________________________________\n\nConclusao:\n\n________________________________________________________________________________")
-    return bytes(pdf.output(dest="S"))
+        pdf.multi_cell(0, 5, limpa(f"{k}: {v}"))
+        
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 7, limpa("2. Matriz de risco"), ln=True)
+    pdf.set_font("Arial", "", 9)
+    pdf.multi_cell(0, 5, limpa(f"Classificacao: {risco['nivel']} - {risco['pontos']}/100"))
+    
+    for m in risco["motivos"]: 
+        pdf.multi_cell(0, 5, limpa("- " + m))
+        
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 7, limpa("3. Testes automatizados"), ln=True)
+    pdf.set_font("Arial", "", 9)
+    for t in risco["testes"]: 
+        pdf.multi_cell(0, 5, limpa("- " + t))
+        
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 7, limpa("4. Observacao e conclusao"), ln=True)
+    pdf.set_font("Arial", "", 9)
+    pdf.multi_cell(0, 8, limpa("Observacao do Controlador:\n\n________________________________________________________________________________\n\nConclusao:\n\n________________________________________________________________________________"))
+    
+    # Tratamento final para evitar falha no buffer
+    saida = pdf.output(dest="S")
+    if isinstance(saida, str):
+        return saida.encode('latin-1', 'ignore')
+    return bytes(saida)
 
 
 # ============================================================
