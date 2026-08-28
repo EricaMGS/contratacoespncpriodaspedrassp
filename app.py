@@ -329,7 +329,7 @@ def consultar_cache(url: str, params_tuple: Tuple[Tuple[str, str], ...], max_pag
     return todos, limite, total
 
 
-def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[Dict[str, Any]], int]:
+def consultar(url: str, params: Dict[str, Any], max_paginas: int) -> Tuple[List[Dict[str, Any]], int, Optional[int]]:
     serial = tuple(sorted((str(k), str(v)) for k, v in params.items()))
     return consultar_cache(url, serial, max_paginas)
 
@@ -744,3 +744,14 @@ def gerar_excel(df: pd.DataFrame, tipo: str, inicio, fim, df_risco: pd.DataFrame
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
+            for col in ws.columns:
+                letra = col[0].column_letter
+                ws.column_dimensions[letra].width = min(55, max(12, max(len(str(x.value or "")) for x in col) + 2))
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def gerar_word(row: Any, tipo: str, risco: Dict[str, Any]) -> bytes:
+    d = dados_registro(row, tipo)
+    doc = Document()
+    sec = doc.sections[0
