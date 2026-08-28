@@ -653,9 +653,37 @@ def identificador_contrato(row: Any) -> Tuple[Optional[str], Optional[int], Opti
 
 
 def consultar_documentos(url: str) -> List[Dict[str, Any]]:
-    data = get_json(url)
-    return registros_api(data)
-
+    todos_documentos = []
+    pagina = 1
+    
+    # Busca até 5 páginas (250 documentos no máximo, limite de segurança)
+    while pagina <= 5: 
+        try:
+            # Força o PNCP a devolver até 50 documentos por vez
+            data = get_json(url, params={"pagina": pagina, "tamanhoPagina": 50})
+        except Exception:
+            # Se a API rejeitar os parâmetros (alguns endpoints antigos não paginam), busca sem eles
+            if pagina == 1:
+                data = get_json(url)
+            else:
+                break
+                
+        regs = registros_api(data)
+        if not regs:
+            break
+            
+        todos_documentos.extend(regs)
+        
+        # Verifica se a API informou que há mais páginas de documentos
+        info = paginacao(data)
+        total_paginas = info.get("totalPaginas")
+        
+        if total_paginas is None or pagina >= total_paginas:
+            break
+            
+        pagina += 1
+        
+    return todos_documentos
 
 def listar_documentos(row: Any, tipo: str) -> List[Dict[str, Any]]:
     if tipo == "Contratos":
