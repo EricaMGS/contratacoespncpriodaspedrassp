@@ -1161,7 +1161,7 @@ def similares(
 
 
 # ============================================================
-# EXPORTAÇÃO WORD - DASHBOARD PRINCIPAL
+# EXPORTAÇÃO WORD - DASHBOARD PRINCIPAL (SEM SEÇÃO 3)
 # ============================================================
 
 def _word_text(valor: Any, padrao: str = "N/D") -> str:
@@ -1236,7 +1236,7 @@ def gerar_word_dashboard_principal(
     riscos: List[Dict[str, Any]],
     valor_total: Any,
 ) -> bytes:
-    """Gera o Word resumido com indicadores e matriz de risco."""
+    """Gera o Word com o resumo executivo: identificação, indicadores, matriz de risco e aviso."""
 
     if not DOCX_OK:
         raise RuntimeError(
@@ -1268,7 +1268,7 @@ def gerar_word_dashboard_principal(
         f"IBGE: {IBGE}"
     )
 
-    # Indicadores Principais
+    # 1. Indicadores Principais
     doc.add_heading("1. Indicadores Principais", level=1)
     altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
     medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
@@ -1288,7 +1288,7 @@ def gerar_word_dashboard_principal(
         tabela_indicadores.rows[i].cells[0].text = rotulo
         tabela_indicadores.rows[i].cells[1].text = valor
 
-    # Matriz de Risco Segmentada
+    # 2. Matriz de Risco Segmentada
     doc.add_heading("2. Matriz de Risco Segmentada", level=1)
     colunas_visualizacao = [
         c for c in (
@@ -1299,6 +1299,8 @@ def gerar_word_dashboard_principal(
             "Fornecedor",
             "Valor",
             "Fim Vigência",
+            "Aditivo Acum.",
+            "Objeto",
             "Gatilhos",
         )
         if c in df_risco.columns
@@ -1730,7 +1732,7 @@ def main() -> None:
     ])
 
     # ========================================================
-    # ABA 1 - MATRIZ DE RISCO PRINCIPAL
+    # ABA 1 - MATRIZ DE RISCO PRINCIPAL (COM OPÇÕES DE DOWNLOAD)
     # ========================================================
     with tab1:
         colunas_visualizacao = [
@@ -1790,7 +1792,7 @@ def main() -> None:
 
                     with col_download2:
                         st.download_button(
-                            "📝 Baixar Resumo Executivo em Word",
+                            "📝 Baixar Dashboard em Word",
                             data=word_aba1,
                             file_name=nome_word_aba1,
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1809,7 +1811,7 @@ def main() -> None:
             st.error(f"Não foi possível gerar o Excel: {exc}")
 
     # ========================================================
-    # ABA NOVA: VIGÊNCIA E ADITIVOS
+    # ABA 2 - VIGÊNCIA E ADITIVOS LEGAIS
     # ========================================================
     with tab_vigencia:
         st.subheader("⏱️ Monitoramento Preditivo de Vigência & Limites da Lei 14.133/21")
@@ -1818,7 +1820,6 @@ def main() -> None:
             "e verificação do teto de aditivos contratuais (+25% em geral / +50% reformas de edifícios)."
         )
 
-        # Filtros de vigência
         vencendo_30 = [r for r in dados_processados if r.get("dias_para_vencer") is not None and 0 <= r["dias_para_vencer"] <= 30]
         vencendo_90 = [r for r in dados_processados if r.get("dias_para_vencer") is not None and 30 < r["dias_para_vencer"] <= 90]
         aditivos_25 = [r for r in dados_processados if r.get("perc_aditivo") is not None and r["perc_aditivo"] > 25.0]
@@ -1886,7 +1887,7 @@ def main() -> None:
                 st.info("Nenhum contrato com aditamento de valor registrado no período consultado.")
 
     # ========================================================
-    # ABA 2 - AUDITORIA E SEMÂNTICA INDIVIDUAL
+    # ABA 3 - AUDITORIA E SEMÂNTICA INDIVIDUAL
     # ========================================================
     with tab2:
         f1, f2 = st.columns(2)
