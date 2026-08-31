@@ -12,7 +12,7 @@ Tecnologias:
 
 Objetivo:
 Consulta, consolidação, segmentação, análise preliminar de risco,
-similaridade semântica e exportação de dados públicos do PNCP.
+monitoramento de vigência/aditamentos, similaridade semântica e exportação.
 
 IMPORTANTE:
 Os alertas produzidos pelo sistema são indicadores automatizados.
@@ -140,7 +140,7 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 "
         "Chrome/131.0 Safari/537.36 "
-        "MonitoramentoControleInterno/5.0"
+        "MonitoramentoControleInterno/6.0"
     ),
     "Accept": "application/json",
     "Accept-Encoding": "gzip, deflate",
@@ -468,6 +468,14 @@ def data_br(valor: Any) -> str:
     return data.strftime("%d/%m/%Y")
 
 
+def data_timestamp(valor: Any) -> Optional[pd.Timestamp]:
+    """Converte valor para pd.Timestamp seguro."""
+    if valor_vazio(valor):
+        return None
+    ts = pd.to_datetime(valor, errors="coerce")
+    return ts.normalize() if pd.notna(ts) else None
+
+
 def cnpj_limpo(valor: Any) -> str:
     """Mantém somente números de um CNPJ."""
 
@@ -553,14 +561,14 @@ def fuzzy_match(
 
 
 # ============================================================
-# EXTRAÇÃO DOS REGISTROS
+# EXTRAÇÃO DOS REGISTROS (COM VIGÊNCIA E ADITIVOS)
 # ============================================================
 
 def dados_registro(
     row: Any,
     tipo: str,
 ) -> Dict[str, Any]:
-    """Extrai os principais campos de um registro PNCP."""
+    """Extrai os principais campos de um registro PNCP incluindo vigência e aditivos."""
 
     if hasattr(row, "to_dict"):
         r_dict = row.to_dict()
@@ -577,14 +585,22 @@ def dados_registro(
         ],
     )
 
+    dt_fim_vig = None
+    val_inicial = None
+    val_global = None
+
     if tipo == "Contratos":
         num = primeiro(r_dict, ["numeroContratoEmpenho", "numeroContrato", "numero"])
         proc = primeiro(r_dict, ["processo", "numeroProcesso", "compra.processo"])
         obj = primeiro(r_dict, ["objetoContrato", "objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
         forn = primeiro(r_dict, ["nomeRazaoSocialFornecedor", "fornecedor.nomeRazaoSocial", "razaoSocialFornecedor", "nomeFornecedor"])
         cnpj = primeiro(r_dict, ["niFornecedor", "fornecedor.niFornecedor", "cnpjFornecedor", "cnpj"])
-        val = primeiro(r_dict, ["valorGlobal", "valorInicial", "valorTotal", "valorContrato", "compra.valorTotalHomologado"])
+        
+        val_global = primeiro(r_dict, ["valorGlobal", "valorTotal", "valorContrato", "compra.valorTotalHomologado"])
+        val_inicial = primeiro(r_dict, ["valorInicial", "valorTotalEstimado", "valorContrato"])
+        
         dt_ = primeiro(r_dict, ["dataAssinatura", "dataCelebracao", "dataPublicacaoPncp"])
+        dt_fim_vig = primeiro(r_dict, ["dataVigenciaFim", "dataFimVigencia", "dataTerminoVigencia", "dataEncerramento"])
         sit = primeiro(r_dict, ["situacao", "status"])
 
     elif tipo == "Atas de Registro de Preços":
@@ -593,8 +609,12 @@ def dados_registro(
         obj = primeiro(r_dict, ["objetoAta", "objetoAtaRegistroPreco", "objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
         forn = primeiro(r_dict, ["nomeRazaoSocialFornecedor", "fornecedor.nomeRazaoSocial", "razaoSocialFornecedor", "nomeFornecedor"])
         cnpj = primeiro(r_dict, ["niFornecedor", "fornecedor.niFornecedor", "cnpjFornecedor", "ni"])
-        val = primeiro(r_dict, ["valorTotalAta", "valorTotal", "valorGlobal", "valorAta", "compra.valorTotalHomologado"])
+        
+        val_global = primeiro(r_dict, ["valorTotalAta", "valorTotal", "valorGlobal", "valorAta", "compra.valorTotalHomologado"])
+        val_inicial = primeiro(r_dict, ["valorInicial", "valorTotalEstimado"])
+        
         dt_ = primeiro(r_dict, ["dataAssinatura", "dataPublicacaoPncp", "dataCelebracao"])
+        dt_fim_vig = primeiro(r_dict, ["dataVigenciaFim", "dataFimVigencia", "dataValidadeFim"])
         sit = primeiro(r_dict, ["situacao", "status"])
 
     else:
@@ -603,8 +623,12 @@ def dados_registro(
         obj = primeiro(r_dict, ["objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
         forn = primeiro(r_dict, ["nomeRazaoSocialFornecedor", "fornecedor.nomeRazaoSocial", "razaoSocialFornecedor", "nomeFornecedor"])
         cnpj = primeiro(r_dict, ["niFornecedor", "fornecedor.niFornecedor", "cnpjFornecedor", "cnpjOrgao"])
-        val = primeiro(r_dict, ["valorTotalHomologado", "compra.valorTotalHomologado", "valorTotalEstimado", "compra.valorTotalEstimado", "valorTotal"])
+        
+        val_global = primeiro(r_dict, ["valorTotalHomologado", "compra.valorTotalHomologado", "valorTotal", "valorGlobal"])
+        val_inicial = primeiro(r_dict, ["valorTotalEstimado", "compra.valorTotalEstimado"])
+        
         dt_ = primeiro(r_dict, ["dataPublicacao", "dataPublicacaoPncp", "dataInclusao"])
+        dt_fim_vig = primeiro(r_dict, ["dataVigenciaFim", "dataFimVigencia"])
         sit = primeiro(r_dict, ["situacaoCompra", "compra.situacaoCompraNome", "situacao", "status"])
 
     mod = primeiro(r_dict, ["modalidadeNome", "modalidadeContratacaoNome", "compra.modalidadeNome", "modalidade"])
@@ -615,14 +639,32 @@ def dados_registro(
     if texto(forn, "") == "":
         forn = fuzzy_match(r_dict, ["razaosocial", "fornec", "fornecedor.nome"])
 
-    if texto(val, "") == "":
-        val = fuzzy_match(r_dict, ["valortotal", "valorglobal", "valorata", "valor"])
+    if texto(val_global, "") == "":
+        val_global = fuzzy_match(r_dict, ["valortotal", "valorglobal", "valorata", "valor"])
+
+    if dt_fim_vig == "N/D" or dt_fim_vig is None:
+        dt_fim_vig = fuzzy_match(r_dict, ["vigenciafim", "fimvigencia", "datatermino", "datavalidadefim"])
 
     if texto(mod, "") == "":
         mod = fuzzy_match(r_dict, ["modalidade", "tipoata"])
 
     if texto(cnpj, "") == "":
         cnpj = fuzzy_match(r_dict, ["cnpj", "ni"])
+
+    # Tratamento numérico de valores e percentual de aditivo
+    v_num = numero(val_global)
+    v_ini_num = numero(val_inicial)
+
+    perc_aditivo = None
+    if v_num is not None and v_ini_num is not None and v_ini_num > 0 and v_num > v_ini_num:
+        perc_aditivo = ((v_num - v_ini_num) / v_ini_num) * 100.0
+
+    # Tratamento de Vigência e cálculo de dias restantes
+    ts_fim_vig = data_timestamp(dt_fim_vig)
+    dias_para_vencer = None
+    if ts_fim_vig is not None:
+        hoje = pd.Timestamp.today().normalize()
+        dias_para_vencer = int((ts_fim_vig - hoje).days)
 
     return {
         "controle": texto(controle),
@@ -631,9 +673,13 @@ def dados_registro(
         "objeto": texto(obj),
         "fornecedor": texto(forn),
         "cnpj_fornecedor": cnpj_limpo(cnpj),
-        "valor_num": numero(val),
-        "valor": moeda(val),
+        "valor_num": v_num,
+        "valor_inicial_num": v_ini_num,
+        "perc_aditivo": perc_aditivo,
+        "valor": moeda(val_global),
         "data": data_br(dt_),
+        "data_fim_vigencia": data_br(dt_fim_vig),
+        "dias_para_vencer": dias_para_vencer,
         "situacao": texto(sit),
         "modalidade": texto(mod),
     }
@@ -894,7 +940,7 @@ def filtrar_periodo(
 
 
 # ============================================================
-# MOTOR DE RISCO
+# MOTOR DE RISCO (COM VIGÊNCIA E ADITIVOS LEGAIS)
 # ============================================================
 
 def limites_iqr(
@@ -921,7 +967,7 @@ def calcular_risco(
     contexto: pd.DataFrame,
     tipo: str,
 ) -> Dict[str, Any]:
-    """Calcula um score heurístico de risco."""
+    """Calcula um score heurístico de risco enriquecido com vigência e aditivos."""
     pontos = 0
     motivos: List[str] = []
     testes: List[str] = []
@@ -930,7 +976,7 @@ def calcular_risco(
     modalidade = texto(registro.get("modalidade"), "").lower()
     objeto = texto(registro.get("objeto"), "").lower()
 
-    # Completude
+    # 1. Completude
     campos_obrigatorios = (("objeto", "objeto"), ("controle", "controle PNCP"), ("data", "data"))
     faltantes = [
         label for campo, label in campos_obrigatorios
@@ -941,7 +987,7 @@ def calcular_risco(
         motivos.append("Campos incompletos: " + ", ".join(faltantes))
         testes.append("Atenção na completude cadastral")
 
-    # Modalidade / Exceção
+    # 2. Modalidade / Exceção
     if "dispensa" in modalidade or "inexig" in modalidade:
         pontos += 20
         motivos.append("Contratação por exceção")
@@ -951,7 +997,7 @@ def calcular_risco(
         motivos.append("Indício emergencial")
         testes.append("Revisar caracterização e prazo emergencial")
 
-    # Valor
+    # 3. Valor
     if valor is not None:
         if valor >= 500_000:
             pontos += 10
@@ -960,7 +1006,7 @@ def calcular_risco(
             pontos += 5
             motivos.append("Valor relevante (> R$ 150 mil)")
 
-    # Outlier
+    # 4. Outlier
     serie_valores = contexto["valor_num"] if "valor_num" in contexto.columns else pd.Series(dtype="float64")
     _, limite_superior, _ = limites_iqr(serie_valores)
     outlier = False
@@ -970,13 +1016,40 @@ def calcular_risco(
         motivos.append("Valor anômalo acima do limite IQR")
         testes.append("Avaliar formação de preços e pesquisa de mercado")
 
-    # Objeto Continuado / Aditivo
-    if any(palavra in objeto for palavra in ("prorroga", "aditivo", "continuado")):
-        pontos += 10
-        motivos.append("Indício de contrato continuado/aditivo")
-        testes.append("Revisar vantajosidade e justificativa")
+    # 5. Monitoramento de Vigência
+    dias_venc = registro.get("dias_para_vencer")
+    if dias_venc is not None:
+        if 0 <= dias_venc <= 30:
+            pontos += 15
+            motivos.append(f"⏳ Vencimento crítico ({dias_venc} dias restantes)")
+            testes.append("Verificar abertura tempestiva de nova licitação ou prorrogação")
+        elif 30 < dias_venc <= 90:
+            pontos += 5
+            motivos.append(f"⏳ Vencimento próximo ({dias_venc} dias restantes)")
+            testes.append("Acompanhar planejamento do encerramento da vigência")
 
-    # Concentração de Fornecedor
+    # 6. Monitoramento de Aditamentos e Limites Legais (Lei 14.133/21, Art. 125)
+    perc_adit = registro.get("perc_aditivo")
+    if perc_adit is not None:
+        if perc_adit > 50.0:
+            pontos += 30
+            motivos.append(f"⚠️ Aditivo expressivo (+{perc_adit:.1f}%), acima do limite de 50%")
+            testes.append("Auditar termo aditivo: extrapolação do teto legal de 50% para reformas/edifícios")
+        elif perc_adit > 25.0:
+            pontos += 15
+            motivos.append(f"⚠️ Aditivo relevante (+{perc_adit:.1f}%), acima de 25%")
+            testes.append("Auditar termo aditivo: verificar enquadramento legal e justificativa técnica (> 25%)")
+        elif perc_adit > 0:
+            pontos += 5
+            motivos.append(f"Contrato com aditivo acumulado (+{perc_adit:.1f}%)")
+
+    # 7. Objeto Continuado / Aditivo no texto
+    if any(palavra in objeto for palavra in ("prorroga", "aditivo", "continuado")):
+        pontos += 5
+        motivos.append("Indício textual de prorrogação/aditivo")
+        testes.append("Revisar vantajosidade da prorrogação contratual")
+
+    # 8. Concentração de Fornecedor
     fornecedor = texto(registro.get("fornecedor"), "").strip()
     if fornecedor and not contexto.empty and "fornecedor" in contexto.columns:
         fornecedores = contexto["fornecedor"].fillna("").astype(str).str.strip().str.casefold()
@@ -1163,13 +1236,7 @@ def gerar_word_dashboard_principal(
     riscos: List[Dict[str, Any]],
     valor_total: Any,
 ) -> bytes:
-    """
-    Gera o Word SOMENTE com o resumo executivo do dashboard:
-    - Identificação da consulta;
-    - Indicadores principais;
-    - Matriz de risco segmentada;
-    - Aviso de apoio ao Controle Interno.
-    """
+    """Gera o Word resumido com indicadores e matriz de risco."""
 
     if not DOCX_OK:
         raise RuntimeError(
@@ -1224,7 +1291,16 @@ def gerar_word_dashboard_principal(
     # Matriz de Risco Segmentada
     doc.add_heading("2. Matriz de Risco Segmentada", level=1)
     colunas_visualizacao = [
-        c for c in ("Risco", "Score", "Número", "Modalidade", "Fornecedor", "Valor", "Objeto", "Gatilhos")
+        c for c in (
+            "Risco",
+            "Score",
+            "Número",
+            "Modalidade",
+            "Fornecedor",
+            "Valor",
+            "Fim Vigência",
+            "Gatilhos",
+        )
         if c in df_risco.columns
     ]
 
@@ -1588,7 +1664,7 @@ def main() -> None:
         for registro in dados_processados
     ]
 
-    # Indicadores
+    # Indicadores Gerais
     altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
     medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
     baixos = sum(r["nivel"] == "🟢 BAIXO" for r in riscos)
@@ -1604,10 +1680,26 @@ def main() -> None:
     k3.metric("🟡 Médio risco", medios)
     k4.metric("Valor Analisado", moeda(valor_total))
 
-    # Matriz de Risco
+    # Matriz de Risco Estruturada
     rows = []
     for i_local, risco in enumerate(riscos):
         registro = dados_processados[i_local]
+        
+        # Formata informação de vigência resumida
+        fim_vig = registro["data_fim_vigencia"]
+        dias_v = registro["dias_para_vencer"]
+        if dias_v is not None:
+            if dias_v < 0:
+                vig_status = f"{fim_vig} (Vencido há {abs(dias_v)}d)"
+            else:
+                vig_status = f"{fim_vig} ({dias_v}d restantes)"
+        else:
+            vig_status = fim_vig
+
+        # Formata acréscimo de aditivo
+        perc_a = registro["perc_aditivo"]
+        adit_status = f"+{perc_a:.1f}%" if perc_a is not None else "0%"
+
         rows.append({
             "Índice": i_local,
             "Risco": risco["nivel"],
@@ -1616,6 +1708,8 @@ def main() -> None:
             "Modalidade": registro["modalidade"],
             "Fornecedor": registro["fornecedor"],
             "Valor": registro["valor"],
+            "Fim Vigência": vig_status,
+            "Aditivo Acum.": adit_status,
             "Objeto": registro["objeto"],
             "Gatilhos": "; ".join(risco["motivos"]),
         })
@@ -1627,19 +1721,31 @@ def main() -> None:
             ascending=[False, True],
         ).reset_index(drop=True)
 
-    # Abas
+    # Abas da Aplicação
     st.markdown("---")
-    tab1, tab2 = st.tabs([
+    tab1, tab_vigencia, tab2 = st.tabs([
         "🚦 Matriz de Risco Segmentada",
+        "⏳ Vigência e Aditivos Legais",
         "📋 Auditoria e Semântica Individual",
     ])
 
     # ========================================================
-    # ABA 1 - PRIMEIRA PARTE DO DASHBOARD
+    # ABA 1 - MATRIZ DE RISCO PRINCIPAL
     # ========================================================
     with tab1:
         colunas_visualizacao = [
-            c for c in ("Risco", "Score", "Número", "Modalidade", "Fornecedor", "Valor", "Objeto", "Gatilhos")
+            c for c in (
+                "Risco",
+                "Score",
+                "Número",
+                "Modalidade",
+                "Fornecedor",
+                "Valor",
+                "Fim Vigência",
+                "Aditivo Acum.",
+                "Objeto",
+                "Gatilhos",
+            )
             if c in df_risco.columns
         ]
 
@@ -1684,7 +1790,7 @@ def main() -> None:
 
                     with col_download2:
                         st.download_button(
-                            "📝 Baixar Dashboard em Word",
+                            "📝 Baixar Resumo Executivo em Word",
                             data=word_aba1,
                             file_name=nome_word_aba1,
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1701,6 +1807,83 @@ def main() -> None:
         except Exception as exc:
             LOGGER.exception("Erro ao gerar Excel")
             st.error(f"Não foi possível gerar o Excel: {exc}")
+
+    # ========================================================
+    # ABA NOVA: VIGÊNCIA E ADITIVOS
+    # ========================================================
+    with tab_vigencia:
+        st.subheader("⏱️ Monitoramento Preditivo de Vigência & Limites da Lei 14.133/21")
+        st.markdown(
+            "Rastreamento de contratos com prazo expirando para planejamento de novas contratações "
+            "e verificação do teto de aditivos contratuais (+25% em geral / +50% reformas de edifícios)."
+        )
+
+        # Filtros de vigência
+        vencendo_30 = [r for r in dados_processados if r.get("dias_para_vencer") is not None and 0 <= r["dias_para_vencer"] <= 30]
+        vencendo_90 = [r for r in dados_processados if r.get("dias_para_vencer") is not None and 30 < r["dias_para_vencer"] <= 90]
+        aditivos_25 = [r for r in dados_processados if r.get("perc_aditivo") is not None and r["perc_aditivo"] > 25.0]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("🚨 Vencem em até 30 dias", len(vencendo_30))
+        m2.metric("⚠️ Vencem entre 31 e 90 dias", len(vencendo_90))
+        m3.metric("📈 Aditivos > 25% (Acréscimo)", len(aditivos_25))
+
+        st.markdown("---")
+
+        sub_tab_vig, sub_tab_adit = st.tabs(["📅 Linha do Tempo de Vigências", "📊 Auditoria de Aditamentos"])
+
+        with sub_tab_vig:
+            tabela_vig = []
+            for r in dados_processados:
+                dias_rest = r.get("dias_para_vencer")
+                if dias_rest is None:
+                    status_prazo = "⚪ Não informado"
+                elif dias_rest < 0:
+                    status_prazo = f"⚫ Encerrado ({abs(dias_rest)}d atrás)"
+                elif dias_rest <= 30:
+                    status_prazo = f"🔴 Crítico ({dias_rest} dias)"
+                elif dias_rest <= 90:
+                    status_prazo = f"🟡 Atenção ({dias_rest} dias)"
+                else:
+                    status_prazo = f"🟢 Regular ({dias_rest} dias)"
+
+                tabela_vig.append({
+                    "Número": r["numero"],
+                    "Fornecedor": r["fornecedor"],
+                    "Data Assinatura": r["data"],
+                    "Término Vigência": r["data_fim_vigencia"],
+                    "Status do Prazo": status_prazo,
+                    "Valor": r["valor"],
+                    "Objeto": r["objeto"],
+                })
+
+            df_vig_show = pd.DataFrame(tabela_vig)
+            st.dataframe(df_vig_show, use_container_width=True, hide_index=True)
+
+        with sub_tab_adit:
+            tabela_adit = []
+            for r in dados_processados:
+                perc_a = r.get("perc_aditivo")
+                v_ini = r.get("valor_inicial_num")
+                v_fim = r.get("valor_num")
+
+                if perc_a is not None and perc_a > 0:
+                    status_legal = "🔴 > 50% (Risco Alto)" if perc_a > 50 else ("🟡 > 25% (Risco Médio)" if perc_a > 25 else "🟢 Regular")
+                    tabela_adit.append({
+                        "Número": r["numero"],
+                        "Fornecedor": r["fornecedor"],
+                        "Valor Inicial": moeda(v_ini),
+                        "Valor Atualizado": moeda(v_fim),
+                        "Acréscimo (%)": f"+{perc_a:.2f}%",
+                        "Avaliação Legal": status_legal,
+                        "Objeto": r["objeto"],
+                    })
+
+            if tabela_adit:
+                df_adit_show = pd.DataFrame(tabela_adit).sort_values("Acréscimo (%)", ascending=False)
+                st.dataframe(df_adit_show, use_container_width=True, hide_index=True)
+            else:
+                st.info("Nenhum contrato com aditamento de valor registrado no período consultado.")
 
     # ========================================================
     # ABA 2 - AUDITORIA E SEMÂNTICA INDIVIDUAL
@@ -1773,7 +1956,8 @@ def main() -> None:
                 info_col1.write(f"**Controle PNCP:** {registro['controle']}")
                 info_col1.write(f"**Número:** {registro['numero']}")
                 info_col1.write(f"**Processo:** {registro['processo']}")
-                info_col1.write(f"**Data:** {registro['data']}")
+                info_col1.write(f"**Data Assinatura:** {registro['data']}")
+                info_col1.write(f"**Fim da Vigência:** {registro['data_fim_vigencia']}")
 
                 info_col2.write(f"**Fornecedor:** {registro['fornecedor']}")
                 info_col2.write(f"**CNPJ Fornecedor:** {registro['cnpj_fornecedor'] or 'N/D'}")
