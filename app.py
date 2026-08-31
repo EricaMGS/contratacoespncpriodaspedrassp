@@ -8,7 +8,7 @@ Tecnologias:
 - Requests
 - Scikit-Learn (opcional)
 - OpenPyXL
-- python-docx
+- python-docx (necessário somente para exportação Word)
 
 Objetivo:
 Consulta, consolidação, segmentação, análise preliminar de risco,
@@ -31,10 +31,22 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 import requests
 import streamlit as st
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.shared import Pt
+# python-docx é usado somente na exportação para Word.
+# O import é opcional para impedir que a aplicação inteira deixe de
+# carregar caso a dependência ainda não tenha sido instalada.
+try:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.shared import Pt
+    DOCX_OK = True
+except ImportError:
+    Document = None
+    WD_ALIGN_PARAGRAPH = None
+    WD_TABLE_ALIGNMENT = None
+    Pt = None
+    DOCX_OK = False
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -2034,6 +2046,14 @@ def gerar_word_dashboard_principal(
 
     Não inclui a aba de Auditoria e Semântica Individual.
     """
+
+    if not DOCX_OK:
+        raise RuntimeError(
+            "A exportação para Word requer a biblioteca "
+            "'python-docx'. Adicione 'python-docx' ao requirements.txt "
+            "e aguarde o novo deploy."
+        )
+
     doc = Document()
 
     # ------------------------------------------------------------
@@ -3392,41 +3412,47 @@ def main() -> None:
     # DOWNLOAD DO DASHBOARD PRINCIPAL EM WORD
     # ========================================================
 
-    try:
-        word_dashboard = gerar_word_dashboard_principal(
-            df_risco=df_risco,
-            df_filtrado=df_filtrado,
-            tipo=tipo_atual,
-            inicio=inicio,
-            fim=fim,
-            modalidade=mod_escolhida,
-            dados_processados=dados_processados,
-            riscos=riscos,
-            valor_total=valor_total,
-        )
+    if DOCX_OK:
+        try:
+            word_dashboard = gerar_word_dashboard_principal(
+                df_risco=df_risco,
+                df_filtrado=df_filtrado,
+                tipo=tipo_atual,
+                inicio=inicio,
+                fim=fim,
+                modalidade=mod_escolhida,
+                dados_processados=dados_processados,
+                riscos=riscos,
+                valor_total=valor_total,
+            )
 
-        st.download_button(
-            "📝 Baixar Dashboard Principal em Word",
-            data=word_dashboard,
-            file_name=(
-                f"Dashboard_Principal_PNCP_"
-                f"{slug(mod_escolhida)}.docx"
-            ),
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "wordprocessingml.document"
-            ),
-            use_container_width=False,
-            key="download_word_dashboard_principal",
-        )
+            st.download_button(
+                "📝 Baixar Dashboard Principal em Word",
+                data=word_dashboard,
+                file_name=(
+                    f"Dashboard_Principal_PNCP_"
+                    f"{slug(mod_escolhida)}.docx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                use_container_width=False,
+                key="download_word_dashboard_principal",
+            )
 
-    except Exception as exc:
-        LOGGER.exception(
-            "Erro ao gerar Word do dashboard principal"
-        )
+        except Exception as exc:
+            LOGGER.exception(
+                "Erro ao gerar Word do dashboard principal"
+            )
 
-        st.error(
-            f"Não foi possível gerar o Word do dashboard principal: {exc}"
+            st.error(
+                f"Não foi possível gerar o Word do dashboard principal: {exc}"
+            )
+    else:
+        st.warning(
+            "⚠️ Exportação para Word indisponível neste ambiente. "
+            "Instale **python-docx** no requirements.txt e faça um novo deploy."
         )
 
     # ========================================================
