@@ -1,9 +1,7 @@
 streamlit
 pandas
 requests
-python-docx
-fpdf2
-openpyxl
-scikit-learn
-pyarrow
 urllib3
+openpyxl
+python-docx
+scikit-learn
