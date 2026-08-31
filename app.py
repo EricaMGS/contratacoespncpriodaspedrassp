@@ -12,7 +12,7 @@ Tecnologias:
 
 Objetivo:
 Consulta, consolidação, segmentação, análise preliminar de risco,
-monitoramento de vigência/aditamentos, similaridade semântica depurada e exportação.
+monitoramento de vigência, captura de termos aditivos e exportação.
 
 IMPORTANTE:
 Os alertas produzidos pelo sistema são indicadores automatizados.
@@ -140,7 +140,7 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 "
         "Chrome/131.0 Safari/537.36 "
-        "MonitoramentoControleInterno/6.0"
+        "MonitoramentoControleInterno/6.1"
     ),
     "Accept": "application/json",
     "Accept-Encoding": "gzip, deflate",
@@ -561,14 +561,14 @@ def fuzzy_match(
 
 
 # ============================================================
-# EXTRAÇÃO DOS REGISTROS (COM VIGÊNCIA E ADITIVOS)
+# EXTRAÇÃO DOS REGISTROS (COM RECONHECIMENTO DE ADITIVOS)
 # ============================================================
 
 def dados_registro(
     row: Any,
     tipo: str,
 ) -> Dict[str, Any]:
-    """Extrai os principais campos de um registro PNCP incluindo vigência e aditivos."""
+    """Extrai os principais campos de um registro PNCP com detecção de termos aditivos."""
 
     if hasattr(row, "to_dict"):
         r_dict = row.to_dict()
@@ -583,6 +583,29 @@ def dados_registro(
             "numeroControlePNCPCompra",
             "idContratoPNCP",
         ],
+    )
+
+    tipo_instrumento = primeiro(
+        r_dict,
+        [
+            "tipoContrato.nome",
+            "tipoContratoNome",
+            "tipoTermoContrato.nome",
+            "tipoTermoContratoNome",
+            "tipoDocumento.nome",
+        ],
+        padrao="Contrato",
+    )
+
+    tipo_contrato_id = primeiro(
+        r_dict,
+        [
+            "tipoContrato.id",
+            "tipoContratoId",
+            "tipoTermoContrato.id",
+            "tipoTermoContratoId",
+        ],
+        padrao=None,
     )
 
     dt_fim_vig = None
@@ -654,6 +677,13 @@ def dados_registro(
     v_num = numero(val_global)
     v_ini_num = numero(val_inicial)
 
+    # Identificação de Termo Aditivo: por Tipo Oficial (ID=2 ou nome), pelo objeto ou por variação de valor
+    eh_termo_aditivo = False
+    if str(tipo_contrato_id) == "2" or "aditivo" in str(tipo_instrumento).lower():
+        eh_termo_aditivo = True
+    elif any(palavra in str(obj).lower() for palavra in ("termo aditivo", "aditamento", "termo de aditamento")):
+        eh_termo_aditivo = True
+
     perc_aditivo = None
     if v_num is not None and v_ini_num is not None and v_ini_num > 0 and v_num > v_ini_num:
         perc_aditivo = ((v_num - v_ini_num) / v_ini_num) * 100.0
@@ -668,6 +698,8 @@ def dados_registro(
         "controle": texto(controle),
         "numero": texto(num),
         "processo": texto(proc),
+        "tipo_instrumento": texto(tipo_instrumento),
+        "eh_aditivo": eh_termo_aditivo,
         "objeto": texto(obj),
         "fornecedor": texto(forn),
         "cnpj_fornecedor": cnpj_limpo(cnpj),
@@ -827,38 +859,28 @@ def normalizar_pncp(registros: List[Dict[str, Any]]) -> pd.DataFrame:
     return df
 
 
-def chaves_identificacao(df: pd.DataFrame) -> List[str]:
-    """Retorna chaves possíveis para identificação única."""
-    return [
-        coluna for coluna in (
-            "numeroControlePNCP",
-            "numeroControlePNCPAta",
-            "numeroControlePNCPCompra",
-            "idContratoPNCP",
-        ) if coluna in df.columns
-    ]
-
-
 def deduplicar(df: pd.DataFrame) -> pd.DataFrame:
-    """Deduplicação progressiva."""
+    """
+    Deduplicação que respeita sequenciais de termos aditivos.
+    Combina o número de controle com o sequencial/tipo para não descartar aditivos legítimos.
+    """
     if df.empty:
         return df
 
     resultado = df.copy()
-    chaves = chaves_identificacao(resultado)
 
-    if chaves:
-        mascara_manter = pd.Series(True, index=resultado.index)
-        identificados = pd.Series(False, index=resultado.index)
+    colunas_compostas = []
+    for c in ["numeroControlePNCP", "numeroControlePNCPAta", "numeroControlePNCPCompra", "idContratoPNCP"]:
+        if c in resultado.columns:
+            colunas_compostas.append(c)
 
-        for coluna in chaves:
-            serie = resultado[coluna].astype("string").str.strip()
-            validos = serie.notna() & ~serie.str.lower().isin(INVALID_TEXTS)
-            duplicados = validos & serie.duplicated(keep="first")
-            mascara_manter &= ~(duplicados & ~identificados)
-            identificados |= validos
+    # Identificadores de aditivo e sequencial
+    for c in ["sequencialContrato", "sequencialTermoContrato", "numeroTermoContrato", "tipoContrato.id"]:
+        if c in resultado.columns:
+            colunas_compostas.append(c)
 
-        resultado = resultado.loc[mascara_manter]
+    if colunas_compostas:
+        resultado = resultado.drop_duplicates(subset=colunas_compostas, keep="first")
     else:
         resultado = resultado.drop_duplicates()
 
@@ -938,7 +960,7 @@ def filtrar_periodo(
 
 
 # ============================================================
-# MOTOR DE RISCO (COM VIGÊNCIA E ADITIVOS LEGAIS)
+# MOTOR DE RISCO
 # ============================================================
 
 def limites_iqr(
@@ -1026,28 +1048,29 @@ def calcular_risco(
             motivos.append(f"⏳ Vencimento próximo ({dias_venc} dias restantes)")
             testes.append("Acompanhar planejamento do encerramento da vigência")
 
-    # 6. Monitoramento de Aditamentos e Limites Legais (Lei 14.133/21, Art. 125)
+    # 6. Monitoramento de Aditamentos (Lei 14.133/21)
     perc_adit = registro.get("perc_aditivo")
+    eh_adit = registro.get("eh_aditivo", False)
+
     if perc_adit is not None:
         if perc_adit > 50.0:
             pontos += 30
-            motivos.append(f"⚠️ Aditivo expressivo (+{perc_adit:.1f}%), acima do limite de 50%")
+            motivos.append(f"⚠️ Aditivo financeiro expressivo (+{perc_adit:.1f}%), acima de 50%")
             testes.append("Auditar termo aditivo: extrapolação do teto legal de 50% para reformas/edifícios")
         elif perc_adit > 25.0:
             pontos += 15
-            motivos.append(f"⚠️ Aditivo relevante (+{perc_adit:.1f}%), acima de 25%")
+            motivos.append(f"⚠️ Aditivo financeiro relevante (+{perc_adit:.1f}%), acima de 25%")
             testes.append("Auditar termo aditivo: verificar enquadramento legal e justificativa técnica (> 25%)")
         elif perc_adit > 0:
             pontos += 5
-            motivos.append(f"Contrato com aditivo acumulado (+{perc_adit:.1f}%)")
+            motivos.append(f"Contrato com aditamento financeiro (+{perc_adit:.1f}%)")
 
-    # 7. Objeto Continuado / Aditivo no texto
-    if any(palavra in objeto for palavra in ("prorroga", "aditivo", "continuado")):
+    if eh_adit:
         pontos += 5
-        motivos.append("Indício textual de prorrogação/aditivo")
-        testes.append("Revisar vantajosidade da prorrogação contratual")
+        motivos.append(f"Instrumento cadastrado como Termo Aditivo ({registro.get('tipo_instrumento')})")
+        testes.append("Revisar motivação formal e anexos do termo aditivo")
 
-    # 8. Concentração de Fornecedor
+    # 7. Concentração de Fornecedor
     fornecedor = texto(registro.get("fornecedor"), "").strip()
     if fornecedor and not contexto.empty and "fornecedor" in contexto.columns:
         fornecedores = contexto["fornecedor"].fillna("").astype(str).str.strip().str.casefold()
@@ -1084,11 +1107,9 @@ def calcular_risco(
 # ============================================================
 
 STOPWORDS_CONTRATOS = {
-    # Preposições / Artigos / Conectivos comuns
     "a", "o", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das",
     "em", "no", "na", "nos", "nas", "por", "pelo", "pela", "pelos", "pelas", "com",
     "para", "que", "e", "ou", "ao", "aos", "à", "às", "sob", "sobre", "entre", "se",
-    # Termos administrativos e burocráticos
     "contrato", "contratacao", "contratada", "contratante", "celebrado", "celebram",
     "termo", "referencia", "especificacoes", "contidas", "anexo", "anexos", "edital",
     "dispensa", "eletronica", "processo", "administrativo", "objeto", "presente",
@@ -1334,11 +1355,12 @@ def gerar_word_dashboard_principal(
             "Risco",
             "Score",
             "Número",
+            "Tipo",
             "Modalidade",
             "Fornecedor",
             "Valor",
             "Fim Vigência",
-            "Aditivo Acum.",
+            "Aditivo",
             "Objeto",
             "Gatilhos",
         )
@@ -1413,7 +1435,7 @@ def gerar_excel(
 # ============================================================
 
 def consultar_contratos(inicio: Any, fim: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Consulta contratos."""
+    """Consulta contratos e termos aditivos associados."""
     params = {
         "dataInicial": inicio.strftime("%Y%m%d"),
         "dataFinal": fim.strftime("%Y%m%d"),
@@ -1737,18 +1759,24 @@ def main() -> None:
             vig_status = fim_vig
 
         perc_a = registro["perc_aditivo"]
-        adit_status = f"+{perc_a:.1f}%" if perc_a is not None else "0%"
+        if perc_a is not None:
+            adit_status = f"+{perc_a:.1f}%"
+        elif registro["eh_aditivo"]:
+            adit_status = "Aditivo formal"
+        else:
+            adit_status = "Inicial (0%)"
 
         rows.append({
             "Índice": i_local,
             "Risco": risco["nivel"],
             "Score": risco["pontos"],
             "Número": registro["numero"],
+            "Tipo": registro["tipo_instrumento"],
             "Modalidade": registro["modalidade"],
             "Fornecedor": registro["fornecedor"],
             "Valor": registro["valor"],
             "Fim Vigência": vig_status,
-            "Aditivo Acum.": adit_status,
+            "Aditivo": adit_status,
             "Objeto": registro["objeto"],
             "Gatilhos": "; ".join(risco["motivos"]),
         })
@@ -1777,11 +1805,12 @@ def main() -> None:
                 "Risco",
                 "Score",
                 "Número",
+                "Tipo",
                 "Modalidade",
                 "Fornecedor",
                 "Valor",
                 "Fim Vigência",
-                "Aditivo Acum.",
+                "Aditivo",
                 "Objeto",
                 "Gatilhos",
             )
@@ -1854,17 +1883,22 @@ def main() -> None:
         st.subheader("⏱️ Monitoramento Preditivo de Vigência & Limites da Lei 14.133/21")
         st.markdown(
             "Rastreamento de contratos com prazo expirando para planejamento de novas contratações "
-            "e verificação do teto de aditivos contratuais (+25% em geral / +50% reformas de edifícios)."
+            "e verificação de aditamentos formais e financeiros (+25% em geral / +50% reformas)."
         )
 
         vencendo_30 = [r for r in dados_processados if r.get("dias_para_vencer") is not None and 0 <= r["dias_para_vencer"] <= 30]
         vencendo_90 = [r for r in dados_processados if r.get("dias_para_vencer") is not None and 30 < r["dias_para_vencer"] <= 90]
-        aditivos_25 = [r for r in dados_processados if r.get("perc_aditivo") is not None and r["perc_aditivo"] > 25.0]
+        
+        # Filtro de Aditivos: identifica tanto acréscimo financeiro quanto termos aditivos formais cadastrados
+        total_aditivos = [
+            r for r in dados_processados 
+            if r.get("eh_aditivo", False) or (r.get("perc_aditivo") is not None and r["perc_aditivo"] > 0)
+        ]
 
         m1, m2, m3 = st.columns(3)
         m1.metric("🚨 Vencem em até 30 dias", len(vencendo_30))
         m2.metric("⚠️ Vencem entre 31 e 90 dias", len(vencendo_90))
-        m3.metric("📈 Aditivos > 25% (Acréscimo)", len(aditivos_25))
+        m3.metric("📈 Termos Aditivos Identificados", len(total_aditivos))
 
         st.markdown("---")
 
@@ -1887,6 +1921,7 @@ def main() -> None:
 
                 tabela_vig.append({
                     "Número": r["numero"],
+                    "Tipo": r["tipo_instrumento"],
                     "Fornecedor": r["fornecedor"],
                     "Data Assinatura": r["data"],
                     "Término Vigência": r["data_fim_vigencia"],
@@ -1902,26 +1937,36 @@ def main() -> None:
             tabela_adit = []
             for r in dados_processados:
                 perc_a = r.get("perc_aditivo")
+                eh_adit = r.get("eh_aditivo", False)
                 v_ini = r.get("valor_inicial_num")
                 v_fim = r.get("valor_num")
 
-                if perc_a is not None and perc_a > 0:
-                    status_legal = "🔴 > 50% (Risco Alto)" if perc_a > 50 else ("🟡 > 25% (Risco Médio)" if perc_a > 25 else "🟢 Regular")
+                if eh_adit or (perc_a is not None and perc_a > 0):
+                    if perc_a is not None and perc_a > 50:
+                        status_legal = "🔴 > 50% (Risco Alto)"
+                    elif perc_a is not None and perc_a > 25:
+                        status_legal = "🟡 > 25% (Risco Médio)"
+                    elif perc_a is not None and perc_a > 0:
+                        status_legal = "🟢 Aditivo Financeiro Regular"
+                    else:
+                        status_legal = "ℹ️ Aditivo de Prazo / Qualitativo"
+
                     tabela_adit.append({
                         "Número": r["numero"],
+                        "Tipo de Instrumento": r["tipo_instrumento"],
                         "Fornecedor": r["fornecedor"],
-                        "Valor Inicial": moeda(v_ini),
+                        "Valor Inicial": moeda(v_ini) if v_ini else "N/D",
                         "Valor Atualizado": moeda(v_fim),
-                        "Acréscimo (%)": f"+{perc_a:.2f}%",
-                        "Avaliação Legal": status_legal,
+                        "Variação (%)": f"+{perc_a:.2f}%" if perc_a is not None else "0.00%",
+                        "Avaliação de Conformidade": status_legal,
                         "Objeto": r["objeto"],
                     })
 
             if tabela_adit:
-                df_adit_show = pd.DataFrame(tabela_adit).sort_values("Acréscimo (%)", ascending=False)
+                df_adit_show = pd.DataFrame(tabela_adit)
                 st.dataframe(df_adit_show, use_container_width=True, hide_index=True)
             else:
-                st.info("Nenhum contrato com aditamento de valor registrado no período consultado.")
+                st.info("Nenhum termo aditivo ou contrato com aditamento de valor localizado no período filtrado.")
 
     # ========================================================
     # ABA 3 - AUDITORIA E SEMÂNTICA INDIVIDUAL
@@ -1993,6 +2038,7 @@ def main() -> None:
                 info_col1, info_col2 = st.columns(2)
                 info_col1.write(f"**Controle PNCP:** {registro['controle']}")
                 info_col1.write(f"**Número:** {registro['numero']}")
+                info_col1.write(f"**Tipo de Instrumento:** {registro['tipo_instrumento']}")
                 info_col1.write(f"**Processo:** {registro['processo']}")
                 info_col1.write(f"**Data Assinatura:** {registro['data']}")
                 info_col1.write(f"**Fim da Vigência:** {registro['data_fim_vigencia']}")
