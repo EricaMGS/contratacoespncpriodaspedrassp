@@ -12,7 +12,7 @@ Tecnologias:
 
 Objetivo:
 Consulta, consolidação, segmentação, análise preliminar de risco,
-monitoramento de vigência/aditamentos, similaridade semântica e exportação.
+monitoramento de vigência/aditamentos, similaridade semântica depurada e exportação.
 
 IMPORTANTE:
 Os alertas produzidos pelo sistema são indicadores automatizados.
@@ -651,7 +651,6 @@ def dados_registro(
     if texto(cnpj, "") == "":
         cnpj = fuzzy_match(r_dict, ["cnpj", "ni"])
 
-    # Tratamento numérico de valores e percentual de aditivo
     v_num = numero(val_global)
     v_ini_num = numero(val_inicial)
 
@@ -659,7 +658,6 @@ def dados_registro(
     if v_num is not None and v_ini_num is not None and v_ini_num > 0 and v_num > v_ini_num:
         perc_aditivo = ((v_num - v_ini_num) / v_ini_num) * 100.0
 
-    # Tratamento de Vigência e cálculo de dias restantes
     ts_fim_vig = data_timestamp(dt_fim_vig)
     dias_para_vencer = None
     if ts_fim_vig is not None:
@@ -1082,31 +1080,66 @@ def calcular_risco(
 
 
 # ============================================================
-# NLP / SIMILARIDADE
+# NLP / SIMILARIDADE SEMÂNTICA OTIMIZADA
 # ============================================================
 
+STOPWORDS_CONTRATOS = {
+    # Preposições / Artigos / Conectivos comuns
+    "a", "o", "os", "as", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das",
+    "em", "no", "na", "nos", "nas", "por", "pelo", "pela", "pelos", "pelas", "com",
+    "para", "que", "e", "ou", "ao", "aos", "à", "às", "sob", "sobre", "entre", "se",
+    # Termos administrativos e burocráticos
+    "contrato", "contratacao", "contratada", "contratante", "celebrado", "celebram",
+    "termo", "referencia", "especificacoes", "contidas", "anexo", "anexos", "edital",
+    "dispensa", "eletronica", "processo", "administrativo", "objeto", "presente",
+    "visa", "visando", "atender", "atendimento", "prestacao", "servico", "servicos",
+    "empresa", "especializada", "prefeitura", "municipio", "municipal", "secretaria",
+    "rio", "pedras", "sp", "conforme", "observadas", "condicoes", "exigencias",
+    "estabelecidas", "leis", "lei", "artigo", "art", "vigor", "fornecimento",
+    "aquisicao", "locacao", "realizacao", "execucao", "ramo", "me", "epp", "ltda",
+    "sa", "cnpj", "cpf", "compromisso", "governo", "hora", "horas", "minutos",
+    "dia", "dias", "inicio", "duracao",
+}
+
+
 def texto_nlp(valor: Any) -> str:
-    """Normaliza texto para o TF-IDF."""
+    """Normaliza o texto do objeto e remove jargões burocráticos."""
     s = texto(valor, "").lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    if len(re.sub(r"[^a-zA-ZÀ-ÿ0-9]", "", s)) < 2:
-        return "objeto ausente"
-    return s
+
+    s = re.sub(r"[áàãâä]", "a", s)
+    s = re.sub(r"[éèêë]", "e", s)
+    s = re.sub(r"[íìîï]", "i", s)
+    s = re.sub(r"[óòõôö]", "o", s)
+    s = re.sub(r"[úùûü]", "u", s)
+    s = re.sub(r"[ç]", "c", s)
+
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    palavras = s.split()
+
+    palavras_limpas = [
+        p for p in palavras
+        if len(p) > 2 and p not in STOPWORDS_CONTRATOS
+    ]
+
+    if not palavras_limpas:
+        return "objeto_sem_termos_chave"
+
+    return " ".join(palavras_limpas)
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def calcular_modelo_tfidf(textos: Tuple[str, ...]):
-    """Cria a matriz TF-IDF."""
+    """Cria a matriz TF-IDF baseada no núcleo semântico dos objetos."""
     if not SKLEARN_OK or TfidfVectorizer is None or len(textos) < 2:
         return None
 
     textos_seguros = tuple(texto_nlp(t) for t in textos)
-    if len(set(textos_seguros)) < 2:
+    textos_validos = [t for t in textos_seguros if t != "objeto_sem_termos_chave"]
+    if len(set(textos_validos)) < 2:
         return None
 
     vetor = TfidfVectorizer(
         lowercase=True,
-        strip_accents="unicode",
         ngram_range=(1, 2),
         min_df=1,
         max_features=8000,
@@ -1123,12 +1156,13 @@ def similares(
     dados_processados: List[Dict[str, Any]],
     idx: int,
     limite: int = 5,
+    corte_minimo: float = 0.15,
 ) -> pd.DataFrame:
-    """Retorna registros semanticamente semelhantes."""
+    """Retorna registros semanticamente semelhantes filtrando ruídos burocráticos."""
     if not SKLEARN_OK or len(dados_processados) < 2 or idx < 0 or idx >= len(dados_processados):
         return pd.DataFrame()
 
-    objetos = tuple(texto_nlp(r.get("objeto")) for r in dados_processados)
+    objetos = tuple(r.get("objeto") for r in dados_processados)
     matriz = calcular_modelo_tfidf(objetos)
     if matriz is None:
         return pd.DataFrame()
@@ -1146,9 +1180,14 @@ def similares(
         j = int(j)
         if j == idx:
             continue
+
+        score_val = float(scores[j])
+        if score_val < corte_minimo:
+            continue
+
         registro = dados_processados[j]
         saida.append({
-            "Similaridade": f"{float(scores[j]) * 100:.1f}%",
+            "Similaridade": f"{score_val * 100:.1f}%",
             "Número": texto(registro.get("numero")),
             "Objeto": texto(registro.get("objeto")),
             "Fornecedor": texto(registro.get("fornecedor")),
@@ -1687,7 +1726,6 @@ def main() -> None:
     for i_local, risco in enumerate(riscos):
         registro = dados_processados[i_local]
         
-        # Formata informação de vigência resumida
         fim_vig = registro["data_fim_vigencia"]
         dias_v = registro["dias_para_vencer"]
         if dias_v is not None:
@@ -1698,7 +1736,6 @@ def main() -> None:
         else:
             vig_status = fim_vig
 
-        # Formata acréscimo de aditivo
         perc_a = registro["perc_aditivo"]
         adit_status = f"+{perc_a:.1f}%" if perc_a is not None else "0%"
 
@@ -1973,7 +2010,7 @@ def main() -> None:
                     "Instale a dependência para habilitar a análise semântica."
                 )
             else:
-                sim = similares(dados_processados, i_alvo, limite=5)
+                sim = similares(dados_processados, i_alvo, limite=5, corte_minimo=0.15)
                 if sim.empty:
                     st.info("Não foi possível identificar vizinhança semântica relevante para este item.")
                 else:
