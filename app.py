@@ -32,9 +32,6 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# python-docx é usado somente na exportação para Word.
-# O import é opcional para impedir que a aplicação inteira deixe de
-# carregar caso a dependência ainda não tenha sido instalada.
 try:
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -123,8 +120,6 @@ PAGE_CONTRATOS = 100
 PAGE_ATAS = 100
 PAGE_EDITAIS = 50
 
-# Limite de segurança para não disparar uma quantidade
-# excessiva de páginas contra a API.
 MAX_PAGINAS = max(
     1,
     int(os.getenv("PNCP_MAX_PAGES", "15")),
@@ -197,10 +192,7 @@ def aplicar_estilo() -> None:
 
 @st.cache_resource(show_spinner=False)
 def sessao_http() -> requests.Session:
-    """
-    Cria uma sessão HTTP reutilizável.
-    O retry foi limitado a situações transitórias.
-    """
+    """Cria uma sessão HTTP reutilizável."""
 
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -617,7 +609,6 @@ def dados_registro(
 
     mod = primeiro(r_dict, ["modalidadeNome", "modalidadeContratacaoNome", "compra.modalidadeNome", "modalidade"])
 
-    # Fallbacks
     if texto(obj, "") == "":
         obj = fuzzy_match(r_dict, ["objeto", "descricao"])
 
@@ -1164,7 +1155,6 @@ def _adicionar_tabela_word(
 
 def gerar_word_dashboard_principal(
     df_risco: pd.DataFrame,
-    df_filtrado: pd.DataFrame,
     tipo: str,
     inicio: Any,
     fim: Any,
@@ -1174,13 +1164,10 @@ def gerar_word_dashboard_principal(
     valor_total: Any,
 ) -> bytes:
     """
-    Gera o Word SOMENTE da primeira parte / aba principal do dashboard.
-
-    Conteúdo:
+    Gera o Word SOMENTE com o resumo executivo do dashboard:
     - Identificação da consulta;
     - Indicadores principais;
     - Matriz de risco segmentada;
-    - Dados do segmento;
     - Aviso de apoio ao Controle Interno.
     """
 
@@ -1214,7 +1201,7 @@ def gerar_word_dashboard_principal(
         f"IBGE: {IBGE}"
     )
 
-    # Indicadores
+    # Indicadores Principais
     doc.add_heading("1. Indicadores Principais", level=1)
     altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
     medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
@@ -1234,7 +1221,7 @@ def gerar_word_dashboard_principal(
         tabela_indicadores.rows[i].cells[0].text = rotulo
         tabela_indicadores.rows[i].cells[1].text = valor
 
-    # Matriz de Risco
+    # Matriz de Risco Segmentada
     doc.add_heading("2. Matriz de Risco Segmentada", level=1)
     colunas_visualizacao = [
         c for c in ("Risco", "Score", "Número", "Modalidade", "Fornecedor", "Valor", "Objeto", "Gatilhos")
@@ -1247,11 +1234,7 @@ def gerar_word_dashboard_principal(
         max_linhas=500,
     )
 
-    # Dados do Segmento
-    doc.add_heading("3. Dados do Segmento", level=1)
-    _adicionar_tabela_word(doc, df_filtrado, max_linhas=500)
-
-    # Aviso
+    # Aviso ao Controle Interno
     doc.add_paragraph(
         "Aviso: os alertas e indicadores apresentados neste dashboard "
         "são ferramentas automatizadas de apoio ao Controle Interno. "
@@ -1689,7 +1672,6 @@ def main() -> None:
                 try:
                     word_aba1 = gerar_word_dashboard_principal(
                         df_risco=df_risco,
-                        df_filtrado=df_filtrado,
                         tipo=tipo_atual,
                         inicio=inicio,
                         fim=fim,
