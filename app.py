@@ -8,6 +8,7 @@ Tecnologias:
 - Requests
 - Scikit-Learn (opcional)
 - OpenPyXL
+- python-docx
 
 Objetivo:
 Consulta, consolidação, segmentação, análise preliminar de risco,
@@ -30,6 +31,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.shared import Pt
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -1939,6 +1944,427 @@ def similares(
 
 
 # ============================================================
+# EXPORTAÇÃO WORD
+# ============================================================
+
+def _word_text(valor: Any, padrao: str = "N/D") -> str:
+    """Converte valores para texto adequado ao Word."""
+    if valor_vazio(valor):
+        return padrao
+
+    if isinstance(valor, float):
+        if pd.isna(valor):
+            return padrao
+        return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    return texto(valor, padrao)
+
+
+def _adicionar_tabela_word(
+    doc: Document,
+    df: pd.DataFrame,
+    titulo: Optional[str] = None,
+    max_linhas: int = 500,
+) -> None:
+    """Adiciona DataFrame ao Word em tabela legível."""
+    if titulo:
+        p = doc.add_paragraph()
+        run = p.add_run(titulo)
+        run.bold = True
+        run.font.size = Pt(12)
+
+    if df is None or df.empty:
+        doc.add_paragraph("Nenhum dado disponível.")
+        return
+
+    tabela_df = df.copy().head(max_linhas)
+
+    tabela = doc.add_table(
+        rows=1,
+        cols=len(tabela_df.columns),
+    )
+    tabela.alignment = WD_TABLE_ALIGNMENT.CENTER
+    tabela.style = "Table Grid"
+
+    for j, coluna in enumerate(tabela_df.columns):
+        celula = tabela.rows[0].cells[j]
+        celula.text = str(coluna)
+        for paragrafo in celula.paragraphs:
+            for run in paragrafo.runs:
+                run.bold = True
+                run.font.size = Pt(8)
+
+    for _, row in tabela_df.iterrows():
+        celulas = tabela.add_row().cells
+        for j, valor in enumerate(row.tolist()):
+            celulas[j].text = _word_text(valor)
+            for paragrafo in celulas[j].paragraphs:
+                for run in paragrafo.runs:
+                    run.font.size = Pt(7)
+
+    if len(df) > max_linhas:
+        doc.add_paragraph(
+            f"Observação: foram exibidas {max_linhas} linhas de "
+            f"{len(df)} registros para manter o documento em tamanho adequado."
+        )
+
+
+def _adicionar_metadados_word(
+    doc: Document,
+    tipo: str,
+    inicio: Any,
+    fim: Any,
+    modalidade: str,
+) -> None:
+    """Adiciona identificação e parâmetros da consulta."""
+    titulo = doc.add_paragraph()
+    titulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = titulo.add_run(
+        "PAINEL DE INTELIGÊNCIA E APOIO AO CONTROLE INTERNO - PNCP"
+    )
+    run.bold = True
+    run.font.size = Pt(16)
+
+    subtitulo = doc.add_paragraph()
+    subtitulo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = subtitulo.add_run(PREFEITURA)
+    run.bold = True
+    run.font.size = Pt(12)
+
+    doc.add_paragraph(
+        f"Escopo: {tipo}\n"
+        f"Período: {data_br(inicio)} a {data_br(fim)}\n"
+        f"Segmentação: {modalidade}\n"
+        f"CNPJ do órgão: {CNPJ}\n"
+        f"IBGE: {IBGE}"
+    )
+
+
+def gerar_word_aba_risco(
+    df_risco: pd.DataFrame,
+    df_filtrado: pd.DataFrame,
+    tipo: str,
+    inicio: Any,
+    fim: Any,
+    modalidade: str,
+    dados_processados: List[Dict[str, Any]],
+    riscos: List[Dict[str, Any]],
+    valor_total: Any,
+) -> bytes:
+    """Gera o Word da aba Matriz de Risco Segmentada."""
+    doc = Document()
+
+    _adicionar_metadados_word(
+        doc,
+        tipo,
+        inicio,
+        fim,
+        modalidade,
+    )
+
+    doc.add_heading("1. Resumo Executivo", level=1)
+
+    altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
+    medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
+    baixos = sum(r["nivel"] == "🟢 BAIXO" for r in riscos)
+
+    tabela_resumo = doc.add_table(rows=4, cols=2)
+    tabela_resumo.style = "Table Grid"
+    tabela_resumo.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    resumo = [
+        ("Registros Segmentados", str(len(dados_processados))),
+        ("Alto risco", str(altos)),
+        ("Médio risco", str(medios)),
+        ("Valor Analisado", moeda(valor_total)),
+    ]
+
+    for i, (rotulo, valor) in enumerate(resumo):
+        tabela_resumo.rows[i].cells[0].text = rotulo
+        tabela_resumo.rows[i].cells[1].text = valor
+
+    doc.add_heading("2. Matriz de Risco Segmentada", level=1)
+
+    colunas = [
+        coluna
+        for coluna in (
+            "Risco",
+            "Score",
+            "Número",
+            "Modalidade",
+            "Fornecedor",
+            "Valor",
+            "Objeto",
+            "Gatilhos",
+        )
+        if coluna in df_risco.columns
+    ]
+
+    _adicionar_tabela_word(
+        doc,
+        df_risco[colunas] if colunas else df_risco,
+        max_linhas=500,
+    )
+
+    doc.add_heading("3. Dados do Segmento", level=1)
+    _adicionar_tabela_word(
+        doc,
+        df_filtrado,
+        max_linhas=500,
+    )
+
+    doc.add_paragraph(
+        "Aviso: os alertas apresentados são indicadores automatizados "
+        "de apoio ao Controle Interno e não substituem análise técnica, "
+        "jurídica ou auditoria humana."
+    )
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def gerar_word_aba_auditoria(
+    registro: Dict[str, Any],
+    risco: Dict[str, Any],
+    sim: pd.DataFrame,
+    tipo: str,
+    inicio: Any,
+    fim: Any,
+    modalidade: str,
+    filtro_risco: List[str],
+    mostrar_outlier: bool,
+) -> bytes:
+    """Gera o Word da aba Auditoria e Semântica Individual."""
+    doc = Document()
+
+    _adicionar_metadados_word(
+        doc,
+        tipo,
+        inicio,
+        fim,
+        modalidade,
+    )
+
+    doc.add_heading("1. Dossiê da Contratação", level=1)
+
+    dados = [
+        ("Controle PNCP", registro["controle"]),
+        ("Número", registro["numero"]),
+        ("Processo", registro["processo"]),
+        ("Data", registro["data"]),
+        ("Fornecedor", registro["fornecedor"]),
+        ("CNPJ Fornecedor", registro["cnpj_fornecedor"] or "N/D"),
+        ("Situação", registro["situacao"]),
+        ("Modalidade", registro["modalidade"]),
+        ("Valor", registro["valor"]),
+        ("Objeto", registro["objeto"]),
+    ]
+
+    tabela = doc.add_table(rows=1, cols=2)
+    tabela.style = "Table Grid"
+    tabela.alignment = WD_TABLE_ALIGNMENT.CENTER
+    tabela.rows[0].cells[0].text = "Campo"
+    tabela.rows[0].cells[1].text = "Informação"
+
+    for campo, valor in dados:
+        celulas = tabela.add_row().cells
+        celulas[0].text = campo
+        celulas[1].text = _word_text(valor)
+
+    doc.add_heading("2. Avaliação de Risco", level=1)
+
+    doc.add_paragraph(
+        f"Nível: {risco['nivel']}\n"
+        f"Score: {risco['pontos']} pontos\n"
+        f"Anomalia financeira: {'Sim' if risco['outlier'] else 'Não'}"
+    )
+
+    doc.add_paragraph("Variáveis de Acionamento")
+    for motivo in risco["motivos"]:
+        doc.add_paragraph(str(motivo), style="List Bullet")
+
+    doc.add_paragraph("Roteiro de Auditoria Sugerido")
+    if risco["testes"]:
+        for teste in risco["testes"]:
+            doc.add_paragraph(str(teste), style="List Bullet")
+    else:
+        doc.add_paragraph("Nenhum teste específico foi sugerido automaticamente.")
+
+    doc.add_heading("3. Filtros Aplicados", level=1)
+    doc.add_paragraph(
+        f"Níveis selecionados: {', '.join(filtro_risco) if filtro_risco else 'Nenhum'}\n"
+        f"Apenas anomalias financeiras: {'Sim' if mostrar_outlier else 'Não'}"
+    )
+
+    doc.add_heading("4. Similaridade Semântica", level=1)
+    if sim is None or sim.empty:
+        doc.add_paragraph(
+            "Não foi possível identificar vizinhança semântica relevante para este item."
+        )
+    else:
+        _adicionar_tabela_word(
+            doc,
+            sim,
+            max_linhas=20,
+        )
+
+    doc.add_paragraph(
+        "Aviso: a similaridade semântica é uma análise automatizada de apoio. "
+        "A interpretação dos resultados deve ser validada pelo responsável."
+    )
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def gerar_word_dashboard_completo(
+    df_risco: pd.DataFrame,
+    df_filtrado: pd.DataFrame,
+    tipo: str,
+    inicio: Any,
+    fim: Any,
+    modalidade: str,
+    dados_processados: List[Dict[str, Any]],
+    riscos: List[Dict[str, Any]],
+    valor_total: Any,
+    registro: Optional[Dict[str, Any]] = None,
+    risco_selecionado: Optional[Dict[str, Any]] = None,
+    sim: Optional[pd.DataFrame] = None,
+    filtro_risco: Optional[List[str]] = None,
+    mostrar_outlier: bool = False,
+) -> bytes:
+    """
+    Gera um único Word contendo o dashboard completo:
+    matriz de risco, dados do segmento e, quando houver seleção,
+    dossiê individual e similaridade semântica.
+    """
+    doc = Document()
+
+    _adicionar_metadados_word(
+        doc,
+        tipo,
+        inicio,
+        fim,
+        modalidade,
+    )
+
+    doc.add_heading("1. Dashboard Geral", level=1)
+
+    altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
+    medios = sum(r["nivel"] == "🟡 MÉDIO" for r in riscos)
+    baixos = sum(r["nivel"] == "🟢 BAIXO" for r in riscos)
+
+    doc.add_paragraph(
+        f"Registros segmentados: {len(dados_processados)}\n"
+        f"Alto risco: {altos}\n"
+        f"Médio risco: {medios}\n"
+        f"Baixo risco: {baixos}\n"
+        f"Valor analisado: {moeda(valor_total)}"
+    )
+
+    doc.add_heading("2. Aba - Matriz de Risco Segmentada", level=1)
+
+    colunas = [
+        coluna
+        for coluna in (
+            "Risco",
+            "Score",
+            "Número",
+            "Modalidade",
+            "Fornecedor",
+            "Valor",
+            "Objeto",
+            "Gatilhos",
+        )
+        if coluna in df_risco.columns
+    ]
+
+    _adicionar_tabela_word(
+        doc,
+        df_risco[colunas] if colunas else df_risco,
+        max_linhas=500,
+    )
+
+    doc.add_heading("3. Aba - Dados do Segmento", level=1)
+    _adicionar_tabela_word(
+        doc,
+        df_filtrado,
+        max_linhas=500,
+    )
+
+    if registro is not None and risco_selecionado is not None:
+        doc.add_heading("4. Aba - Auditoria e Semântica Individual", level=1)
+
+        doc.add_paragraph(
+            f"Controle PNCP: {registro['controle']}\n"
+            f"Número: {registro['numero']}\n"
+            f"Processo: {registro['processo']}\n"
+            f"Data: {registro['data']}\n"
+            f"Fornecedor: {registro['fornecedor']}\n"
+            f"CNPJ Fornecedor: {registro['cnpj_fornecedor'] or 'N/D'}\n"
+            f"Situação: {registro['situacao']}\n"
+            f"Modalidade: {registro['modalidade']}\n"
+            f"Valor: {registro['valor']}\n"
+            f"Objeto: {registro['objeto']}"
+        )
+
+        doc.add_paragraph(
+            f"Nível de risco: {risco_selecionado['nivel']}\n"
+            f"Score: {risco_selecionado['pontos']} pontos\n"
+            f"Anomalia financeira: "
+            f"{'Sim' if risco_selecionado['outlier'] else 'Não'}"
+        )
+
+        doc.add_paragraph("Variáveis de Acionamento")
+        for motivo in risco_selecionado["motivos"]:
+            doc.add_paragraph(str(motivo), style="List Bullet")
+
+        doc.add_paragraph("Roteiro de Auditoria Sugerido")
+        if risco_selecionado["testes"]:
+            for teste in risco_selecionado["testes"]:
+                doc.add_paragraph(str(teste), style="List Bullet")
+        else:
+            doc.add_paragraph(
+                "Nenhum teste específico foi sugerido automaticamente."
+            )
+
+        doc.add_paragraph(
+            f"Filtros de risco: "
+            f"{', '.join(filtro_risco or []) if filtro_risco else 'Nenhum'}\n"
+            f"Apenas anomalias financeiras: "
+            f"{'Sim' if mostrar_outlier else 'Não'}"
+        )
+
+        doc.add_heading("Similaridade Semântica", level=2)
+        if sim is None or sim.empty:
+            doc.add_paragraph(
+                "Não foi possível identificar vizinhança semântica relevante para este item."
+            )
+        else:
+            _adicionar_tabela_word(
+                doc,
+                sim,
+                max_linhas=20,
+            )
+
+    doc.add_paragraph(
+        "Aviso: os alertas e análises produzidos pelo sistema são indicadores "
+        "automatizados de apoio. Toda conclusão de auditoria deve ser validada "
+        "por servidor responsável e pelos procedimentos técnicos, jurídicos "
+        "e administrativos aplicáveis."
+    )
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ============================================================
 # EXPORTAÇÃO EXCEL
 # ============================================================
 
@@ -2846,16 +3272,53 @@ def main() -> None:
                 f"{slug(mod_escolhida)}.xlsx"
             )
 
-            st.download_button(
-                "📊 Baixar Matriz Deste Segmento (Excel)",
-                data=excel,
-                file_name=nome_arquivo,
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-                use_container_width=False,
-            )
+            col_download1, col_download2 = st.columns(2)
+
+            with col_download1:
+                st.download_button(
+                    "📊 Baixar Matriz Deste Segmento (Excel)",
+                    data=excel,
+                    file_name=nome_arquivo,
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                    use_container_width=True,
+                )
+
+            try:
+                word_aba1 = gerar_word_aba_risco(
+                    df_risco=df_risco,
+                    df_filtrado=df_filtrado,
+                    tipo=tipo_atual,
+                    inicio=inicio,
+                    fim=fim,
+                    modalidade=mod_escolhida,
+                    dados_processados=dados_processados,
+                    riscos=riscos,
+                    valor_total=valor_total,
+                )
+
+                nome_word_aba1 = (
+                    f"Dashboard_Matriz_Risco_"
+                    f"{slug(mod_escolhida)}.docx"
+                )
+
+                with col_download2:
+                    st.download_button(
+                        "📝 Baixar esta Aba em Word",
+                        data=word_aba1,
+                        file_name=nome_word_aba1,
+                        mime=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "wordprocessingml.document"
+                        ),
+                        use_container_width=True,
+                    )
+            except Exception as exc:
+                LOGGER.exception("Erro ao gerar Word da aba 1")
+                with col_download2:
+                    st.error(f"Não foi possível gerar o Word: {exc}")
 
         except Exception as exc:
 
@@ -3129,6 +3592,121 @@ def main() -> None:
                         use_container_width=True,
                         hide_index=True,
                     )
+
+    # ========================================================
+    # EXPORTAÇÃO WORD - ABA 2 E DASHBOARD COMPLETO
+    # ========================================================
+
+    # A exportação da aba 2 depende da existência de um dossiê selecionado.
+    # Por isso, ela é criada dentro do próprio fluxo da aba 2.
+    if idx_auditoria:
+        try:
+            sim_exportacao = (
+                similares(
+                    dados_processados,
+                    i_alvo,
+                    limite=5,
+                )
+                if SKLEARN_OK
+                else pd.DataFrame()
+            )
+
+            word_aba2 = gerar_word_aba_auditoria(
+                registro=registro,
+                risco=risco,
+                sim=sim_exportacao,
+                tipo=tipo_atual,
+                inicio=inicio,
+                fim=fim,
+                modalidade=mod_escolhida,
+                filtro_risco=filtro_risco,
+                mostrar_outlier=mostrar_outlier,
+            )
+
+            st.download_button(
+                "📝 Baixar esta Aba em Word",
+                data=word_aba2,
+                file_name=(
+                    f"Dashboard_Auditoria_"
+                    f"{slug(registro['numero'])}.docx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                use_container_width=False,
+                key="download_word_aba2",
+            )
+
+            word_completo = gerar_word_dashboard_completo(
+                df_risco=df_risco,
+                df_filtrado=df_filtrado,
+                tipo=tipo_atual,
+                inicio=inicio,
+                fim=fim,
+                modalidade=mod_escolhida,
+                dados_processados=dados_processados,
+                riscos=riscos,
+                valor_total=valor_total,
+                registro=registro,
+                risco_selecionado=risco,
+                sim=sim_exportacao,
+                filtro_risco=filtro_risco,
+                mostrar_outlier=mostrar_outlier,
+            )
+
+            st.download_button(
+                "📘 Baixar Dashboard Completo (todas as abas) em Word",
+                data=word_completo,
+                file_name=(
+                    f"Dashboard_Completo_PNCP_"
+                    f"{slug(mod_escolhida)}.docx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                use_container_width=False,
+                key="download_word_completo",
+            )
+
+        except Exception as exc:
+            LOGGER.exception("Erro ao gerar Word da aba 2/dashboard completo")
+            st.error(f"Não foi possível gerar o Word: {exc}")
+
+    else:
+        # Quando nenhum dossiê está disponível, ainda permite exportar
+        # o dashboard geral com a matriz e os dados do segmento.
+        try:
+            word_completo_sem_dossie = gerar_word_dashboard_completo(
+                df_risco=df_risco,
+                df_filtrado=df_filtrado,
+                tipo=tipo_atual,
+                inicio=inicio,
+                fim=fim,
+                modalidade=mod_escolhida,
+                dados_processados=dados_processados,
+                riscos=riscos,
+                valor_total=valor_total,
+            )
+
+            st.download_button(
+                "📘 Baixar Dashboard Completo (todas as abas) em Word",
+                data=word_completo_sem_dossie,
+                file_name=(
+                    f"Dashboard_Completo_PNCP_"
+                    f"{slug(mod_escolhida)}.docx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "wordprocessingml.document"
+                ),
+                use_container_width=False,
+                key="download_word_completo_sem_dossie",
+            )
+        except Exception as exc:
+            LOGGER.exception("Erro ao gerar Word do dashboard completo")
+            st.error(f"Não foi possível gerar o Word: {exc}")
 
     # ========================================================
     # RODAPÉ
