@@ -714,6 +714,10 @@ def dados_registro(
 
     ano_contrato = primeiro(r_dict, ["anoContrato", "ano", "compra.anoCompra"], padrao=None)
     seq_contrato = primeiro(r_dict, ["sequencialContrato", "sequencial", "numeroSequencial"], padrao=None)
+    
+    # Tentativa extra para capturar variáveis necessárias para formar a URL oficial do PNCP
+    ano_url = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
+    seq_url = primeiro(r_dict, ["sequencialCompra", "sequencialContrato", "sequencialAta", "sequencial", "numeroSequencial", "compra.sequencialCompra"], padrao=None)
 
     tipo_instrumento = primeiro(
         r_dict,
@@ -807,6 +811,17 @@ def dados_registro(
     v_num = numero(val_global)
     v_ini_num = numero(val_inicial)
 
+    # Geração do Link Oficial do PNCP
+    link_pncp = None
+    if ano_url is not None and seq_url is not None:
+        cnpj_url = cnpj_limpo(CNPJ)
+        if tipo == "Contratos":
+            link_pncp = f"https://pncp.gov.br/app/contratos/{cnpj_url}/{ano_url}/{seq_url}"
+        elif tipo == "Atas de Registro de Preços":
+            link_pncp = f"https://pncp.gov.br/app/atas/{cnpj_url}/{ano_url}/{seq_url}"
+        else:
+            link_pncp = f"https://pncp.gov.br/app/editais/{cnpj_url}/{ano_url}/{seq_url}"
+
     # 1. Checagem inicial no próprio payload
     eh_termo_aditivo = False
     if str(tipo_contrato_id) == "2" or "aditivo" in str(tipo_instrumento).lower():
@@ -869,6 +884,7 @@ def dados_registro(
         "dias_para_vencer": dias_para_vencer,
         "situacao": texto(sit),
         "modalidade": texto(mod),
+        "link_pncp": link_pncp,
     }
 
 
@@ -1368,6 +1384,7 @@ def similares(
             "Objeto": texto(registro.get("objeto")),
             "Fornecedor": texto(registro.get("fornecedor")),
             "Valor": texto(registro.get("valor")),
+            "Link PNCP": registro.get("link_pncp"),
         })
         if len(saida) >= limite:
             break
@@ -1516,6 +1533,7 @@ def gerar_word_dashboard_principal(
             "Valor",
             "Fim Vigência",
             "Aditivo",
+            "Link PNCP",
             "Objeto",
             "Gatilhos",
         )
@@ -1952,6 +1970,7 @@ def main() -> None:
             "Aditivo": adit_status,
             "Objeto": registro["objeto"],
             "Gatilhos": "; ".join(risco["motivos"]),
+            "Link PNCP": registro["link_pncp"],
         })
 
     df_risco = pd.DataFrame(rows)
@@ -1968,6 +1987,15 @@ def main() -> None:
         "⏳ 2. Prazos e Aditamentos",
         "🔎 3. Auditoria de Risco Individual",
     ])
+    
+    # Configuração comum de coluna clicável para as tabelas do Streamlit
+    config_coluna_link = {
+        "Link PNCP": st.column_config.LinkColumn(
+            "Portal PNCP",
+            help="Clique para abrir a contratação na página oficial do PNCP",
+            display_text="🔗 Acessar"
+        )
+    }
 
     # ========================================================
     # ABA 1 - MATRIZ DE RISCO PRINCIPAL (COM OPÇÕES DE DOWNLOAD)
@@ -1984,6 +2012,7 @@ def main() -> None:
                 "Valor",
                 "Fim Vigência",
                 "Aditivo",
+                "Link PNCP",
                 "Objeto",
                 "Gatilhos",
             )
@@ -1994,6 +2023,7 @@ def main() -> None:
             df_risco[colunas_visualizacao],
             use_container_width=True,
             hide_index=True,
+            column_config=config_coluna_link
         )
 
         st.markdown("#### 📥 Opções de Exportação")
@@ -2095,6 +2125,7 @@ def main() -> None:
                 "Término Vigência": r["data_fim_vigencia"],
                 "Status do Prazo": status_prazo,
                 "Valor": r["valor"],
+                "Link PNCP": r["link_pncp"],
                 "Objeto": r["objeto"],
             })
         df_vig_show = pd.DataFrame(tabela_vig)
@@ -2253,7 +2284,7 @@ def main() -> None:
             sub_tab_vig, sub_tab_adit = st.tabs(["📅 Linha do Tempo de Vigências", "📊 Auditoria de Aditamentos"])
 
             with sub_tab_vig:
-                st.dataframe(df_vig_show, use_container_width=True, hide_index=True)
+                st.dataframe(df_vig_show, use_container_width=True, hide_index=True, column_config=config_coluna_link)
 
             with sub_tab_adit:
                 tabela_adit = []
@@ -2285,6 +2316,7 @@ def main() -> None:
                             "Valor Atualizado": moeda(v_fim),
                             "Variação (%)": f"+{perc_a:.2f}%" if perc_a is not None else "0.00%",
                             "Avaliação de Conformidade": status_legal,
+                            "Link PNCP": r["link_pncp"],
                             "Objeto": r["objeto"],
                         })
 
@@ -2294,6 +2326,7 @@ def main() -> None:
                         df_adit_show,
                         use_container_width=True,
                         hide_index=True,
+                        column_config=config_coluna_link
                     )
                 else:
                     if (
@@ -2323,7 +2356,7 @@ def main() -> None:
 
             st.markdown("---")
             st.markdown("### 📅 Linha do Tempo de Vigências")
-            st.dataframe(df_vig_show, use_container_width=True, hide_index=True)
+            st.dataframe(df_vig_show, use_container_width=True, hide_index=True, column_config=config_coluna_link)
 
 
     # ========================================================
@@ -2398,6 +2431,10 @@ def main() -> None:
 
                 st.info(f"**Objeto Descrito no Edital/Contrato:** {registro['objeto']}")
 
+                # Novo botão/link oficial renderizado logo abaixo das métricas do Dossiê
+                if registro["link_pncp"]:
+                    st.markdown(f"👉 [**Acessar dados oficiais e anexos no Portal PNCP**]({registro['link_pncp']})")
+
             with st.expander("🔎 Justificativa Analítica e Roteiro de Auditoria", expanded=True):
                 st.markdown("📍 **Variáveis que acionaram o alerta no sistema:**")
                 for motivo in risco["motivos"]:
@@ -2438,7 +2475,7 @@ def main() -> None:
                 if sim.empty:
                     st.info("Não foi possível identificar vizinhança semântica relevante (contratos com objetos similares) para este item.")
                 else:
-                    st.dataframe(sim, use_container_width=True, hide_index=True)
+                    st.dataframe(sim, use_container_width=True, hide_index=True, column_config=config_coluna_link)
 
     # Rodapé
     st.markdown("---")
