@@ -90,6 +90,8 @@ MUNICIPIO = "Rio das Pedras/SP"
 PREFEITURA = "Prefeitura Municipal de Rio das Pedras/SP"
 
 BASE_CONSULTA = "https://pncp.gov.br/api/consulta/v1"
+# API de serviços do PNCP: contratos, termos, histórico e documentos.
+BASE_SERVICOS = "https://pncp.gov.br/api/pncp/v1"
 
 MAX_WORKERS = max(
     1,
@@ -600,7 +602,7 @@ def buscar_termos_contrato(
         return resultado
 
     url = (
-        f"{BASE_CONSULTA}/orgaos/{cnpj}"
+        f"{BASE_SERVICOS}/orgaos/{cnpj}"
         f"/contratos/{ano_int}/{seq_int}/termos"
     )
     resultado["url"] = url
