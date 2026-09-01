@@ -727,15 +727,12 @@ def dados_registro(
     seq_url = None
     controle_str = texto(controle, "")
 
-    # O padrão oficial do PNCP é CNPJ-TIPO-SEQUENCIAL/ANO (ex: 44826840000183-3-000001/2024)
-    # A Regex captura tudo o que está após o último hífen até o final (ex: 000001/2024)
     match_controle = re.search(r'-(\d+)/(\d{4})$', controle_str.strip())
     
     if match_controle:
-        seq_url = str(int(match_controle.group(1))) # Transforma em int para remover zeros à esquerda
+        seq_url = str(int(match_controle.group(1)))
         ano_url = str(match_controle.group(2))
     else:
-        # Fallback de salvaguarda explorando chaves variadas do payload
         ano_fb = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
         if ano_fb is None or str(ano_fb).strip() in ["", "N/D", "None"]:
             ano_fb = fuzzy_match(r_dict, ["ano"], padrao=None)
@@ -752,7 +749,6 @@ def dados_registro(
         except (ValueError, TypeError):
             pass
 
-    # Garante que sempre teremos uma string válida
     link_pncp = "https://pncp.gov.br" 
     
     if ano_url and seq_url:
@@ -1222,9 +1218,15 @@ def calcular_risco(
         motivos.append("Indício emergencial")
         testes.append("Revisar caracterização e prazo emergencial")
 
-    # 3. Valor
+    # 3. Valor (Materialidade Absoluta)
     if valor is not None:
-        if valor >= 500_000:
+        if valor >= 5_000_000:
+            pontos += 60
+            motivos.append("Materialidade extrema (> R$ 5 milhões)")
+        elif valor >= 1_000_000:
+            pontos += 30
+            motivos.append("Valor muito elevado (> R$ 1 milhão)")
+        elif valor >= 500_000:
             pontos += 10
             motivos.append("Valor elevado (> R$ 500 mil)")
         elif valor >= 150_000:
