@@ -1975,17 +1975,6 @@ def main() -> None:
             if c in df_risco.columns and (c != "Aditivo" or tipo_atual == "Contratos")
         ]
         
-        st.info(
-            "💡 **Entenda os Alertas de Risco:**\n\n"
-            "**• Valor anômalo acima do limite IQR:** O sistema utiliza o método estatístico de Intervalo "
-            "Interquartil (IQR) para identificar discrepâncias financeiras. Um alerta é gerado quando o "
-            "valor foge significativamente do padrão dos demais itens do mesmo segmento (outlier). Indica a "
-            "necessidade de revisar a formação de preços e pesquisa de mercado.\n\n"
-            "**• Fornecedor concentrado:** Ocorre quando uma mesma empresa acumula um volume alto de "
-            "contratações (acima de 10% do total analisado). O alerta sugere avaliar se há dependência "
-            "econômica do fornecedor, riscos à continuidade do fornecimento ou indícios de direcionamento."
-        )
-
         st.dataframe(
             df_risco[colunas_visualizacao],
             use_container_width=True,
@@ -2322,6 +2311,17 @@ def main() -> None:
     # ABA 3 - AUDITORIA E SEMÂNTICA INDIVIDUAL
     # ========================================================
     with tab2:
+        st.info(
+            "💡 **Entenda os Alertas de Risco:**\n\n"
+            "**• Valor anômalo acima do limite IQR:** O sistema utiliza o método estatístico de Intervalo "
+            "Interquartil (IQR) para identificar discrepâncias financeiras. Um alerta é gerado quando o "
+            "valor foge significativamente do padrão dos demais itens do mesmo segmento (outlier). Indica a "
+            "necessidade de revisar a formação de preços e pesquisa de mercado.\n\n"
+            "**• Fornecedor concentrado:** Ocorre quando uma mesma empresa acumula um volume alto de "
+            "contratações (acima de 10% do total analisado). O alerta sugere avaliar se há dependência "
+            "econômica do fornecedor, riscos à continuidade do fornecimento ou indícios de direcionamento."
+        )
+
         f1, f2 = st.columns(2)
 
         filtro_risco = f1.multiselect(
