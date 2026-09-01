@@ -706,65 +706,31 @@ def dados_registro(
         r_dict,
         [
             "numeroControlePNCP",
-            "numeroControlePncp",
             "numeroControlePNCPAta",
             "numeroControlePNCPCompra",
             "idContratoPNCP",
         ],
-        padrao=""
     )
-    
-    if not controle or controle == "N/D":
-        controle = fuzzy_match(r_dict, ["controlepncp", "numerocontrole"], padrao="")
 
     ano_contrato = primeiro(r_dict, ["anoContrato", "ano", "compra.anoCompra"], padrao=None)
     seq_contrato = primeiro(r_dict, ["sequencialContrato", "sequencial", "numeroSequencial"], padrao=None)
 
-    # ========================================================
-    # EXTRAÇÃO INFALÍVEL DO LINK DO PNCP
-    # ========================================================
+    # Extração rigorosa do Ano e Sequencial diretamente do Número de Controle do PNCP
     ano_url = None
     seq_url = None
     controle_str = texto(controle, "")
 
-    # O padrão oficial do PNCP é CNPJ-TIPO-SEQUENCIAL/ANO (ex: 44826840000183-3-000001/2024)
-    # A Regex captura tudo o que está após o último hífen até o final (ex: 000001/2024)
-    match_controle = re.search(r'-(\d+)/(\d{4})$', controle_str.strip())
-    
+    # O padrão do PNCP é CNPJ-TIPO-SEQUENCIAL/ANO (ex: 44826840000183-1-000001/2024)
+    match_controle = re.search(r'-(\d+)/(\d{4})$', controle_str)
     if match_controle:
-        seq_url = str(int(match_controle.group(1))) # Transforma em int para remover zeros à esquerda
+        seq_url = str(int(match_controle.group(1))) # Transforma em int para remover zeros à esquerda, depois string
         ano_url = str(match_controle.group(2))
     else:
-        # Fallback de salvaguarda explorando chaves variadas do payload
-        ano_fb = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
-        if ano_fb is None or str(ano_fb).strip() in ["", "N/D", "None"]:
-            ano_fb = fuzzy_match(r_dict, ["ano"], padrao=None)
-            
-        seq_fb = primeiro(r_dict, ["sequencialCompra", "sequencialContrato", "sequencialAta", "sequencial", "numeroSequencial", "compra.sequencialCompra"], padrao=None)
-        if seq_fb is None or str(seq_fb).strip() in ["", "N/D", "None"]:
-            seq_fb = fuzzy_match(r_dict, ["sequencial"], padrao=None)
-            
-        try:
-            if ano_fb is not None and str(ano_fb).strip() != "" and str(ano_fb).strip() != "N/D":
-                ano_url = str(int(float(str(ano_fb).strip())))
-            if seq_fb is not None and str(seq_fb).strip() != "" and str(seq_fb).strip() != "N/D":
-                seq_url = str(int(float(str(seq_fb).strip())))
-        except (ValueError, TypeError):
-            pass
-
-    # Garante que sempre teremos uma string válida, evitando o aparecimento literal de "None"
-    link_pncp = "https://pncp.gov.br" 
-    
-    if ano_url and seq_url:
-        cnpj_url = cnpj_limpo(CNPJ)
-        if tipo == "Contratos":
-            link_pncp = f"https://pncp.gov.br/app/contratos/{cnpj_url}/{ano_url}/{seq_url}"
-        elif tipo == "Atas de Registro de Preços":
-            link_pncp = f"https://pncp.gov.br/app/atas/{cnpj_url}/{ano_url}/{seq_url}"
-        else:
-            link_pncp = f"https://pncp.gov.br/app/editais/{cnpj_url}/{ano_url}/{seq_url}"
-
-    # ========================================================
+        # Fallback caso a API mude ou o regex falhe
+        ano_fallback = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
+        seq_fallback = primeiro(r_dict, ["sequencialCompra", "sequencialContrato", "sequencialAta", "sequencial", "numeroSequencial", "compra.sequencialCompra"], padrao=None)
+        if ano_fallback is not None: ano_url = str(ano_fallback)
+        if seq_fallback is not None: seq_url = str(seq_fallback)
 
     tipo_instrumento = primeiro(
         r_dict,
@@ -858,6 +824,17 @@ def dados_registro(
     v_num = numero(val_global)
     v_ini_num = numero(val_inicial)
 
+    # Geração do Link Oficial do PNCP
+    link_pncp = None
+    if ano_url is not None and seq_url is not None:
+        cnpj_url = cnpj_limpo(CNPJ)
+        if tipo == "Contratos":
+            link_pncp = f"https://pncp.gov.br/app/contratos/{cnpj_url}/{ano_url}/{seq_url}"
+        elif tipo == "Atas de Registro de Preços":
+            link_pncp = f"https://pncp.gov.br/app/atas/{cnpj_url}/{ano_url}/{seq_url}"
+        else:
+            link_pncp = f"https://pncp.gov.br/app/editais/{cnpj_url}/{ano_url}/{seq_url}"
+
     # 1. Checagem inicial no próprio payload
     eh_termo_aditivo = False
     if str(tipo_contrato_id) == "2" or "aditivo" in str(tipo_instrumento).lower():
@@ -898,7 +875,7 @@ def dados_registro(
         dias_para_vencer = int((ts_fim_vig - hoje).days)
 
     return {
-        "controle": texto(controle),
+        "controle": controle_str,
         "numero": texto(num),
         "processo": texto(proc),
         "ano_contrato": ano_contrato,
@@ -1420,7 +1397,7 @@ def similares(
             "Objeto": texto(registro.get("objeto")),
             "Fornecedor": texto(registro.get("fornecedor")),
             "Valor": texto(registro.get("valor")),
-            "Link PNCP": registro.get("link_pncp", "https://pncp.gov.br"),
+            "Link PNCP": registro.get("link_pncp"),
         })
         if len(saida) >= limite:
             break
@@ -2006,7 +1983,7 @@ def main() -> None:
             "Aditivo": adit_status,
             "Objeto": registro["objeto"],
             "Gatilhos": "; ".join(risco["motivos"]),
-            "Link PNCP": registro.get("link_pncp", "https://pncp.gov.br"),
+            "Link PNCP": registro["link_pncp"],
         })
 
     df_risco = pd.DataFrame(rows)
@@ -2161,7 +2138,7 @@ def main() -> None:
                 "Término Vigência": r["data_fim_vigencia"],
                 "Status do Prazo": status_prazo,
                 "Valor": r["valor"],
-                "Link PNCP": r.get("link_pncp", "https://pncp.gov.br"),
+                "Link PNCP": r["link_pncp"],
                 "Objeto": r["objeto"],
             })
         df_vig_show = pd.DataFrame(tabela_vig)
@@ -2352,7 +2329,7 @@ def main() -> None:
                             "Valor Atualizado": moeda(v_fim),
                             "Variação (%)": f"+{perc_a:.2f}%" if perc_a is not None else "0.00%",
                             "Avaliação de Conformidade": status_legal,
-                            "Link PNCP": r.get("link_pncp", "https://pncp.gov.br"),
+                            "Link PNCP": r["link_pncp"],
                             "Objeto": r["objeto"],
                         })
 
@@ -2468,7 +2445,7 @@ def main() -> None:
                 st.info(f"**Objeto Descrito no Edital/Contrato:** {registro['objeto']}")
 
                 # Novo botão/link oficial renderizado logo abaixo das métricas do Dossiê
-                if registro.get("link_pncp"):
+                if registro["link_pncp"]:
                     st.markdown(f"👉 [**Acessar dados oficiais e anexos no Portal PNCP**]({registro['link_pncp']})")
 
             with st.expander("🔎 Justificativa Analítica e Roteiro de Auditoria", expanded=True):
