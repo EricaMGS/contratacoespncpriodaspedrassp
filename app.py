@@ -562,22 +562,134 @@ def buscar_termos_contrato(
     cnpj_orgao: str,
     ano: Any,
     sequencial: Any,
-) -> List[Dict[str, Any]]:
-    """Consulta os termos aditivos vinculados a um contrato específico."""
-    if valor_vazio(ano) or valor_vazio(sequencial):
-        return []
+) -> Dict[str, Any]:
+    """Consulta os termos vinculados a um contrato e preserva o diagnóstico real.
 
-    url = f"{BASE_CONSULTA}/orgaos/{cnpj_limpo(cnpj_orgao)}/contratos/{ano}/{sequencial}/termos"
+    Retorna um dicionário com status explícito, em vez de transformar
+    ausência de registros, HTTP 404 e falhas de comunicação em uma única
+    lista vazia.
+    """
+
+    resultado = {
+        "status": "SEM_IDENTIFICADORES",
+        "termos": [],
+        "http_status": None,
+        "mensagem": "",
+        "url": "",
+    }
+
+    if valor_vazio(ano) or valor_vazio(sequencial):
+        resultado["mensagem"] = (
+            "O contrato não possui anoContrato e/ou sequencialContrato "
+            "disponíveis para consulta dos termos."
+        )
+        return resultado
+
+    cnpj = cnpj_limpo(cnpj_orgao)
+    if not cnpj:
+        resultado["mensagem"] = "CNPJ do órgão não disponível para consulta."
+        return resultado
+
     try:
-        dados = get_json(url)
-        if isinstance(dados, list):
-            return [d for d in dados if isinstance(d, dict)]
-        if isinstance(dados, dict) and "data" in dados and isinstance(dados["data"], list):
-            return [d for d in dados["data"] if isinstance(d, dict)]
-        return []
-    except Exception as exc:
-        LOGGER.debug("Termos não encontrados para %s/%s: %s", ano, sequencial, exc)
-        return []
+        ano_int = int(ano)
+        seq_int = int(sequencial)
+    except (TypeError, ValueError):
+        resultado["mensagem"] = (
+            f"Identificadores inválidos: ano={ano!r}, sequencial={sequencial!r}."
+        )
+        return resultado
+
+    url = (
+        f"{BASE_CONSULTA}/orgaos/{cnpj}"
+        f"/contratos/{ano_int}/{seq_int}/termos"
+    )
+    resultado["url"] = url
+
+    session = sessao_http()
+
+    try:
+        response = session.get(url, timeout=TIMEOUT)
+    except requests.exceptions.Timeout:
+        resultado["status"] = "ERRO_CONSULTA"
+        resultado["mensagem"] = "Tempo limite excedido ao consultar os termos no PNCP."
+        LOGGER.warning("Timeout na consulta de termos %s/%s", ano_int, seq_int)
+        return resultado
+    except requests.exceptions.ConnectionError:
+        resultado["status"] = "ERRO_CONSULTA"
+        resultado["mensagem"] = "Não foi possível estabelecer conexão com o PNCP."
+        LOGGER.warning("Erro de conexão na consulta de termos %s/%s", ano_int, seq_int)
+        return resultado
+    except requests.exceptions.RequestException as exc:
+        resultado["status"] = "ERRO_CONSULTA"
+        resultado["mensagem"] = f"Erro de comunicação com o PNCP: {exc}"
+        LOGGER.warning("Erro de requisição na consulta de termos %s/%s: %s", ano_int, seq_int, exc)
+        return resultado
+
+    resultado["http_status"] = response.status_code
+
+    if response.status_code == 200:
+        try:
+            payload = response.json()
+        except ValueError:
+            resultado["status"] = "RESPOSTA_INVALIDA"
+            resultado["mensagem"] = (
+                "O PNCP respondeu HTTP 200, mas o conteúdo não pôde ser "
+                "interpretado como JSON."
+            )
+            return resultado
+
+        termos = registros_api(payload)
+
+        if not termos:
+            resultado["status"] = "SEM_REGISTROS"
+            resultado["mensagem"] = (
+                "Consulta realizada com sucesso. O PNCP não retornou "
+                "termos vinculados a este contrato."
+            )
+            return resultado
+
+        resultado["status"] = "REGISTROS_ENCONTRADOS"
+        resultado["termos"] = termos
+        resultado["mensagem"] = f"{len(termos)} termo(s) localizado(s) no PNCP."
+        return resultado
+
+    if response.status_code == 204:
+        resultado["status"] = "SEM_REGISTROS"
+        resultado["mensagem"] = (
+            "O PNCP respondeu HTTP 204 (sem conteúdo). Nenhum termo foi retornado."
+        )
+        return resultado
+
+    if response.status_code == 404:
+        resultado["status"] = "HTTP_404"
+        resultado["mensagem"] = (
+            "O PNCP respondeu HTTP 404 para o recurso de termos. "
+            "Isso não deve ser interpretado automaticamente como ausência de aditivos."
+        )
+        LOGGER.warning("HTTP 404 na consulta de termos %s/%s", ano_int, seq_int)
+        return resultado
+
+    if response.status_code == 429:
+        resultado["status"] = "ERRO_CONSULTA"
+        resultado["mensagem"] = (
+            "O PNCP informou limite de requisições (HTTP 429). "
+            "A consulta dos termos não pôde ser concluída."
+        )
+        return resultado
+
+    if response.status_code in (500, 502, 503, 504):
+        resultado["status"] = "ERRO_CONSULTA"
+        resultado["mensagem"] = (
+            f"O PNCP apresentou indisponibilidade temporária "
+            f"(HTTP {response.status_code})."
+        )
+        return resultado
+
+    resultado["status"] = "ERRO_CONSULTA"
+    resultado["mensagem"] = (
+        f"O PNCP respondeu HTTP {response.status_code}: {detalhe_http(response)}"
+    )
+    return resultado
 
 
 def dados_registro(
@@ -705,9 +817,23 @@ def dados_registro(
 
     # 2. Busca ativa nos sub-recursos de Termos do PNCP para contratos
     termos_vinculados = []
-    if tipo == "Contratos" and ano_contrato and seq_contrato:
-        termos_vinculados = buscar_termos_contrato(CNPJ, ano_contrato, seq_contrato)
-        if termos_vinculados:
+    diagnostico_aditivo = {
+        "status": "NAO_CONSULTADO",
+        "termos": [],
+        "http_status": None,
+        "mensagem": "Consulta de termos não executada para este registro.",
+        "url": "",
+    }
+
+    if tipo == "Contratos":
+        diagnostico_aditivo = buscar_termos_contrato(
+            CNPJ,
+            ano_contrato,
+            seq_contrato,
+        )
+        termos_vinculados = diagnostico_aditivo.get("termos", [])
+
+        if diagnostico_aditivo.get("status") == "REGISTROS_ENCONTRADOS":
             eh_termo_aditivo = True
 
     # 3. Cálculo de variação percentual de aditivos
@@ -731,6 +857,7 @@ def dados_registro(
         "eh_aditivo": eh_termo_aditivo,
         "qtd_termos_aditivos": len(termos_vinculados),
         "termos_detalhes": termos_vinculados,
+        "diagnostico_aditivo": diagnostico_aditivo,
         "objeto": texto(obj),
         "fornecedor": texto(forn),
         "cnpj_fornecedor": cnpj_limpo(cnpj),
@@ -1933,6 +2060,121 @@ def main() -> None:
         m2.metric("⚠️ Vencem entre 31 e 90 dias", len(vencendo_90))
         m3.metric("📈 Termos Aditivos Identificados", len(total_aditivos))
 
+        # ========================================================
+        # DIAGNÓSTICO REAL DA CONSULTA DE ADITIVOS
+        # ========================================================
+        if tipo_atual == "Contratos":
+            diagnosticos = [
+                r.get("diagnostico_aditivo", {})
+                for r in dados_processados
+            ]
+
+            total_contratos = len(diagnosticos)
+            qtd_encontrados = sum(
+                d.get("status") == "REGISTROS_ENCONTRADOS"
+                for d in diagnosticos
+            )
+            qtd_sem_registros = sum(
+                d.get("status") == "SEM_REGISTROS"
+                for d in diagnosticos
+            )
+            qtd_sem_identificadores = sum(
+                d.get("status") == "SEM_IDENTIFICADORES"
+                for d in diagnosticos
+            )
+            qtd_404 = sum(
+                d.get("status") == "HTTP_404"
+                for d in diagnosticos
+            )
+            qtd_erros = sum(
+                d.get("status") in {"ERRO_CONSULTA", "RESPOSTA_INVALIDA"}
+                for d in diagnosticos
+            )
+
+            st.markdown("### 🔎 Diagnóstico da Consulta de Aditivos")
+
+            d1, d2, d3, d4, d5 = st.columns(5)
+            d1.metric("Contratos analisados", total_contratos)
+            d2.metric("🟢 Com termos", qtd_encontrados)
+            d3.metric("⚪ Sem termos", qtd_sem_registros)
+            d4.metric("🟡 Sem identificadores", qtd_sem_identificadores)
+            d5.metric("🔴 Falhas", qtd_erros + qtd_404)
+
+            if qtd_encontrados > 0:
+                st.success(
+                    f"✅ O PNCP retornou termos para {qtd_encontrados} contrato(s). "
+                    "Esses registros foram considerados na análise de aditamentos."
+                )
+
+            if qtd_sem_registros > 0:
+                st.info(
+                    f"ℹ️ {qtd_sem_registros} contrato(s) foram consultados com sucesso "
+                    "e não apresentaram termos retornados pelo PNCP."
+                )
+
+            if qtd_sem_identificadores > 0:
+                st.warning(
+                    f"⚠️ {qtd_sem_identificadores} contrato(s) não puderam ter os termos "
+                    "consultados porque anoContrato e/ou sequencialContrato não foram "
+                    "encontrados no registro retornado pelo PNCP."
+                )
+
+            if qtd_404 > 0:
+                st.warning(
+                    f"🟠 {qtd_404} consulta(s) retornaram HTTP 404. Isso significa que o "
+                    "recurso de termos não foi localizado pelo endpoint consultado; não "
+                    "é correto concluir apenas por isso que não existem aditivos."
+                )
+
+            if qtd_erros > 0:
+                st.error(
+                    f"🔴 {qtd_erros} consulta(s) apresentaram erro ou resposta inválida. "
+                    "Não é possível usar esses casos para afirmar ausência de aditivos."
+                )
+
+            with st.expander("📋 Detalhes técnicos das consultas", expanded=False):
+                resumo_diagnostico = pd.DataFrame([
+                    {"Situação": "Termos encontrados", "Quantidade": qtd_encontrados},
+                    {"Situação": "Consulta realizada sem termos", "Quantidade": qtd_sem_registros},
+                    {"Situação": "Identificadores ausentes", "Quantidade": qtd_sem_identificadores},
+                    {"Situação": "HTTP 404", "Quantidade": qtd_404},
+                    {"Situação": "Erro/resposta inválida", "Quantidade": qtd_erros},
+                ])
+                st.dataframe(
+                    resumo_diagnostico,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                detalhes_diagnostico = []
+                for r in dados_processados:
+                    diag = r.get("diagnostico_aditivo", {})
+                    status = diag.get("status", "NAO_CONSULTADO")
+                    rotulos = {
+                        "REGISTROS_ENCONTRADOS": "🟢 Termo(s) encontrado(s)",
+                        "SEM_REGISTROS": "⚪ Consulta realizada — nenhum termo",
+                        "SEM_IDENTIFICADORES": "🟡 Identificadores insuficientes",
+                        "HTTP_404": "🟠 HTTP 404",
+                        "ERRO_CONSULTA": "🔴 Erro na consulta",
+                        "RESPOSTA_INVALIDA": "🔴 Resposta inválida",
+                        "NAO_CONSULTADO": "⚪ Não consultado",
+                    }
+                    detalhes_diagnostico.append({
+                        "Contrato": r.get("numero", "N/D"),
+                        "Ano": r.get("ano_contrato", "N/D"),
+                        "Sequencial": r.get("sequencial_contrato", "N/D"),
+                        "Situação": rotulos.get(status, status),
+                        "HTTP": diag.get("http_status", ""),
+                        "Termos": len(diag.get("termos", [])),
+                        "Mensagem": diag.get("mensagem", ""),
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(detalhes_diagnostico),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
         st.markdown("---")
 
         sub_tab_vig, sub_tab_adit = st.tabs(["📅 Linha do Tempo de Vigências", "📊 Auditoria de Aditamentos"])
@@ -2001,9 +2243,57 @@ def main() -> None:
 
             if tabela_adit:
                 df_adit_show = pd.DataFrame(tabela_adit)
-                st.dataframe(df_adit_show, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    df_adit_show,
+                    use_container_width=True,
+                    hide_index=True,
+                )
             else:
-                st.info("Nenhum termo aditivo ou contrato com aditamento de valor localizado no período filtrado.")
+                if tipo_atual == "Contratos":
+                    diagnosticos = [
+                        r.get("diagnostico_aditivo", {})
+                        for r in dados_processados
+                    ]
+                    qtd_sem_registros = sum(
+                        d.get("status") == "SEM_REGISTROS"
+                        for d in diagnosticos
+                    )
+                    qtd_sem_identificadores = sum(
+                        d.get("status") == "SEM_IDENTIFICADORES"
+                        for d in diagnosticos
+                    )
+                    qtd_404 = sum(
+                        d.get("status") == "HTTP_404"
+                        for d in diagnosticos
+                    )
+                    qtd_erros = sum(
+                        d.get("status") in {"ERRO_CONSULTA", "RESPOSTA_INVALIDA"}
+                        for d in diagnosticos
+                    )
+
+                    if (
+                        qtd_sem_registros > 0
+                        and qtd_sem_identificadores == 0
+                        and qtd_404 == 0
+                        and qtd_erros == 0
+                    ):
+                        st.success(
+                            "✅ As consultas aos termos foram realizadas com sucesso. "
+                            "Nenhum termo aditivo foi retornado pelo PNCP para os "
+                            "contratos analisados."
+                        )
+                    else:
+                        st.warning(
+                            "⚠️ Nenhum aditivo foi exibido na tabela, mas isso não "
+                            "permite concluir que não existam aditivos. Consulte o "
+                            "diagnóstico acima para verificar as consultas que não "
+                            "puderam ser concluídas."
+                        )
+                else:
+                    st.info(
+                        "ℹ️ Nenhum termo aditivo ou contrato com aditamento de valor "
+                        "localizado no período filtrado."
+                    )
 
     # ========================================================
     # ABA 3 - AUDITORIA E SEMÂNTICA INDIVIDUAL
