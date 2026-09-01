@@ -527,6 +527,7 @@ def primeiro(
 def fuzzy_match(
     row_dict: Dict[str, Any],
     palavras: Sequence[str],
+    padrao: Any = None
 ) -> Any:
     """Busca aproximada pelo nome do campo como fallback."""
 
@@ -553,7 +554,7 @@ def fuzzy_match(
 
         return valor
 
-    return None
+    return padrao
 
 
 # ============================================================
@@ -565,12 +566,7 @@ def buscar_termos_contrato(
     ano: Any,
     sequencial: Any,
 ) -> Dict[str, Any]:
-    """Consulta os termos vinculados a um contrato e preserva o diagnóstico real.
-
-    Retorna um dicionário com status explícito, em vez de transformar
-    ausência de registros, HTTP 404 e falhas de comunicação em uma única
-    lista vazia.
-    """
+    """Consulta os termos vinculados a um contrato e preserva o diagnóstico real."""
 
     resultado = {
         "status": "SEM_IDENTIFICADORES",
@@ -1204,28 +1200,29 @@ def calcular_risco(
             motivos.append(f"⏳ Vencimento próximo ({dias_venc} dias restantes)")
             testes.append("Acompanhar planejamento do encerramento da vigência")
 
-    # 6. Monitoramento de Aditamentos (Lei 14.133/21)
-    perc_adit = registro.get("perc_aditivo")
-    eh_adit = registro.get("eh_aditivo", False)
-    qtd_termos = registro.get("qtd_termos_aditivos", 0)
+    # 6. Monitoramento de Aditamentos (Lei 14.133/21) - Apenas Contratos
+    if tipo == "Contratos":
+        perc_adit = registro.get("perc_aditivo")
+        eh_adit = registro.get("eh_aditivo", False)
+        qtd_termos = registro.get("qtd_termos_aditivos", 0)
 
-    if perc_adit is not None:
-        if perc_adit > 50.0:
-            pontos += 30
-            motivos.append(f"⚠️ Aditivo financeiro expressivo (+{perc_adit:.1f}%), acima de 50%")
-            testes.append("Auditar termo aditivo: extrapolação do teto legal de 50% para reformas/edifícios")
-        elif perc_adit > 25.0:
-            pontos += 15
-            motivos.append(f"⚠️ Aditivo financeiro relevante (+{perc_adit:.1f}%), acima de 25%")
-            testes.append("Auditar termo aditivo: verificar enquadramento legal e justificativa técnica (> 25%)")
-        elif perc_adit > 0:
+        if perc_adit is not None:
+            if perc_adit > 50.0:
+                pontos += 30
+                motivos.append(f"⚠️ Aditivo financeiro expressivo (+{perc_adit:.1f}%), acima de 50%")
+                testes.append("Auditar termo aditivo: extrapolação do teto legal de 50% para reformas/edifícios")
+            elif perc_adit > 25.0:
+                pontos += 15
+                motivos.append(f"⚠️ Aditivo financeiro relevante (+{perc_adit:.1f}%), acima de 25%")
+                testes.append("Auditar termo aditivo: verificar enquadramento legal e justificativa técnica (> 25%)")
+            elif perc_adit > 0:
+                pontos += 5
+                motivos.append(f"Contrato com aditamento financeiro (+{perc_adit:.1f}%)")
+
+        if eh_adit or qtd_termos > 0:
             pontos += 5
-            motivos.append(f"Contrato com aditamento financeiro (+{perc_adit:.1f}%)")
-
-    if eh_adit or qtd_termos > 0:
-        pontos += 5
-        motivos.append(f"Termo Aditivo formal identificado ({qtd_termos} aditivo(s) no PNCP)")
-        testes.append("Revisar motivação formal e anexos do termo aditivo")
+            motivos.append(f"Termo Aditivo formal identificado ({qtd_termos} aditivo(s) no PNCP)")
+            testes.append("Revisar motivação formal e anexos do termo aditivo")
 
     # 7. Concentração de Fornecedor
     fornecedor = texto(registro.get("fornecedor"), "").strip()
@@ -1521,7 +1518,7 @@ def gerar_word_dashboard_principal(
             "Objeto",
             "Gatilhos",
         )
-        if c in df_risco.columns
+        if c in df_risco.columns and (c != "Aditivo" or tipo == "Contratos")
     ]
 
     _adicionar_tabela_word(
@@ -1975,8 +1972,19 @@ def main() -> None:
                 "Objeto",
                 "Gatilhos",
             )
-            if c in df_risco.columns
+            if c in df_risco.columns and (c != "Aditivo" or tipo_atual == "Contratos")
         ]
+        
+        st.info(
+            "💡 **Entenda os Alertas de Risco:**\n\n"
+            "**• Valor anômalo acima do limite IQR:** O sistema utiliza o método estatístico de Intervalo "
+            "Interquartil (IQR) para identificar discrepâncias financeiras. Um alerta é gerado quando o "
+            "valor foge significativamente do padrão dos demais itens do mesmo segmento (outlier). Indica a "
+            "necessidade de revisar a formação de preços e pesquisa de mercado.\n\n"
+            "**• Fornecedor concentrado:** Ocorre quando uma mesma empresa acumula um volume alto de "
+            "contratações (acima de 10% do total analisado). O alerta sugere avaliar se há dependência "
+            "econômica do fornecedor, riscos à continuidade do fornecimento ou indícios de direcionamento."
+        )
 
         st.dataframe(
             df_risco[colunas_visualizacao],
@@ -2041,31 +2049,64 @@ def main() -> None:
     # ABA 2 - VIGÊNCIA E ADITIVOS LEGAIS
     # ========================================================
     with tab_vigencia:
-        st.subheader("⏱️ Monitoramento Preditivo de Vigência & Limites da Lei 14.133/21")
-        st.markdown(
-            "Rastreamento de contratos com prazo expirando para planejamento de novas contratações "
-            "e verificação de aditamentos formais e financeiros (+25% em geral / +50% reformas)."
-        )
+        if tipo_atual == "Contratos":
+            st.subheader("⏱️ Monitoramento Preditivo de Vigência & Limites da Lei 14.133/21")
+            st.markdown(
+                "Rastreamento de contratos com prazo expirando para planejamento de novas contratações "
+                "e verificação de aditamentos formais e financeiros (+25% em geral / +50% reformas)."
+            )
+        else:
+            st.subheader("⏱️ Monitoramento Preditivo de Vigência")
+            st.markdown(
+                "Rastreamento de prazos expirando para planejamento tempestivo de novas licitações."
+            )
 
         vencendo_30 = [r for r in dados_processados if r.get("dias_para_vencer") is not None and 0 <= r["dias_para_vencer"] <= 30]
         vencendo_90 = [r for r in dados_processados if r.get("dias_para_vencer") is not None and 30 < r["dias_para_vencer"] <= 90]
         
-        total_aditivos = [
-            r for r in dados_processados 
-            if r.get("eh_aditivo", False) 
-            or (r.get("qtd_termos_aditivos", 0) > 0)
-            or (r.get("perc_aditivo") is not None and r["perc_aditivo"] > 0)
-        ]
+        # Preparação comum da tabela de vigências
+        tabela_vig = []
+        for r in dados_processados:
+            dias_rest = r.get("dias_para_vencer")
+            if dias_rest is None:
+                status_prazo = "⚪ Não informado"
+            elif dias_rest < 0:
+                status_prazo = f"⚫ Encerrado ({abs(dias_rest)}d atrás)"
+            elif dias_rest <= 30:
+                status_prazo = f"🔴 Crítico ({dias_rest} dias)"
+            elif dias_rest <= 90:
+                status_prazo = f"🟡 Atenção ({dias_rest} dias)"
+            else:
+                status_prazo = f"🟢 Regular ({dias_rest} dias)"
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("🚨 Vencem em até 30 dias", len(vencendo_30))
-        m2.metric("⚠️ Vencem entre 31 e 90 dias", len(vencendo_90))
-        m3.metric("📈 Termos Aditivos Identificados", len(total_aditivos))
+            tabela_vig.append({
+                "Número": r["numero"],
+                "Tipo": r["tipo_instrumento"],
+                "Fornecedor": r["fornecedor"],
+                "Data Assinatura": r["data"],
+                "Término Vigência": r["data_fim_vigencia"],
+                "Status do Prazo": status_prazo,
+                "Valor": r["valor"],
+                "Objeto": r["objeto"],
+            })
+        df_vig_show = pd.DataFrame(tabela_vig)
 
-        # ========================================================
-        # DIAGNÓSTICO REAL DA CONSULTA DE ADITIVOS
-        # ========================================================
         if tipo_atual == "Contratos":
+            total_aditivos = [
+                r for r in dados_processados 
+                if r.get("eh_aditivo", False) 
+                or (r.get("qtd_termos_aditivos", 0) > 0)
+                or (r.get("perc_aditivo") is not None and r["perc_aditivo"] > 0)
+            ]
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("🚨 Vencem em até 30 dias", len(vencendo_30))
+            m2.metric("⚠️ Vencem entre 31 e 90 dias", len(vencendo_90))
+            m3.metric("📈 Termos Aditivos Identificados", len(total_aditivos))
+
+            # ========================================================
+            # DIAGNÓSTICO REAL DA CONSULTA DE ADITIVOS
+            # ========================================================
             diagnosticos = [
                 r.get("diagnostico_aditivo", {})
                 for r in dados_processados
@@ -2199,102 +2240,54 @@ def main() -> None:
                     hide_index=True,
                 )
 
-        st.markdown("---")
+            st.markdown("---")
 
-        sub_tab_vig, sub_tab_adit = st.tabs(["📅 Linha do Tempo de Vigências", "📊 Auditoria de Aditamentos"])
+            sub_tab_vig, sub_tab_adit = st.tabs(["📅 Linha do Tempo de Vigências", "📊 Auditoria de Aditamentos"])
 
-        with sub_tab_vig:
-            tabela_vig = []
-            for r in dados_processados:
-                dias_rest = r.get("dias_para_vencer")
-                if dias_rest is None:
-                    status_prazo = "⚪ Não informado"
-                elif dias_rest < 0:
-                    status_prazo = f"⚫ Encerrado ({abs(dias_rest)}d atrás)"
-                elif dias_rest <= 30:
-                    status_prazo = f"🔴 Crítico ({dias_rest} dias)"
-                elif dias_rest <= 90:
-                    status_prazo = f"🟡 Atenção ({dias_rest} dias)"
+            with sub_tab_vig:
+                st.dataframe(df_vig_show, use_container_width=True, hide_index=True)
+
+            with sub_tab_adit:
+                tabela_adit = []
+                for r in dados_processados:
+                    perc_a = r.get("perc_aditivo")
+                    eh_adit = r.get("eh_aditivo", False)
+                    qtd_t = r.get("qtd_termos_aditivos", 0)
+                    v_ini = r.get("valor_inicial_num")
+                    v_fim = r.get("valor_num")
+
+                    if eh_adit or qtd_t > 0 or (perc_a is not None and perc_a > 0):
+                        if perc_a is not None and perc_a > 50:
+                            status_legal = "🔴 > 50% (Risco Alto)"
+                        elif perc_a is not None and perc_a > 25:
+                            status_legal = "🟡 > 25% (Risco Médio)"
+                        elif perc_a is not None and perc_a > 0:
+                            status_legal = "🟢 Aditivo Finance Regular"
+                        elif qtd_t > 0:
+                            status_legal = f"ℹ️ {qtd_t} Termo(s) Aditivo(s) no PNCP"
+                        else:
+                            status_legal = "ℹ️ Aditivo de Prazo / Qualitativo"
+
+                        tabela_adit.append({
+                            "Número": r["numero"],
+                            "Tipo de Instrumento": r["tipo_instrumento"],
+                            "Termos no PNCP": qtd_t,
+                            "Fornecedor": r["fornecedor"],
+                            "Valor Inicial": moeda(v_ini) if v_ini else "N/D",
+                            "Valor Atualizado": moeda(v_fim),
+                            "Variação (%)": f"+{perc_a:.2f}%" if perc_a is not None else "0.00%",
+                            "Avaliação de Conformidade": status_legal,
+                            "Objeto": r["objeto"],
+                        })
+
+                if tabela_adit:
+                    df_adit_show = pd.DataFrame(tabela_adit)
+                    st.dataframe(
+                        df_adit_show,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
                 else:
-                    status_prazo = f"🟢 Regular ({dias_rest} dias)"
-
-                tabela_vig.append({
-                    "Número": r["numero"],
-                    "Tipo": r["tipo_instrumento"],
-                    "Fornecedor": r["fornecedor"],
-                    "Data Assinatura": r["data"],
-                    "Término Vigência": r["data_fim_vigencia"],
-                    "Status do Prazo": status_prazo,
-                    "Valor": r["valor"],
-                    "Objeto": r["objeto"],
-                })
-
-            df_vig_show = pd.DataFrame(tabela_vig)
-            st.dataframe(df_vig_show, use_container_width=True, hide_index=True)
-
-        with sub_tab_adit:
-            tabela_adit = []
-            for r in dados_processados:
-                perc_a = r.get("perc_aditivo")
-                eh_adit = r.get("eh_aditivo", False)
-                qtd_t = r.get("qtd_termos_aditivos", 0)
-                v_ini = r.get("valor_inicial_num")
-                v_fim = r.get("valor_num")
-
-                if eh_adit or qtd_t > 0 or (perc_a is not None and perc_a > 0):
-                    if perc_a is not None and perc_a > 50:
-                        status_legal = "🔴 > 50% (Risco Alto)"
-                    elif perc_a is not None and perc_a > 25:
-                        status_legal = "🟡 > 25% (Risco Médio)"
-                    elif perc_a is not None and perc_a > 0:
-                        status_legal = "🟢 Aditivo Financeiro Regular"
-                    elif qtd_t > 0:
-                        status_legal = f"ℹ️ {qtd_t} Termo(s) Aditivo(s) no PNCP"
-                    else:
-                        status_legal = "ℹ️ Aditivo de Prazo / Qualitativo"
-
-                    tabela_adit.append({
-                        "Número": r["numero"],
-                        "Tipo de Instrumento": r["tipo_instrumento"],
-                        "Termos no PNCP": qtd_t,
-                        "Fornecedor": r["fornecedor"],
-                        "Valor Inicial": moeda(v_ini) if v_ini else "N/D",
-                        "Valor Atualizado": moeda(v_fim),
-                        "Variação (%)": f"+{perc_a:.2f}%" if perc_a is not None else "0.00%",
-                        "Avaliação de Conformidade": status_legal,
-                        "Objeto": r["objeto"],
-                    })
-
-            if tabela_adit:
-                df_adit_show = pd.DataFrame(tabela_adit)
-                st.dataframe(
-                    df_adit_show,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            else:
-                if tipo_atual == "Contratos":
-                    diagnosticos = [
-                        r.get("diagnostico_aditivo", {})
-                        for r in dados_processados
-                    ]
-                    qtd_sem_registros = sum(
-                        d.get("status") == "SEM_REGISTROS"
-                        for d in diagnosticos
-                    )
-                    qtd_sem_identificadores = sum(
-                        d.get("status") == "SEM_IDENTIFICADORES"
-                        for d in diagnosticos
-                    )
-                    qtd_404 = sum(
-                        d.get("status") == "HTTP_404"
-                        for d in diagnosticos
-                    )
-                    qtd_erros = sum(
-                        d.get("status") in {"ERRO_CONSULTA", "RESPOSTA_INVALIDA"}
-                        for d in diagnosticos
-                    )
-
                     if (
                         qtd_sem_registros > 0
                         and qtd_sem_identificadores == 0
@@ -2313,11 +2306,17 @@ def main() -> None:
                             "diagnóstico acima para verificar as consultas que não "
                             "puderam ser concluídas."
                         )
-                else:
-                    st.info(
-                        "ℹ️ Nenhum termo aditivo ou contrato com aditamento de valor "
-                        "localizado no período filtrado."
-                    )
+
+        else:
+            # Caso não seja Contratos (Atas ou Editais), renderiza vigência diretamente sem a lógica de aditivos
+            m1, m2 = st.columns(2)
+            m1.metric("🚨 Vencem em até 30 dias", len(vencendo_30))
+            m2.metric("⚠️ Vencem entre 31 e 90 dias", len(vencendo_90))
+
+            st.markdown("---")
+            st.markdown("### 📅 Linha do Tempo de Vigências")
+            st.dataframe(df_vig_show, use_container_width=True, hide_index=True)
+
 
     # ========================================================
     # ABA 3 - AUDITORIA E SEMÂNTICA INDIVIDUAL
