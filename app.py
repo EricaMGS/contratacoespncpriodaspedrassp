@@ -706,31 +706,65 @@ def dados_registro(
         r_dict,
         [
             "numeroControlePNCP",
+            "numeroControlePncp",
             "numeroControlePNCPAta",
             "numeroControlePNCPCompra",
             "idContratoPNCP",
         ],
+        padrao=""
     )
+    
+    if not controle or controle == "N/D":
+        controle = fuzzy_match(r_dict, ["controlepncp", "numerocontrole"], padrao="")
 
     ano_contrato = primeiro(r_dict, ["anoContrato", "ano", "compra.anoCompra"], padrao=None)
     seq_contrato = primeiro(r_dict, ["sequencialContrato", "sequencial", "numeroSequencial"], padrao=None)
 
-    # Extração rigorosa do Ano e Sequencial diretamente do Número de Controle do PNCP
+    # ========================================================
+    # EXTRAÇÃO INFALÍVEL DO LINK DO PNCP
+    # ========================================================
     ano_url = None
     seq_url = None
     controle_str = texto(controle, "")
 
-    # O padrão do PNCP é CNPJ-TIPO-SEQUENCIAL/ANO (ex: 44826840000183-1-000001/2024)
-    match_controle = re.search(r'-(\d+)/(\d{4})$', controle_str)
+    # O padrão oficial do PNCP é CNPJ-TIPO-SEQUENCIAL/ANO (ex: 44826840000183-3-000001/2024)
+    # A Regex captura tudo o que está após o último hífen até o final (ex: 000001/2024)
+    match_controle = re.search(r'-(\d+)/(\d{4})$', controle_str.strip())
+    
     if match_controle:
-        seq_url = str(int(match_controle.group(1))) # Transforma em int para remover zeros à esquerda, depois string
+        seq_url = str(int(match_controle.group(1))) # Transforma em int para remover zeros à esquerda
         ano_url = str(match_controle.group(2))
     else:
-        # Fallback caso a API mude ou o regex falhe
-        ano_fallback = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
-        seq_fallback = primeiro(r_dict, ["sequencialCompra", "sequencialContrato", "sequencialAta", "sequencial", "numeroSequencial", "compra.sequencialCompra"], padrao=None)
-        if ano_fallback is not None: ano_url = str(ano_fallback)
-        if seq_fallback is not None: seq_url = str(seq_fallback)
+        # Fallback de salvaguarda explorando chaves variadas do payload
+        ano_fb = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
+        if ano_fb is None or str(ano_fb).strip() in ["", "N/D", "None"]:
+            ano_fb = fuzzy_match(r_dict, ["ano"], padrao=None)
+            
+        seq_fb = primeiro(r_dict, ["sequencialCompra", "sequencialContrato", "sequencialAta", "sequencial", "numeroSequencial", "compra.sequencialCompra"], padrao=None)
+        if seq_fb is None or str(seq_fb).strip() in ["", "N/D", "None"]:
+            seq_fb = fuzzy_match(r_dict, ["sequencial"], padrao=None)
+            
+        try:
+            if ano_fb is not None and str(ano_fb).strip() != "" and str(ano_fb).strip() != "N/D":
+                ano_url = str(int(float(str(ano_fb).strip())))
+            if seq_fb is not None and str(seq_fb).strip() != "" and str(seq_fb).strip() != "N/D":
+                seq_url = str(int(float(str(seq_fb).strip())))
+        except (ValueError, TypeError):
+            pass
+
+    # Garante que sempre teremos uma string válida
+    link_pncp = "https://pncp.gov.br" 
+    
+    if ano_url and seq_url:
+        cnpj_url = cnpj_limpo(CNPJ)
+        if tipo == "Contratos":
+            link_pncp = f"https://pncp.gov.br/app/contratos/{cnpj_url}/{ano_url}/{seq_url}"
+        elif tipo == "Atas de Registro de Preços":
+            link_pncp = f"https://pncp.gov.br/app/atas/{cnpj_url}/{ano_url}/{seq_url}"
+        else:
+            link_pncp = f"https://pncp.gov.br/app/editais/{cnpj_url}/{ano_url}/{seq_url}"
+
+    # ========================================================
 
     tipo_instrumento = primeiro(
         r_dict,
@@ -824,17 +858,6 @@ def dados_registro(
     v_num = numero(val_global)
     v_ini_num = numero(val_inicial)
 
-    # Geração do Link Oficial do PNCP
-    link_pncp = None
-    if ano_url is not None and seq_url is not None:
-        cnpj_url = cnpj_limpo(CNPJ)
-        if tipo == "Contratos":
-            link_pncp = f"https://pncp.gov.br/app/contratos/{cnpj_url}/{ano_url}/{seq_url}"
-        elif tipo == "Atas de Registro de Preços":
-            link_pncp = f"https://pncp.gov.br/app/atas/{cnpj_url}/{ano_url}/{seq_url}"
-        else:
-            link_pncp = f"https://pncp.gov.br/app/editais/{cnpj_url}/{ano_url}/{seq_url}"
-
     # 1. Checagem inicial no próprio payload
     eh_termo_aditivo = False
     if str(tipo_contrato_id) == "2" or "aditivo" in str(tipo_instrumento).lower():
@@ -875,7 +898,7 @@ def dados_registro(
         dias_para_vencer = int((ts_fim_vig - hoje).days)
 
     return {
-        "controle": controle_str,
+        "controle": texto(controle),
         "numero": texto(num),
         "processo": texto(proc),
         "ano_contrato": ano_contrato,
@@ -1397,7 +1420,7 @@ def similares(
             "Objeto": texto(registro.get("objeto")),
             "Fornecedor": texto(registro.get("fornecedor")),
             "Valor": texto(registro.get("valor")),
-            "Link PNCP": registro.get("link_pncp"),
+            "Link PNCP": registro.get("link_pncp", "https://pncp.gov.br"),
         })
         if len(saida) >= limite:
             break
@@ -1886,36 +1909,52 @@ def main() -> None:
         st.warning("Não foi possível estruturar os registros retornados. Verifique se a base do PNCP está instável.")
         st.stop()
 
-    # Segmentação
+    # Segmentação e Pesquisa
     st.markdown("---")
-    st.subheader("🗂️ Segmentação Estratégica")
+    st.subheader("🗂️ Segmentação Estratégica e Pesquisa")
+    
+    col_seg1, col_seg2 = st.columns(2)
 
     todas_modalidades = sorted({
         d["modalidade"] for d in dados_totais
         if d["modalidade"] and d["modalidade"] != "N/D"
     })
-
     opcao_geral = "Visão Geral (Todas as Modalidades)"
 
-    if todas_modalidades:
+    with col_seg1:
         mod_escolhida = st.selectbox(
             "Filtrar e Segmentar por Modalidade de Contratação:",
             [opcao_geral, *todas_modalidades],
             help="Filtre os resultados para isolar processos como Dispensas, Inexigibilidades, Pregões, etc."
         )
-    else:
-        mod_escolhida = opcao_geral
 
-    if mod_escolhida != opcao_geral:
-        indices_ativos = [
-            i for i, registro in enumerate(dados_totais)
-            if registro["modalidade"] == mod_escolhida
-        ]
-    else:
-        indices_ativos = list(range(len(dados_totais)))
+    with col_seg2:
+        termo_pesquisa = st.text_input(
+            "🔍 Pesquisa Livre (Objeto, Fornecedor, Número...):",
+            "",
+            help="Digite para buscar em todos os registros retornados."
+        ).strip().casefold()
+
+    # Aplicação combinada de filtros (Modalidade + Pesquisa Livre)
+    indices_ativos = []
+    for i, registro in enumerate(dados_totais):
+        # 1. Filtro de Modalidade
+        if mod_escolhida != opcao_geral and registro["modalidade"] != mod_escolhida:
+            continue
+        
+        # 2. Filtro de Pesquisa Livre
+        if termo_pesquisa:
+            texto_busca = f"{registro['objeto']} {registro['fornecedor']} {registro['numero']} {registro['processo']}".casefold()
+            if termo_pesquisa not in texto_busca:
+                continue
+        
+        indices_ativos.append(i)
 
     if not indices_ativos:
-        st.warning(f"Sem registros para a modalidade: {mod_escolhida}")
+        mensagem_vazio = f"Nenhum registro encontrado para a modalidade '{mod_escolhida}'"
+        if termo_pesquisa:
+            mensagem_vazio += f" contendo o termo '{termo_pesquisa}'."
+        st.warning(mensagem_vazio)
         st.stop()
 
     df_filtrado = df_bruto.iloc[indices_ativos].reset_index(drop=True)
@@ -1983,7 +2022,7 @@ def main() -> None:
             "Aditivo": adit_status,
             "Objeto": registro["objeto"],
             "Gatilhos": "; ".join(risco["motivos"]),
-            "Link PNCP": registro["link_pncp"],
+            "Link PNCP": registro.get("link_pncp", "https://pncp.gov.br"),
         })
 
     df_risco = pd.DataFrame(rows)
@@ -2138,7 +2177,7 @@ def main() -> None:
                 "Término Vigência": r["data_fim_vigencia"],
                 "Status do Prazo": status_prazo,
                 "Valor": r["valor"],
-                "Link PNCP": r["link_pncp"],
+                "Link PNCP": r.get("link_pncp", "https://pncp.gov.br"),
                 "Objeto": r["objeto"],
             })
         df_vig_show = pd.DataFrame(tabela_vig)
@@ -2329,7 +2368,7 @@ def main() -> None:
                             "Valor Atualizado": moeda(v_fim),
                             "Variação (%)": f"+{perc_a:.2f}%" if perc_a is not None else "0.00%",
                             "Avaliação de Conformidade": status_legal,
-                            "Link PNCP": r["link_pncp"],
+                            "Link PNCP": r.get("link_pncp", "https://pncp.gov.br"),
                             "Objeto": r["objeto"],
                         })
 
@@ -2445,7 +2484,7 @@ def main() -> None:
                 st.info(f"**Objeto Descrito no Edital/Contrato:** {registro['objeto']}")
 
                 # Novo botão/link oficial renderizado logo abaixo das métricas do Dossiê
-                if registro["link_pncp"]:
+                if registro.get("link_pncp"):
                     st.markdown(f"👉 [**Acessar dados oficiais e anexos no Portal PNCP**]({registro['link_pncp']})")
 
             with st.expander("🔎 Justificativa Analítica e Roteiro de Auditoria", expanded=True):
