@@ -2113,6 +2113,28 @@ def main() -> None:
                     f"ℹ️ {qtd_sem_registros} contrato(s) foram consultados com sucesso "
                     "e não apresentaram termos retornados pelo PNCP."
                 )
+                
+                tabela_sem_termos = []
+                for r in dados_processados:
+                    if r.get("diagnostico_aditivo", {}).get("status") == "SEM_REGISTROS":
+                        tabela_sem_termos.append({
+                            "Contrato": r.get("numero", "N/D"),
+                            "Ano": r.get("ano_contrato", "N/D"),
+                            "Sequencial": r.get("sequencial_contrato", "N/D"),
+                            "Resultado": "Nenhum termo no PNCP",
+                        })
+                        
+                st.dataframe(
+                    pd.DataFrame(tabela_sem_termos),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                
+                st.markdown(
+                    "ℹ️ **A ausência de termo no PNCP não comprova, isoladamente, a inexistência de "
+                    "aditamento administrativo. Recomenda-se confrontar o resultado com os processos, "
+                    "contratos e documentos mantidos pela Prefeitura.**"
+                )
 
             if qtd_sem_identificadores > 0:
                 st.warning(
