@@ -714,10 +714,23 @@ def dados_registro(
 
     ano_contrato = primeiro(r_dict, ["anoContrato", "ano", "compra.anoCompra"], padrao=None)
     seq_contrato = primeiro(r_dict, ["sequencialContrato", "sequencial", "numeroSequencial"], padrao=None)
-    
-    # Tentativa extra para capturar variáveis necessárias para formar a URL oficial do PNCP
-    ano_url = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
-    seq_url = primeiro(r_dict, ["sequencialCompra", "sequencialContrato", "sequencialAta", "sequencial", "numeroSequencial", "compra.sequencialCompra"], padrao=None)
+
+    # Extração rigorosa do Ano e Sequencial diretamente do Número de Controle do PNCP
+    ano_url = None
+    seq_url = None
+    controle_str = texto(controle, "")
+
+    # O padrão do PNCP é CNPJ-TIPO-SEQUENCIAL/ANO (ex: 44826840000183-1-000001/2024)
+    match_controle = re.search(r'-(\d+)/(\d{4})$', controle_str)
+    if match_controle:
+        seq_url = str(int(match_controle.group(1))) # Transforma em int para remover zeros à esquerda, depois string
+        ano_url = str(match_controle.group(2))
+    else:
+        # Fallback caso a API mude ou o regex falhe
+        ano_fallback = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
+        seq_fallback = primeiro(r_dict, ["sequencialCompra", "sequencialContrato", "sequencialAta", "sequencial", "numeroSequencial", "compra.sequencialCompra"], padrao=None)
+        if ano_fallback is not None: ano_url = str(ano_fallback)
+        if seq_fallback is not None: seq_url = str(seq_fallback)
 
     tipo_instrumento = primeiro(
         r_dict,
@@ -862,7 +875,7 @@ def dados_registro(
         dias_para_vencer = int((ts_fim_vig - hoje).days)
 
     return {
-        "controle": texto(controle),
+        "controle": controle_str,
         "numero": texto(num),
         "processo": texto(proc),
         "ano_contrato": ano_contrato,
