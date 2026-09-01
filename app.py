@@ -27,6 +27,7 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import datetime as dt
 
 import pandas as pd
 import requests
@@ -1661,17 +1662,17 @@ def consultar_editais(
 
 def dt_date(ano: int, mes: int, dia: int):
     """Helper para criação de date."""
-    import datetime as dt
     return dt.date(ano, mes, dia)
 
 
 def inicializar_estado() -> None:
     """Inicializa session_state."""
     hoje = pd.Timestamp.today().date()
+    
     defaults = {
         "df": None,
         "tipo": TIPOS[0],
-        "inicio": dt_date(2026, 1, 1),
+        "inicio": dt_date(hoje.year, 1, 1), # Inicializa com o primeiro dia do ano atual
         "fim": hoje,
     }
 
@@ -1714,26 +1715,27 @@ def main() -> None:
     # Cabeçalho
     st.title("🏛️ Inteligência de Controle Interno PNCP")
     st.info(
-        "ℹ️ Sistema de alertas automáticos. "
-        "Os resultados são indicadores de apoio e "
-        "devem ser validados por análise e auditoria humana."
+        "ℹ️ **Aviso:** Os alertas produzidos por este sistema são indicadores automatizados "
+        "para apoio ao Controle Interno. Toda conclusão deve ser validada por análise e auditoria humana."
     )
 
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Parâmetros")
+        
         tipo_selecionado = st.selectbox(
-            "Escopo",
+            "Escopo da Consulta",
             TIPOS,
             index=TIPOS.index(st.session_state.tipo),
+            help="Selecione o tipo de registro que deseja buscar na base do PNCP."
         )
 
         if tipo_selecionado != st.session_state.tipo:
             st.session_state.tipo = tipo_selecionado
             st.session_state.df = None
 
-        inicio = st.date_input("📅 Data inicial", value=st.session_state.inicio)
-        fim = st.date_input("📅 Data final", value=st.session_state.fim)
+        inicio = st.date_input("📅 Data inicial", value=st.session_state.inicio, help="Data de início para o filtro de publicação/assinatura.")
+        fim = st.date_input("📅 Data final", value=st.session_state.fim, help="Data final para o filtro da consulta.")
 
         st.session_state.inicio = inicio
         st.session_state.fim = fim
@@ -1747,6 +1749,7 @@ def main() -> None:
             type="primary",
             use_container_width=True,
             disabled=erro_periodo is not None,
+            help="Clique para buscar os dados direto da base oficial do PNCP."
         )
 
         st.markdown("---")
@@ -1827,18 +1830,29 @@ def main() -> None:
     tipo_atual = st.session_state.tipo
 
     if df_bruto is None:
-        st.info("👈 Defina os parâmetros na barra lateral e clique em **Carregar dados**.")
+        # Tela inicial acolhedora (Empty State)
+        st.markdown("### Bem-vindo ao Painel de Inteligência de Dados")
+        st.markdown(
+            "Esta ferramenta automatiza a coleta e a análise de dados públicos do Portal Nacional de Contratações "
+            "Públicas (PNCP), estruturando as informações para facilitar a detecção de riscos e anomalias."
+        )
+        st.info(
+            "👈 **Como começar sua análise:**\n\n"
+            "1. **Escolha o Escopo:** No menu à esquerda, selecione se deseja visualizar Contratos, Atas ou Editais.\n"
+            "2. **Defina o Período:** Ajuste as datas para refletir o intervalo de publicação que deseja investigar.\n"
+            "3. **Gere o Dossiê:** Clique em **Carregar dados** e aguarde o processamento automático da matriz de risco."
+        )
         st.stop()
 
     if df_bruto.empty:
-        st.warning("Nenhum dado retornado para o filtro aplicado.")
+        st.warning(f"Nenhum dado retornado para o escopo '{tipo_atual}' no período selecionado.")
         st.stop()
 
     # Conversão dos registros
     dados_totais = [dados_registro(row, tipo_atual) for row in df_bruto.to_dict("records")]
 
     if not dados_totais:
-        st.warning("Não foi possível estruturar os registros retornados.")
+        st.warning("Não foi possível estruturar os registros retornados. Verifique se a base do PNCP está instável.")
         st.stop()
 
     # Segmentação
@@ -1854,8 +1868,9 @@ def main() -> None:
 
     if todas_modalidades:
         mod_escolhida = st.selectbox(
-            "Filtrar e Segmentar por Modalidade:",
+            "Filtrar e Segmentar por Modalidade de Contratação:",
             [opcao_geral, *todas_modalidades],
+            help="Filtre os resultados para isolar processos como Dispensas, Inexigibilidades, Pregões, etc."
         )
     else:
         mod_escolhida = opcao_geral
@@ -1949,9 +1964,9 @@ def main() -> None:
     # Abas da Aplicação
     st.markdown("---")
     tab1, tab_vigencia, tab2 = st.tabs([
-        "🚦 Matriz de Risco Segmentada",
-        "⏳ Vigência e Aditivos Legais",
-        "📋 Auditoria e Semântica Individual",
+        "🚦 1. Matriz de Risco Segmentada",
+        "⏳ 2. Prazos e Aditamentos",
+        "🔎 3. Auditoria de Risco Individual",
     ])
 
     # ========================================================
@@ -1981,6 +1996,8 @@ def main() -> None:
             hide_index=True,
         )
 
+        st.markdown("#### 📥 Opções de Exportação")
+        
         try:
             excel = gerar_excel(
                 df_filtrado,
@@ -1998,6 +2015,7 @@ def main() -> None:
                     file_name=nome_arquivo,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
+                    help="Gera uma planilha Excel com os indicadores completos de risco gerados nesta aba."
                 )
 
             if DOCX_OK:
@@ -2021,6 +2039,7 @@ def main() -> None:
                             file_name=nome_word_aba1,
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                             use_container_width=True,
+                            help="Gera um relatório executivo formatado no Word para arquivamento ou apresentação."
                         )
                 except Exception as exc:
                     LOGGER.exception("Erro ao gerar Word do dashboard principal")
@@ -2322,15 +2341,21 @@ def main() -> None:
             "econômica do fornecedor, riscos à continuidade do fornecimento ou indícios de direcionamento."
         )
 
+        st.markdown("### Aprofundamento por Registro")
+        
         f1, f2 = st.columns(2)
 
         filtro_risco = f1.multiselect(
-            "Nível de Risco Alvo",
+            "Filtrar por Nível de Risco Alvo:",
             ["🔴 ALTO", "🟡 MÉDIO", "🟢 BAIXO"],
             default=["🔴 ALTO", "🟡 MÉDIO"],
+            help="Selecione os níveis de risco que deseja analisar no detalhe."
         )
 
-        mostrar_outlier = f2.checkbox("Apenas anomalias financeiras")
+        mostrar_outlier = f2.checkbox(
+            "Isolar apenas anomalias financeiras (Outliers)", 
+            help="Se marcado, mostrará apenas os registros que ativaram o alerta de limite IQR financeiro."
+        )
 
         idx_auditoria = [
             i for i, risco in enumerate(riscos)
@@ -2338,7 +2363,7 @@ def main() -> None:
         ]
 
         if not idx_auditoria:
-            st.warning("Ajuste os filtros de priorização acima para investigar um dossiê.")
+            st.warning("Nenhum dossiê atende aos filtros de priorização ajustados acima.")
         else:
             mapa = {}
             for i in idx_auditoria:
@@ -2356,8 +2381,9 @@ def main() -> None:
                 mapa[chave] = i
 
             escolhido = st.selectbox(
-                "Selecione o dossiê da contratação:",
+                "Selecione o dossiê da contratação para expandir:",
                 list(mapa.keys()),
+                help="Escolha um item da lista para visualizar a justificativa dos alertas."
             )
 
             i_alvo = mapa[escolhido]
@@ -2370,21 +2396,23 @@ def main() -> None:
                 col_b.metric("Volume", registro["valor"])
                 col_c.metric("Enquadramento Legal", registro["modalidade"])
 
-                st.info(f"**Objeto Descrito:** {registro['objeto']}")
+                st.info(f"**Objeto Descrito no Edital/Contrato:** {registro['objeto']}")
 
-            with st.expander("🔎 Justificativa Analítica e Testes", expanded=True):
-                st.markdown("**Variáveis de Acionamento:**")
+            with st.expander("🔎 Justificativa Analítica e Roteiro de Auditoria", expanded=True):
+                st.markdown("📍 **Variáveis que acionaram o alerta no sistema:**")
                 for motivo in risco["motivos"]:
                     st.write(f"- {motivo}")
 
+                st.markdown("---")
+                
                 if risco["testes"]:
-                    st.markdown("**Roteiro de Auditoria Sugerido:**")
+                    st.markdown("📋 **Roteiro de Auditoria Sugerido pelo Sistema:**")
                     for teste in risco["testes"]:
                         st.write(f"- {teste}")
                 else:
-                    st.caption("Nenhum teste específico foi sugerido automaticamente.")
+                    st.caption("Nenhum teste específico foi sugerido automaticamente para este cenário.")
 
-            with st.expander("📄 Informações do Registro", expanded=False):
+            with st.expander("📄 Informações de Registro e Partes Envolvidas", expanded=False):
                 info_col1, info_col2 = st.columns(2)
                 info_col1.write(f"**Controle PNCP:** {registro['controle']}")
                 info_col1.write(f"**Número:** {registro['numero']}")
@@ -2403,12 +2431,12 @@ def main() -> None:
             if not SKLEARN_OK:
                 st.warning(
                     "Scikit-Learn não está instalado. "
-                    "Instale a dependência para habilitar a análise semântica."
+                    "Instale a dependência para habilitar a análise semântica automática de objetos similares."
                 )
             else:
                 sim = similares(dados_processados, i_alvo, limite=5, corte_minimo=0.15)
                 if sim.empty:
-                    st.info("Não foi possível identificar vizinhança semântica relevante para este item.")
+                    st.info("Não foi possível identificar vizinhança semântica relevante (contratos com objetos similares) para este item.")
                 else:
                     st.dataframe(sim, use_container_width=True, hide_index=True)
 
@@ -2416,7 +2444,7 @@ def main() -> None:
     st.markdown("---")
     st.caption(
         f"Painel de apoio ao Controle Interno — {PREFEITURA}. "
-        "Dados públicos consultados no PNCP. "
+        "Dados públicos consultados de forma ativa via Integração API PNCP. "
         "Alertas automatizados não substituem análise técnica, jurídica ou auditoria humana."
     )
 
