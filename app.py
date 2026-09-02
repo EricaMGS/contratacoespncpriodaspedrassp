@@ -63,15 +63,17 @@ LOGGER = logging.getLogger(__name__)
 
 
 # ============================================================
-# DEPENDÊNCIAS OPCIONAIS
+# DEPENDÊNCIAS OPCIONAIS (NLP)
 # ============================================================
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
 
     SKLEARN_OK = True
 except ImportError:
     TfidfVectorizer = None
+    cosine_similarity = None
     SKLEARN_OK = False
 
     LOGGER.warning(
@@ -724,21 +726,12 @@ def dados_registro(
 
     # ========================================================
     # EXTRAÇÃO ROBUSTA DO LINK PÚBLICO DO PNCP
-    #
-    # Contratos/Editais: /app/{tipo}/{CNPJ}/{ano}/{sequencial}
-    # Atas:             /app/atas/{CNPJ}/{anoCompra}/{sequencialCompra}/{sequencialAta}
-    #
-    # O número de controle de uma Ata normalmente segue a estrutura:
-    # CNPJ-1-sequencialCompra/anoCompra-sequencialAta
-    # Ex.: 00000000000000-1-79/2023-1
     # ========================================================
     ano_url = None
     seq_url = None
     seq_ata_url = None
     controle_str = texto(controle, "").strip()
 
-    # 1) Para Atas, prioriza o número de controle completo, pois ele
-    # contém os três identificadores necessários para a URL pública.
     if tipo == "Atas de Registro de Preços":
         match_ata = re.search(
             r"^(\d{14})-1-(\d+)/(\d{4})-(\d+)$",
@@ -750,9 +743,6 @@ def dados_registro(
             ano_url = str(int(match_ata.group(3)))
             seq_ata_url = str(int(match_ata.group(4)))
 
-    # 2) Fallback para campos estruturados do payload da API.
-    #    Não mistura sequencialAta com sequencialCompra: são identificadores
-    #    diferentes na URL pública de uma Ata.
     ano_fb = primeiro(
         r_dict,
         [
@@ -806,7 +796,6 @@ def dados_registro(
                 padrao=None,
             )
 
-        # Só substitui o que não veio do número de controle.
         try:
             if valor_vazio(ano_url) and not valor_vazio(ano_fb):
                 ano_url = str(int(float(str(ano_fb).strip())))
@@ -818,7 +807,6 @@ def dados_registro(
             pass
 
     else:
-        # Contratos e Editais continuam usando ano + sequencial do registro.
         seq_fb = primeiro(
             r_dict,
             [
@@ -833,7 +821,6 @@ def dados_registro(
         if valor_vazio(seq_fb):
             seq_fb = fuzzy_match(r_dict, ["sequencial"], padrao=None)
 
-        # Número de controle de contratos/editais: ...-sequencial/ano
         match_controle = re.search(r"-(\d+)/(\d{4})$", controle_str)
         if match_controle:
             seq_url = str(int(match_controle.group(1)))
@@ -847,7 +834,6 @@ def dados_registro(
             except (ValueError, TypeError):
                 pass
 
-    # URL pública padrão como fallback.
     link_pncp = "https://pncp.gov.br"
     cnpj_url = cnpj_limpo(CNPJ)
 
@@ -857,7 +843,6 @@ def dados_registro(
             f"{cnpj_url}/{ano_url}/{seq_url}"
         )
     elif tipo == "Atas de Registro de Preços" and ano_url and seq_url and seq_ata_url:
-        # IMPORTANTE: a URL de uma Ata exige também o sequencialAta.
         link_pncp = (
             f"https://pncp.gov.br/app/atas/"
             f"{cnpj_url}/{ano_url}/{seq_url}/{seq_ata_url}"
@@ -867,8 +852,6 @@ def dados_registro(
             f"https://pncp.gov.br/app/editais/"
             f"{cnpj_url}/{ano_url}/{seq_url}"
         )
-
-    # ========================================================
 
     tipo_instrumento = primeiro(
         r_dict,
@@ -962,14 +945,12 @@ def dados_registro(
     v_num = numero(val_global)
     v_ini_num = numero(val_inicial)
 
-    # 1. Checagem inicial no próprio payload
     eh_termo_aditivo = False
     if str(tipo_contrato_id) == "2" or "aditivo" in str(tipo_instrumento).lower():
         eh_termo_aditivo = True
     elif any(palavra in str(obj).lower() for palavra in ("termo aditivo", "aditamento")):
         eh_termo_aditivo = True
 
-    # 2. Busca ativa nos sub-recursos de Termos do PNCP para contratos
     termos_vinculados = []
     diagnostico_aditivo = {
         "status": "NAO_CONSULTADO",
@@ -990,7 +971,6 @@ def dados_registro(
         if diagnostico_aditivo.get("status") == "REGISTROS_ENCONTRADOS":
             eh_termo_aditivo = True
 
-    # 3. Cálculo de variação percentual de aditivos
     perc_aditivo = None
     if v_num is not None and v_ini_num is not None and v_ini_num > 0 and v_num > v_ini_num:
         perc_aditivo = ((v_num - v_ini_num) / v_ini_num) * 100.0
@@ -1035,12 +1015,7 @@ def estruturar_dados_registros(
     df: pd.DataFrame,
     tipo: str,
 ) -> List[Dict[str, Any]]:
-    """Estrutura os registros uma única vez por carga.
-
-    Para contratos, as consultas independentes de termos aditivos são executadas
-    em paralelo. Como ``buscar_termos_contrato`` possui cache próprio, os reruns
-    do Streamlit não repetem chamadas ao PNCP.
-    """
+    """Estrutura os registros uma única vez por carga."""
     if df.empty:
         return []
 
@@ -1067,8 +1042,6 @@ def estruturar_dados_registros(
                 resultado[indice_resultado] = dado
             except Exception as exc:
                 LOGGER.exception("Falha ao estruturar contrato na posição %s", indice)
-                # Fallback sem interromper toda a carga: a própria função de
-                # extração já mantém diagnóstico técnico quando a consulta falha.
                 resultado[indice] = dados_registro(registros[indice], tipo)
 
     return [item for item in resultado if item is not None]
@@ -1433,11 +1406,11 @@ def calcular_risco(
             motivos.append(f"Termo Aditivo formal identificado ({qtd_termos} aditivo(s) no PNCP)")
             testes.append("Revisar motivação formal e anexos do termo aditivo")
 
-    # 7. Concentração de Fornecedor
-    fornecedor = texto(registro.get("fornecedor"), "").strip()
-    if fornecedor and not contexto.empty and "fornecedor" in contexto.columns:
-        fornecedores = contexto["fornecedor"].fillna("").astype(str).str.strip().str.casefold()
-        qtd = int((fornecedores == fornecedor.casefold()).sum())
+    # 7. Concentração de Fornecedor (Atualizado para buscar por CNPJ)
+    cnpj_fornecedor = texto(registro.get("cnpj_fornecedor"), "").strip()
+    if cnpj_fornecedor and not contexto.empty and "cnpj_fornecedor" in contexto.columns:
+        cnpjs = contexto["cnpj_fornecedor"].fillna("").astype(str).str.strip()
+        qtd = int((cnpjs == cnpj_fornecedor).sum())
         limite_concentracao = max(3, int(len(contexto) * 0.10))
 
         if qtd >= limite_concentracao:
@@ -1511,7 +1484,7 @@ def texto_nlp(valor: Any) -> str:
     return " ".join(palavras_limpas)
 
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+# Decorador de cache removido para evitar overhead ao instanciar strings muito grandes.
 def calcular_modelo_tfidf(textos: Tuple[str, ...]):
     """Cria a matriz TF-IDF baseada no núcleo semântico dos objetos."""
     if not SKLEARN_OK or TfidfVectorizer is None or len(textos) < 2:
@@ -1552,7 +1525,8 @@ def similares(
         return pd.DataFrame()
 
     try:
-        scores = (matriz @ matriz[idx].T).toarray().ravel()
+        # Substituição da multiplicação por matriz (.toarray) pela função cosine_similarity (economiza RAM e processamento)
+        scores = cosine_similarity(matriz[idx], matriz).ravel()
     except (IndexError, ValueError) as exc:
         LOGGER.warning("Erro no cálculo de similaridade: %s", exc)
         return pd.DataFrame()
