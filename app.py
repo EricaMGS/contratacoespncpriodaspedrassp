@@ -721,44 +721,150 @@ def dados_registro(
     seq_contrato = primeiro(r_dict, ["sequencialContrato", "sequencial", "numeroSequencial"], padrao=None)
 
     # ========================================================
-    # EXTRAÇÃO INFALÍVEL DO LINK DO PNCP
+    # EXTRAÇÃO ROBUSTA DO LINK PÚBLICO DO PNCP
+    #
+    # Contratos/Editais: /app/{tipo}/{CNPJ}/{ano}/{sequencial}
+    # Atas:             /app/atas/{CNPJ}/{anoCompra}/{sequencialCompra}/{sequencialAta}
+    #
+    # O número de controle de uma Ata normalmente segue a estrutura:
+    # CNPJ-1-sequencialCompra/anoCompra-sequencialAta
+    # Ex.: 00000000000000-1-79/2023-1
     # ========================================================
     ano_url = None
     seq_url = None
-    controle_str = texto(controle, "")
+    seq_ata_url = None
+    controle_str = texto(controle, "").strip()
 
-    match_controle = re.search(r'-(\d+)/(\d{4})$', controle_str.strip())
-    
-    if match_controle:
-        seq_url = str(int(match_controle.group(1)))
-        ano_url = str(match_controle.group(2))
-    else:
-        ano_fb = primeiro(r_dict, ["anoCompra", "anoContrato", "anoAta", "ano", "compra.anoCompra"], padrao=None)
-        if ano_fb is None or str(ano_fb).strip() in ["", "N/D", "None"]:
-            ano_fb = fuzzy_match(r_dict, ["ano"], padrao=None)
-            
-        seq_fb = primeiro(r_dict, ["sequencialCompra", "sequencialContrato", "sequencialAta", "sequencial", "numeroSequencial", "compra.sequencialCompra"], padrao=None)
-        if seq_fb is None or str(seq_fb).strip() in ["", "N/D", "None"]:
-            seq_fb = fuzzy_match(r_dict, ["sequencial"], padrao=None)
-            
+    # 1) Para Atas, prioriza o número de controle completo, pois ele
+    # contém os três identificadores necessários para a URL pública.
+    if tipo == "Atas de Registro de Preços":
+        match_ata = re.search(
+            r"^(\d{14})-1-(\d+)/(\d{4})-(\d+)$",
+            controle_str,
+        )
+
+        if match_ata:
+            seq_url = str(int(match_ata.group(2)))
+            ano_url = str(int(match_ata.group(3)))
+            seq_ata_url = str(int(match_ata.group(4)))
+
+    # 2) Fallback para campos estruturados do payload da API.
+    #    Não mistura sequencialAta com sequencialCompra: são identificadores
+    #    diferentes na URL pública de uma Ata.
+    ano_fb = primeiro(
+        r_dict,
+        [
+            "anoCompra",
+            "anoAta",
+            "anoContrato",
+            "ano",
+            "compra.anoCompra",
+            "ata.anoCompra",
+        ],
+        padrao=None,
+    )
+
+    if valor_vazio(ano_fb):
+        ano_fb = fuzzy_match(r_dict, ["anocompra", "anoata", "ano"], padrao=None)
+
+    if tipo == "Atas de Registro de Preços":
+        seq_fb = primeiro(
+            r_dict,
+            [
+                "sequencialCompra",
+                "compra.sequencialCompra",
+                "sequencialAtaCompra",
+                "sequencial",
+            ],
+            padrao=None,
+        )
+
+        seq_ata_fb = primeiro(
+            r_dict,
+            [
+                "sequencialAta",
+                "ata.sequencialAta",
+                "numeroSequencialAta",
+                "sequencialAtaRegistroPreco",
+            ],
+            padrao=None,
+        )
+
+        if valor_vazio(seq_fb):
+            seq_fb = fuzzy_match(
+                r_dict,
+                ["sequencialcompra", "sequencial"],
+                padrao=None,
+            )
+
+        if valor_vazio(seq_ata_fb):
+            seq_ata_fb = fuzzy_match(
+                r_dict,
+                ["sequencialata", "sequencialataregistro"],
+                padrao=None,
+            )
+
+        # Só substitui o que não veio do número de controle.
         try:
-            if ano_fb is not None and str(ano_fb).strip() != "" and str(ano_fb).strip() != "N/D":
+            if valor_vazio(ano_url) and not valor_vazio(ano_fb):
                 ano_url = str(int(float(str(ano_fb).strip())))
-            if seq_fb is not None and str(seq_fb).strip() != "" and str(seq_fb).strip() != "N/D":
+            if valor_vazio(seq_url) and not valor_vazio(seq_fb):
                 seq_url = str(int(float(str(seq_fb).strip())))
+            if valor_vazio(seq_ata_url) and not valor_vazio(seq_ata_fb):
+                seq_ata_url = str(int(float(str(seq_ata_fb).strip())))
         except (ValueError, TypeError):
             pass
 
-    link_pncp = "https://pncp.gov.br" 
-    
-    if ano_url and seq_url:
-        cnpj_url = cnpj_limpo(CNPJ)
-        if tipo == "Contratos":
-            link_pncp = f"https://pncp.gov.br/app/contratos/{cnpj_url}/{ano_url}/{seq_url}"
-        elif tipo == "Atas de Registro de Preços":
-            link_pncp = f"https://pncp.gov.br/app/atas/{cnpj_url}/{ano_url}/{seq_url}"
+    else:
+        # Contratos e Editais continuam usando ano + sequencial do registro.
+        seq_fb = primeiro(
+            r_dict,
+            [
+                "sequencialContrato" if tipo == "Contratos" else "sequencialCompra",
+                "sequencial",
+                "numeroSequencial",
+                "compra.sequencialCompra",
+            ],
+            padrao=None,
+        )
+
+        if valor_vazio(seq_fb):
+            seq_fb = fuzzy_match(r_dict, ["sequencial"], padrao=None)
+
+        # Número de controle de contratos/editais: ...-sequencial/ano
+        match_controle = re.search(r"-(\d+)/(\d{4})$", controle_str)
+        if match_controle:
+            seq_url = str(int(match_controle.group(1)))
+            ano_url = str(int(match_controle.group(2)))
         else:
-            link_pncp = f"https://pncp.gov.br/app/editais/{cnpj_url}/{ano_url}/{seq_url}"
+            try:
+                if not valor_vazio(ano_fb):
+                    ano_url = str(int(float(str(ano_fb).strip())))
+                if not valor_vazio(seq_fb):
+                    seq_url = str(int(float(str(seq_fb).strip())))
+            except (ValueError, TypeError):
+                pass
+
+    # URL pública padrão como fallback.
+    link_pncp = "https://pncp.gov.br"
+    cnpj_url = cnpj_limpo(CNPJ)
+
+    if tipo == "Contratos" and ano_url and seq_url:
+        link_pncp = (
+            f"https://pncp.gov.br/app/contratos/"
+            f"{cnpj_url}/{ano_url}/{seq_url}"
+        )
+    elif tipo == "Atas de Registro de Preços" and ano_url and seq_url and seq_ata_url:
+        # IMPORTANTE: a URL de uma Ata exige também o sequencialAta.
+        link_pncp = (
+            f"https://pncp.gov.br/app/atas/"
+            f"{cnpj_url}/{ano_url}/{seq_url}/{seq_ata_url}"
+        )
+    elif tipo == "Editais e Avisos de Contratações" and ano_url and seq_url:
+        link_pncp = (
+            f"https://pncp.gov.br/app/editais/"
+            f"{cnpj_url}/{ano_url}/{seq_url}"
+        )
 
     # ========================================================
 
@@ -899,6 +1005,9 @@ def dados_registro(
         "processo": texto(proc),
         "ano_contrato": ano_contrato,
         "sequencial_contrato": seq_contrato,
+        "ano_url": ano_url,
+        "sequencial_url": seq_url,
+        "sequencial_ata_url": seq_ata_url,
         "tipo_instrumento": texto(tipo_instrumento),
         "eh_aditivo": eh_termo_aditivo,
         "qtd_termos_aditivos": len(termos_vinculados),
