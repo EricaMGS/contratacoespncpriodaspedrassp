@@ -129,6 +129,7 @@ MAX_PAGINAS = max(
 )
 
 CACHE_TTL = 900
+CACHE_TERMOS_TTL = 3600
 
 TIPOS = [
     "Contratos",
@@ -562,6 +563,7 @@ def fuzzy_match(
 # EXTRAÇÃO DOS REGISTROS COM BUSCA ATIVA DE TERMOS ADITIVOS
 # ============================================================
 
+@st.cache_data(ttl=CACHE_TERMOS_TTL, show_spinner=False)
 def buscar_termos_contrato(
     cnpj_orgao: str,
     ano: Any,
@@ -1027,6 +1029,49 @@ def dados_registro(
         "modalidade": texto(mod),
         "link_pncp": link_pncp,
     }
+
+
+def estruturar_dados_registros(
+    df: pd.DataFrame,
+    tipo: str,
+) -> List[Dict[str, Any]]:
+    """Estrutura os registros uma única vez por carga.
+
+    Para contratos, as consultas independentes de termos aditivos são executadas
+    em paralelo. Como ``buscar_termos_contrato`` possui cache próprio, os reruns
+    do Streamlit não repetem chamadas ao PNCP.
+    """
+    if df.empty:
+        return []
+
+    registros = df.to_dict("records")
+
+    if tipo != "Contratos" or len(registros) <= 1:
+        return [dados_registro(row, tipo) for row in registros]
+
+    workers = min(MAX_WORKERS, len(registros))
+    resultado: List[Optional[Dict[str, Any]]] = [None] * len(registros)
+
+    def processar(indice: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        return indice, dados_registro(row, tipo)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futuros = {
+            executor.submit(processar, indice, row): indice
+            for indice, row in enumerate(registros)
+        }
+        for futuro in as_completed(futuros):
+            indice = futuros[futuro]
+            try:
+                indice_resultado, dado = futuro.result()
+                resultado[indice_resultado] = dado
+            except Exception as exc:
+                LOGGER.exception("Falha ao estruturar contrato na posição %s", indice)
+                # Fallback sem interromper toda a carga: a própria função de
+                # extração já mantém diagnóstico técnico quando a consulta falha.
+                resultado[indice] = dados_registro(registros[indice], tipo)
+
+    return [item for item in resultado if item is not None]
 
 
 # ============================================================
@@ -1556,6 +1601,43 @@ def _word_text(valor: Any, padrao: str = "N/D") -> str:
     return texto(valor, padrao)
 
 
+def _adicionar_hyperlink_word(paragrafo: Any, url: str, texto_link: str = "🔗 Acessar") -> None:
+    """Adiciona um hyperlink externo clicável em um parágrafo do Word."""
+    if not url or not str(url).startswith(("http://", "https://")):
+        paragrafo.add_run(texto_link)
+        return
+
+    try:
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        parte = paragrafo.part
+        rel_id = parte.relate_to(
+            str(url),
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+            is_external=True,
+        )
+
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(qn("r:id"), rel_id)
+
+        run = OxmlElement("w:r")
+        r_pr = OxmlElement("w:rPr")
+        r_style = OxmlElement("w:rStyle")
+        r_style.set(qn("w:val"), "Hyperlink")
+        r_pr.append(r_style)
+        run.append(r_pr)
+
+        text_element = OxmlElement("w:t")
+        text_element.text = texto_link
+        run.append(text_element)
+        hyperlink.append(run)
+        paragrafo._p.append(hyperlink)
+    except Exception:
+        # Fallback seguro: mostra a URL como texto caso o Word não aceite o relacionamento.
+        paragrafo.add_run(str(url))
+
+
 def _adicionar_tabela_word(
     doc: Document,
     df: pd.DataFrame,
@@ -1593,10 +1675,18 @@ def _adicionar_tabela_word(
     for _, row in tabela_df.iterrows():
         celulas = tabela.add_row().cells
         for j, valor in enumerate(row.tolist()):
-            celulas[j].text = _word_text(valor)
-            for paragrafo in celulas[j].paragraphs:
+            coluna = str(tabela_df.columns[j])
+            if coluna == "Link PNCP" and str(valor).startswith(("http://", "https://")):
+                celulas[j].text = ""
+                paragrafo = celulas[j].paragraphs[0]
+                _adicionar_hyperlink_word(paragrafo, str(valor), "🔗 Acessar")
                 for run in paragrafo.runs:
                     run.font.size = Pt(7)
+            else:
+                celulas[j].text = _word_text(valor)
+                for paragrafo in celulas[j].paragraphs:
+                    for run in paragrafo.runs:
+                        run.font.size = Pt(7)
 
     if len(df) > max_linhas:
         doc.add_paragraph(
@@ -1605,6 +1695,7 @@ def _adicionar_tabela_word(
         )
 
 
+@st.cache_data(show_spinner=False)
 def gerar_word_dashboard_principal(
     df_risco: pd.DataFrame,
     tipo: str,
@@ -1713,11 +1804,27 @@ def gerar_word_dashboard_principal(
 # ============================================================
 
 def ajustar_planilha_excel(worksheet: Any) -> None:
-    """Formatação básica da planilha."""
+    """Formatação básica da planilha e criação de links clicáveis para o PNCP."""
     worksheet.freeze_panes = "A2"
 
     if worksheet.max_row >= 1:
         worksheet.auto_filter.ref = worksheet.dimensions
+
+    # Transforma a coluna "Link PNCP" em hyperlink real no Excel.
+    cabecalhos = {
+        str(celula.value).strip(): celula.column
+        for celula in worksheet[1]
+        if celula.value is not None
+    }
+    coluna_link = cabecalhos.get("Link PNCP")
+    if coluna_link:
+        for linha in range(2, worksheet.max_row + 1):
+            celula = worksheet.cell(row=linha, column=coluna_link)
+            url = str(celula.value or "").strip()
+            if url.startswith(("http://", "https://")):
+                celula.hyperlink = url
+                celula.value = "🔗 Acessar"
+                celula.style = "Hyperlink"
 
     for coluna in worksheet.columns:
         if not coluna:
@@ -1729,20 +1836,36 @@ def ajustar_planilha_excel(worksheet: Any) -> None:
             tamanho = 0 if valor is None else len(str(valor))
             maior = max(maior, tamanho)
 
-        worksheet.column_dimensions[letra].width = min(55, max(12, maior + 2))
+        # Mantém a coluna de acesso com largura adequada.
+        if coluna_link and coluna[0].column == coluna_link:
+            worksheet.column_dimensions[letra].width = 16
+        else:
+            worksheet.column_dimensions[letra].width = min(55, max(12, maior + 2))
 
 
+@st.cache_data(show_spinner=False)
 def gerar_excel(
     df: pd.DataFrame,
     tipo: str,
     df_risco: pd.DataFrame,
+    dados_processados: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
-    """Gera arquivo Excel para download."""
+    """Gera Excel com matriz e dados brutos, preservando links oficiais."""
     buffer = io.BytesIO()
+    df_brutos_export = df.copy()
+
+    # Os links são aplicados na mesma ordem do dataframe filtrado, antes da
+    # matriz ser ordenada por score. Isso evita associação incorreta entre
+    # registros e URLs no PNCP.
+    if dados_processados and len(dados_processados) == len(df_brutos_export):
+        df_brutos_export["Link PNCP"] = [
+            registro.get("link_pncp", "https://pncp.gov.br")
+            for registro in dados_processados
+        ]
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df_risco.to_excel(writer, sheet_name="Matriz de Risco", index=False)
-        df.to_excel(writer, sheet_name="Dados Brutos", index=False)
+        df_brutos_export.to_excel(writer, sheet_name="Dados Brutos", index=False)
         for worksheet in writer.book.worksheets:
             ajustar_planilha_excel(worksheet)
 
@@ -1754,6 +1877,21 @@ def gerar_excel(
 # CONSULTAS ESPECÍFICAS
 # ============================================================
 
+def _registrar_limite_paginacao(
+    erros: List[str],
+    paginas_consultadas: int,
+    total_paginas: Optional[int],
+    contexto: str,
+) -> None:
+    """Registra quando o limite local impede a coleta integral do resultado."""
+    if total_paginas is not None and paginas_consultadas < total_paginas:
+        erros.append(
+            f"{contexto}: o PNCP informou {total_paginas} página(s), mas o app "
+            f"consultou {paginas_consultadas} por causa do limite PNCP_MAX_PAGES={MAX_PAGINAS}. "
+            "O conjunto exibido é parcial."
+        )
+
+
 def consultar_contratos(inicio: Any, fim: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Consulta contratos."""
     params = {
@@ -1762,7 +1900,10 @@ def consultar_contratos(inicio: Any, fim: Any) -> Tuple[List[Dict[str, Any]], Li
         "cnpjOrgao": CNPJ,
         "tamanhoPagina": PAGE_CONTRATOS,
     }
-    registros, _, _, erros = consultar(f"{BASE_CONSULTA}/contratos", params, MAX_PAGINAS)
+    registros, paginas, total, erros = consultar(
+        f"{BASE_CONSULTA}/contratos", params, MAX_PAGINAS
+    )
+    _registrar_limite_paginacao(erros, paginas, total, "Contratos")
     return registros, erros
 
 
@@ -1774,7 +1915,10 @@ def consultar_atas(inicio: Any, fim: Any) -> Tuple[List[Dict[str, Any]], List[st
         "cnpj": CNPJ,
         "tamanhoPagina": PAGE_ATAS,
     }
-    registros, _, _, erros = consultar(f"{BASE_CONSULTA}/atas", params, MAX_PAGINAS)
+    registros, paginas, total, erros = consultar(
+        f"{BASE_CONSULTA}/atas", params, MAX_PAGINAS
+    )
+    _registrar_limite_paginacao(erros, paginas, total, "Atas")
     return registros, erros
 
 
@@ -1803,10 +1947,13 @@ def consultar_editais(
         params["codigoModalidadeContratacao"] = modalidade
 
         try:
-            registros, _, _, erros_pagina = consultar(
+            registros, paginas, total, erros_pagina = consultar(
                 f"{BASE_CONSULTA}/contratacoes/publicacao",
                 params,
                 MAX_PAGINAS,
+            )
+            _registrar_limite_paginacao(
+                erros_pagina, paginas, total, f"Modalidade {modalidade}"
             )
             if registros:
                 todos_registros.extend(registros)
@@ -1836,8 +1983,10 @@ def inicializar_estado() -> None:
     
     defaults = {
         "df": None,
+        "dados_totais": None,
+        "consulta_meta": None,
         "tipo": TIPOS[0],
-        "inicio": dt_date(hoje.year, 1, 1), # Inicializa com o primeiro dia do ano atual
+        "inicio": dt_date(hoje.year, 1, 1),
         "fim": hoje,
     }
 
@@ -1898,6 +2047,8 @@ def main() -> None:
         if tipo_selecionado != st.session_state.tipo:
             st.session_state.tipo = tipo_selecionado
             st.session_state.df = None
+            st.session_state.dados_totais = None
+            st.session_state.consulta_meta = None
 
         inicio = st.date_input("📅 Data inicial", value=st.session_state.inicio, help="Data de início para o filtro de publicação/assinatura.")
         fim = st.date_input("📅 Data final", value=st.session_state.fim, help="Data final para o filtro da consulta.")
@@ -1922,6 +2073,18 @@ def main() -> None:
         st.caption(f"CNPJ: {CNPJ}")
         st.caption(f"IBGE: {IBGE}")
         st.caption(f"Máx. páginas por consulta: {MAX_PAGINAS}")
+        st.caption(f"Cache da consulta: {CACHE_TTL // 60} min | Termos aditivos: {CACHE_TERMOS_TTL // 60} min")
+
+        if st.button(
+            "♻️ Atualizar dados ignorando cache",
+            use_container_width=True,
+            help="Limpa o cache local do app. Use quando precisar forçar uma nova leitura do PNCP.",
+        ):
+            st.cache_data.clear()
+            st.session_state.df = None
+            st.session_state.dados_totais = None
+            st.session_state.consulta_meta = None
+            st.success("Cache limpo. Clique em Carregar dados para consultar novamente.")
 
         if not SKLEARN_OK:
             st.warning(
@@ -1972,16 +2135,21 @@ def main() -> None:
             fim_ts = pd.Timestamp(fim).normalize()
             df = filtrar_periodo(df, inicio_ts, fim_ts)
 
-            st.session_state.df = df
-            st.session_state.tipo = tipo_consulta
+            # Estrutura e enriquece os registros somente no momento da carga.
+            # Isso evita que filtros, abas e widgets disparem novas chamadas ao PNCP.
+            dados_estruturados = estruturar_dados_registros(df, tipo_consulta)
 
-            if erros_consulta:
-                st.warning("A consulta terminou com alguns avisos. Verifique os detalhes abaixo.")
-                with st.expander("⚠️ Detalhes técnicos da consulta"):
-                    for erro in erros_consulta[:30]:
-                        st.write(f"- {erro}")
-                    if len(erros_consulta) > 30:
-                        st.caption(f"{len(erros_consulta) - 30} avisos adicionais foram omitidos.")
+            st.session_state.df = df
+            st.session_state.dados_totais = dados_estruturados
+            st.session_state.tipo = tipo_consulta
+            st.session_state.consulta_meta = {
+                "inicio": inicio,
+                "fim": fim,
+                "registros": len(df),
+                "avisos": len(erros_consulta),
+                "erros": list(erros_consulta),
+                "carregado_em": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            }
 
             st.rerun()
 
@@ -2009,16 +2177,65 @@ def main() -> None:
         )
         st.stop()
 
+    meta_consulta = st.session_state.get("consulta_meta") or {}
+    erros_persistidos = meta_consulta.get("erros") or []
+
     if df_bruto.empty:
-        st.warning(f"Nenhum dado retornado para o escopo '{tipo_atual}' no período selecionado.")
+        if erros_persistidos:
+            st.error(
+                "❌ A consulta não produziu registros e apresentou falhas técnicas. "
+                "O resultado é inconclusivo: não é correto afirmar que não existem registros no PNCP."
+            )
+            with st.expander("⚠️ Diagnóstico técnico da consulta", expanded=True):
+                for erro in erros_persistidos[:30]:
+                    st.write(f"- {erro}")
+                if len(erros_persistidos) > 30:
+                    st.caption(f"{len(erros_persistidos) - 30} aviso(s) adicional(is) omitido(s).")
+        else:
+            st.info(
+                f"ℹ️ Consulta concluída sem erro, mas nenhum registro foi retornado "
+                f"para o escopo '{tipo_atual}' no período selecionado."
+            )
         st.stop()
 
-    # Conversão dos registros
-    dados_totais = [dados_registro(row, tipo_atual) for row in df_bruto.to_dict("records")]
+    # Registros já estruturados/enriquecidos na etapa de carga.
+    dados_totais = st.session_state.get("dados_totais")
+    if dados_totais is None or len(dados_totais) != len(df_bruto):
+        # Compatibilidade com sessões abertas antes de uma atualização do código.
+        with st.spinner("Estruturando os registros carregados..."):
+            dados_totais = estruturar_dados_registros(df_bruto, tipo_atual)
+        st.session_state.dados_totais = dados_totais
 
     if not dados_totais:
         st.warning("Não foi possível estruturar os registros retornados. Verifique se a base do PNCP está instável.")
         st.stop()
+
+    meta = st.session_state.get("consulta_meta") or {}
+    if meta:
+        st.caption(
+            f"Última carga: {meta.get('carregado_em', 'N/D')} • "
+            f"{meta.get('registros', len(df_bruto))} registro(s) • "
+            f"{meta.get('avisos', 0)} aviso(s) de consulta"
+        )
+
+        erros_persistidos = meta.get("erros") or []
+        if erros_persistidos:
+            st.warning(
+                "⚠️ A consulta retornou dados, mas houve falha em parte da coleta. "
+                "Analise os avisos antes de considerar o conjunto como completo."
+            )
+            with st.expander("⚠️ Diagnóstico técnico da última consulta", expanded=False):
+                for erro in erros_persistidos[:30]:
+                    st.write(f"- {erro}")
+                if len(erros_persistidos) > 30:
+                    st.caption(f"{len(erros_persistidos) - 30} aviso(s) adicional(is) omitido(s).")
+
+        # Alerta quando o usuário altera os parâmetros depois da última carga.
+        if meta.get("inicio") != inicio or meta.get("fim") != fim or tipo_atual != tipo_selecionado:
+            st.info(
+                "ℹ️ Os parâmetros da barra lateral foram alterados após a última carga. "
+                "Clique em **Carregar dados** para atualizar a análise."
+            )
 
     # Segmentação e Pesquisa
     st.markdown("---")
@@ -2196,6 +2413,7 @@ def main() -> None:
                 df_filtrado,
                 tipo_atual,
                 df_risco,
+                dados_processados,
             )
             nome_arquivo = f"Auditoria_{slug(mod_escolhida)}.xlsx"
 
