@@ -2026,8 +2026,22 @@ def main() -> None:
     aplicar_estilo()
     inicializar_estado()
 
-    # Cabeçalho
-    st.title("🏛️ Inteligência de Controle Interno PNCP")
+    # ==========================================
+    # NOVO CABEÇALHO COM O LOGOTIPO (OPÇÃO 1)
+    # ==========================================
+    col_logo, col_titulo = st.columns([1, 10], vertical_alignment="center")
+    
+    with col_logo:
+        try:
+            # Tenta carregar a imagem salva na pasta do projeto
+            st.image("logo_controle.jpg", use_container_width=True)
+        except Exception:
+            # Fallback seguro caso a imagem ainda não esteja na pasta
+            st.markdown("<h1 style='text-align: center; margin:0;'>🛡️</h1>", unsafe_allow_html=True)
+            
+    with col_titulo:
+        st.title("Inteligência de Controle Interno PNCP")
+        
     st.info(
         "ℹ️ **Aviso:** Os alertas produzidos por este sistema são indicadores automatizados "
         "para apoio ao Controle Interno. Toda conclusão deve ser validada por análise e auditoria humana."
@@ -2035,6 +2049,15 @@ def main() -> None:
 
     # Sidebar
     with st.sidebar:
+        # ==========================================
+        # LOGOTIPO NA BARRA LATERAL (Opcional, reforça a identidade visual)
+        # ==========================================
+        try:
+            st.image("logo_controle.jpg", use_container_width=True)
+            st.markdown("---")
+        except Exception:
+            pass
+
         st.header("⚙️ Parâmetros")
         
         tipo_selecionado = st.selectbox(
