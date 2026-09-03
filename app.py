@@ -28,7 +28,6 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import datetime as dt
-import time
 
 import pandas as pd
 import requests
@@ -101,30 +100,25 @@ MAX_WORKERS = max(
     1,
     min(
         16,
-        int(os.getenv("PNCP_MAX_WORKERS", "8")),
+        int(os.getenv("PNCP_MAX_WORKERS", "6")),
     ),
-)
-
-MAX_WORKERS_TERMS = max(
-    1,
-    min(10, int(os.getenv("PNCP_MAX_WORKERS_TERMS", "8"))),
 )
 
 TIMEOUT_CONNECT = max(
     3,
-    int(os.getenv("PNCP_TIMEOUT_CONNECT", "5")),
+    int(os.getenv("PNCP_TIMEOUT_CONNECT", "10")),
 )
 
 TIMEOUT_READ = max(
     10,
-    int(os.getenv("PNCP_TIMEOUT_READ", "30")),
+    int(os.getenv("PNCP_TIMEOUT_READ", "45")),
 )
 
 TIMEOUT = (TIMEOUT_CONNECT, TIMEOUT_READ)
 
 MAX_TENTATIVAS = max(
     1,
-    int(os.getenv("PNCP_MAX_RETRIES", "2")),
+    int(os.getenv("PNCP_MAX_RETRIES", "4")),
 )
 
 PAGE_CONTRATOS = 100
@@ -214,7 +208,7 @@ def sessao_http() -> requests.Session:
         connect=MAX_TENTATIVAS,
         read=MAX_TENTATIVAS,
         status=MAX_TENTATIVAS,
-        backoff_factor=0.6,
+        backoff_factor=1.5,
         status_forcelist=(408, 425, 429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
         respect_retry_after_header=True,
@@ -704,9 +698,9 @@ def buscar_termos_contrato(
 def dados_registro(
     row: Any,
     tipo: str,
-    consultar_aditivos: bool = True,
 ) -> Dict[str, Any]:
-    """Extrai e estrutura um registro. A consulta de termos pode ser desativada para cargas rápidas."""
+    """Extrai os campos com checagem do sub-recurso de termos aditivos."""
+
     if hasattr(row, "to_dict"):
         r_dict = row.to_dict()
     else:
@@ -723,20 +717,27 @@ def dados_registro(
         ],
         padrao=""
     )
-
+    
     if not controle or controle == "N/D":
         controle = fuzzy_match(r_dict, ["controlepncp", "numerocontrole"], padrao="")
 
     ano_contrato = primeiro(r_dict, ["anoContrato", "ano", "compra.anoCompra"], padrao=None)
     seq_contrato = primeiro(r_dict, ["sequencialContrato", "sequencial", "numeroSequencial"], padrao=None)
 
+    # ========================================================
+    # EXTRAÇÃO ROBUSTA DO LINK PÚBLICO DO PNCP
+    # ========================================================
     ano_url = None
     seq_url = None
     seq_ata_url = None
     controle_str = texto(controle, "").strip()
 
     if tipo == "Atas de Registro de Preços":
-        match_ata = re.search(r"^(\d{14})-1-(\d+)/(\d{4})-(\d+)$", controle_str)
+        match_ata = re.search(
+            r"^(\d{14})-1-(\d+)/(\d{4})-(\d+)$",
+            controle_str,
+        )
+
         if match_ata:
             seq_url = str(int(match_ata.group(2)))
             ano_url = str(int(match_ata.group(3)))
@@ -744,7 +745,14 @@ def dados_registro(
 
     ano_fb = primeiro(
         r_dict,
-        ["anoCompra", "anoAta", "anoContrato", "ano", "compra.anoCompra", "ata.anoCompra"],
+        [
+            "anoCompra",
+            "anoAta",
+            "anoContrato",
+            "ano",
+            "compra.anoCompra",
+            "ata.anoCompra",
+        ],
         padrao=None,
     )
 
@@ -754,19 +762,39 @@ def dados_registro(
     if tipo == "Atas de Registro de Preços":
         seq_fb = primeiro(
             r_dict,
-            ["sequencialCompra", "compra.sequencialCompra", "sequencialAtaCompra", "sequencial"],
+            [
+                "sequencialCompra",
+                "compra.sequencialCompra",
+                "sequencialAtaCompra",
+                "sequencial",
+            ],
             padrao=None,
         )
+
         seq_ata_fb = primeiro(
             r_dict,
-            ["sequencialAta", "ata.sequencialAta", "numeroSequencialAta", "sequencialAtaRegistroPreco"],
+            [
+                "sequencialAta",
+                "ata.sequencialAta",
+                "numeroSequencialAta",
+                "sequencialAtaRegistroPreco",
+            ],
             padrao=None,
         )
 
         if valor_vazio(seq_fb):
-            seq_fb = fuzzy_match(r_dict, ["sequencialcompra", "sequencial"], padrao=None)
+            seq_fb = fuzzy_match(
+                r_dict,
+                ["sequencialcompra", "sequencial"],
+                padrao=None,
+            )
+
         if valor_vazio(seq_ata_fb):
-            seq_ata_fb = fuzzy_match(r_dict, ["sequencialata", "sequencialataregistro"], padrao=None)
+            seq_ata_fb = fuzzy_match(
+                r_dict,
+                ["sequencialata", "sequencialataregistro"],
+                padrao=None,
+            )
 
         try:
             if valor_vazio(ano_url) and not valor_vazio(ano_fb):
@@ -777,6 +805,7 @@ def dados_registro(
                 seq_ata_url = str(int(float(str(seq_ata_fb).strip())))
         except (ValueError, TypeError):
             pass
+
     else:
         seq_fb = primeiro(
             r_dict,
@@ -809,22 +838,47 @@ def dados_registro(
     cnpj_url = cnpj_limpo(CNPJ)
 
     if tipo == "Contratos" and ano_url and seq_url:
-        link_pncp = f"https://pncp.gov.br/app/contratos/{cnpj_url}/{ano_url}/{seq_url}"
+        link_pncp = (
+            f"https://pncp.gov.br/app/contratos/"
+            f"{cnpj_url}/{ano_url}/{seq_url}"
+        )
     elif tipo == "Atas de Registro de Preços" and ano_url and seq_url and seq_ata_url:
-        link_pncp = f"https://pncp.gov.br/app/atas/{cnpj_url}/{ano_url}/{seq_url}/{seq_ata_url}"
+        link_pncp = (
+            f"https://pncp.gov.br/app/atas/"
+            f"{cnpj_url}/{ano_url}/{seq_url}/{seq_ata_url}"
+        )
     elif tipo == "Editais e Avisos de Contratações" and ano_url and seq_url:
-        link_pncp = f"https://pncp.gov.br/app/editais/{cnpj_url}/{ano_url}/{seq_url}"
+        link_pncp = (
+            f"https://pncp.gov.br/app/editais/"
+            f"{cnpj_url}/{ano_url}/{seq_url}"
+        )
 
     tipo_instrumento = primeiro(
         r_dict,
-        ["tipoContrato.nome", "tipoContratoNome", "tipoTermoContrato.nome", "tipoTermoContratoNome", "tipoDocumento.nome"],
+        [
+            "tipoContrato.nome",
+            "tipoContratoNome",
+            "tipoTermoContrato.nome",
+            "tipoTermoContratoNome",
+            "tipoDocumento.nome",
+        ],
         padrao="Contrato",
     )
+
     tipo_contrato_id = primeiro(
         r_dict,
-        ["tipoContrato.id", "tipoContratoId", "tipoTermoContrato.id", "tipoTermoContratoId"],
+        [
+            "tipoContrato.id",
+            "tipoContratoId",
+            "tipoTermoContrato.id",
+            "tipoTermoContratoId",
+        ],
         padrao=None,
     )
+
+    dt_fim_vig = None
+    val_inicial = None
+    val_global = None
 
     if tipo == "Contratos":
         num = primeiro(r_dict, ["numeroContratoEmpenho", "numeroContrato", "numero"])
@@ -832,30 +886,38 @@ def dados_registro(
         obj = primeiro(r_dict, ["objetoContrato", "objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
         forn = primeiro(r_dict, ["nomeRazaoSocialFornecedor", "fornecedor.nomeRazaoSocial", "razaoSocialFornecedor", "nomeFornecedor"])
         cnpj = primeiro(r_dict, ["niFornecedor", "fornecedor.niFornecedor", "cnpjFornecedor", "cnpj"])
+        
         val_global = primeiro(r_dict, ["valorGlobal", "valorTotal", "valorContrato", "compra.valorTotalHomologado"])
         val_inicial = primeiro(r_dict, ["valorInicial", "valorTotalEstimado", "valorContrato"])
+        
         dt_ = primeiro(r_dict, ["dataAssinatura", "dataCelebracao", "dataPublicacaoPncp"])
         dt_fim_vig = primeiro(r_dict, ["dataVigenciaFim", "dataFimVigencia", "dataTerminoVigencia", "dataEncerramento"])
         sit = primeiro(r_dict, ["situacao", "status"])
+
     elif tipo == "Atas de Registro de Preços":
         num = primeiro(r_dict, ["numeroAtaRegistroPreco", "numeroAta", "numero"])
         proc = primeiro(r_dict, ["processo", "numeroProcesso", "processoAdministrativo", "compra.processo"])
         obj = primeiro(r_dict, ["objetoAta", "objetoAtaRegistroPreco", "objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
         forn = primeiro(r_dict, ["nomeRazaoSocialFornecedor", "fornecedor.nomeRazaoSocial", "razaoSocialFornecedor", "nomeFornecedor"])
         cnpj = primeiro(r_dict, ["niFornecedor", "fornecedor.niFornecedor", "cnpjFornecedor", "ni"])
+        
         val_global = primeiro(r_dict, ["valorTotalAta", "valorTotal", "valorGlobal", "valorAta", "compra.valorTotalHomologado"])
         val_inicial = primeiro(r_dict, ["valorInicial", "valorTotalEstimado"])
+        
         dt_ = primeiro(r_dict, ["dataAssinatura", "dataPublicacaoPncp", "dataCelebracao"])
         dt_fim_vig = primeiro(r_dict, ["dataVigenciaFim", "dataFimVigencia", "dataValidadeFim"])
         sit = primeiro(r_dict, ["situacao", "status"])
+
     else:
         num = primeiro(r_dict, ["numeroCompra", "compra.numeroCompra", "numeroEdital", "numero"])
         proc = primeiro(r_dict, ["processo", "compra.processo", "numeroProcesso"])
         obj = primeiro(r_dict, ["objetoCompra", "compra.objetoCompra", "objeto", "descricaoObjeto"])
         forn = primeiro(r_dict, ["nomeRazaoSocialFornecedor", "fornecedor.nomeRazaoSocial", "razaoSocialFornecedor", "nomeFornecedor"])
         cnpj = primeiro(r_dict, ["niFornecedor", "fornecedor.niFornecedor", "cnpjFornecedor", "cnpjOrgao"])
+        
         val_global = primeiro(r_dict, ["valorTotalHomologado", "compra.valorTotalHomologado", "valorTotal", "valorGlobal"])
         val_inicial = primeiro(r_dict, ["valorTotalEstimado", "compra.valorTotalEstimado"])
+        
         dt_ = primeiro(r_dict, ["dataPublicacao", "dataPublicacaoPncp", "dataInclusao"])
         dt_fim_vig = primeiro(r_dict, ["dataVigenciaFim", "dataFimVigencia"])
         sit = primeiro(r_dict, ["situacaoCompra", "compra.situacaoCompraNome", "situacao", "status"])
@@ -864,26 +926,32 @@ def dados_registro(
 
     if texto(obj, "") == "":
         obj = fuzzy_match(r_dict, ["objeto", "descricao"])
+
     if texto(forn, "") == "":
         forn = fuzzy_match(r_dict, ["razaosocial", "fornec", "fornecedor.nome"])
+
     if texto(val_global, "") == "":
         val_global = fuzzy_match(r_dict, ["valortotal", "valorglobal", "valorata", "valor"])
+
     if dt_fim_vig == "N/D" or dt_fim_vig is None:
         dt_fim_vig = fuzzy_match(r_dict, ["vigenciafim", "fimvigencia", "datatermino", "datavalidadefim"])
+
     if texto(mod, "") == "":
         mod = fuzzy_match(r_dict, ["modalidade", "tipoata"])
+
     if texto(cnpj, "") == "":
         cnpj = fuzzy_match(r_dict, ["cnpj", "ni"])
 
     v_num = numero(val_global)
     v_ini_num = numero(val_inicial)
 
-    eh_termo_aditivo = (
-        str(tipo_contrato_id) == "2"
-        or "aditivo" in str(tipo_instrumento).lower()
-        or any(palavra in str(obj).lower() for palavra in ("termo aditivo", "aditamento"))
-    )
+    eh_termo_aditivo = False
+    if str(tipo_contrato_id) == "2" or "aditivo" in str(tipo_instrumento).lower():
+        eh_termo_aditivo = True
+    elif any(palavra in str(obj).lower() for palavra in ("termo aditivo", "aditamento")):
+        eh_termo_aditivo = True
 
+    termos_vinculados = []
     diagnostico_aditivo = {
         "status": "NAO_CONSULTADO",
         "termos": [],
@@ -892,12 +960,16 @@ def dados_registro(
         "url": "",
     }
 
-    if tipo == "Contratos" and consultar_aditivos:
-        diagnostico_aditivo = buscar_termos_contrato(CNPJ, ano_contrato, seq_contrato)
+    if tipo == "Contratos":
+        diagnostico_aditivo = buscar_termos_contrato(
+            CNPJ,
+            ano_contrato,
+            seq_contrato,
+        )
+        termos_vinculados = diagnostico_aditivo.get("termos", [])
 
-    termos_vinculados = diagnostico_aditivo.get("termos", [])
-    if diagnostico_aditivo.get("status") == "REGISTROS_ENCONTRADOS":
-        eh_termo_aditivo = True
+        if diagnostico_aditivo.get("status") == "REGISTROS_ENCONTRADOS":
+            eh_termo_aditivo = True
 
     perc_aditivo = None
     if v_num is not None and v_ini_num is not None and v_ini_num > 0 and v_num > v_ini_num:
@@ -939,92 +1011,40 @@ def dados_registro(
     }
 
 
-
 def estruturar_dados_registros(
     df: pd.DataFrame,
     tipo: str,
-    consultar_aditivos: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Estrutura registros com paralelismo controlado, sem chamadas de API aninhadas."""
+    """Estrutura os registros uma única vez por carga."""
     if df.empty:
         return []
 
     registros = df.to_dict("records")
-    workers = min(MAX_WORKERS, max(1, len(registros)))
 
+    if tipo != "Contratos" or len(registros) <= 1:
+        return [dados_registro(row, tipo) for row in registros]
+
+    workers = min(MAX_WORKERS, len(registros))
     resultado: List[Optional[Dict[str, Any]]] = [None] * len(registros)
 
-    def processar_base(indice: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        return indice, dados_registro(row, tipo, consultar_aditivos=False)
+    def processar(indice: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        return indice, dados_registro(row, tipo)
 
-    # Primeiro prepara todos os registros sem rede. Isso reduz contenção e torna
-    # a etapa de rede (termos) independente da normalização.
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futuros = {
-            executor.submit(processar_base, indice, row): indice
+            executor.submit(processar, indice, row): indice
             for indice, row in enumerate(registros)
         }
         for futuro in as_completed(futuros):
             indice = futuros[futuro]
             try:
-                idx, dado = futuro.result()
-                resultado[idx] = dado
-            except Exception:
-                LOGGER.exception("Falha ao estruturar registro na posição %s", indice)
-                resultado[indice] = dados_registro(registros[indice], tipo, consultar_aditivos=False)
-
-    saida = [item for item in resultado if item is not None]
-
-    if tipo != "Contratos" or not consultar_aditivos or not saida:
-        return saida
-
-    # Consulta de termos em lote e em paralelo, somente depois de a estrutura
-    # principal estar pronta. O diagnóstico original é preservado.
-    candidatos = [
-        (i, r)
-        for i, r in enumerate(saida)
-        if not valor_vazio(r.get("ano_contrato"))
-        and not valor_vazio(r.get("sequencial_contrato"))
-    ]
-
-    if not candidatos:
-        return saida
-
-    workers_termos = min(MAX_WORKERS_TERMS, max(1, len(candidatos)))
-
-    def consultar_um(item: Tuple[int, Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
-        i, registro = item
-        diagnostico = buscar_termos_contrato(
-            CNPJ,
-            registro.get("ano_contrato"),
-            registro.get("sequencial_contrato"),
-        )
-        return i, diagnostico
-
-    with ThreadPoolExecutor(max_workers=workers_termos) as executor:
-        futuros = {executor.submit(consultar_um, item): item[0] for item in candidatos}
-        for futuro in as_completed(futuros):
-            i = futuros[futuro]
-            try:
-                _, diagnostico = futuro.result()
-                saida[i]["diagnostico_aditivo"] = diagnostico
-                termos = diagnostico.get("termos", [])
-                saida[i]["termos_detalhes"] = termos
-                saida[i]["qtd_termos_aditivos"] = len(termos)
-                if diagnostico.get("status") == "REGISTROS_ENCONTRADOS":
-                    saida[i]["eh_aditivo"] = True
+                indice_resultado, dado = futuro.result()
+                resultado[indice_resultado] = dado
             except Exception as exc:
-                LOGGER.exception("Falha na consulta de termos do contrato %s", i)
-                saida[i]["diagnostico_aditivo"] = {
-                    "status": "ERRO_CONSULTA",
-                    "termos": [],
-                    "http_status": None,
-                    "mensagem": f"Falha inesperada na consulta de termos: {exc}",
-                    "url": "",
-                }
+                LOGGER.exception("Falha ao estruturar contrato na posição %s", indice)
+                resultado[indice] = dados_registro(registros[indice], tipo)
 
-    return saida
-
+    return [item for item in resultado if item is not None]
 
 
 # ============================================================
@@ -1093,23 +1113,19 @@ def consultar_cache(
     params_tuple: Tuple[Tuple[str, str], ...],
     max_paginas: int,
 ) -> Tuple[List[Dict[str, Any]], int, Optional[int], List[str]]:
-    """Consulta paginada de forma paralela, com parada antecipada quando possível."""
+    """Consulta paginada com paralelismo."""
     base = dict(params_tuple)
     base["pagina"] = 1
 
     primeira = get_json(url, base)
     registros_primeira = registros_api(primeira)
     info = paginacao(primeira)
+
     tamanho_pagina = inteiro_seguro(base.get("tamanhoPagina")) or 50
     total = calcular_total_paginas(info, tamanho_pagina)
 
     if not registros_primeira:
         return ([], 1, total, [])
-
-    # Se o servidor não informa o total e a primeira página já veio incompleta,
-    # não há motivo para disparar novas requisições.
-    if total is None and len(registros_primeira) < tamanho_pagina:
-        return (registros_primeira, 1, 1, [])
 
     limite = min(max(1, max_paginas), total if total is not None else max_paginas)
     todos = list(registros_primeira)
@@ -1128,10 +1144,8 @@ def consultar_cache(
         return pagina, registros_api(resposta)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futuros = {
-            executor.submit(buscar_pagina, p): p
-            for p in range(2, limite + 1)
-        }
+        futuros = {executor.submit(buscar_pagina, p): p for p in range(2, limite + 1)}
+
         for futuro in as_completed(futuros):
             pagina = futuros[futuro]
             try:
@@ -1143,17 +1157,9 @@ def consultar_cache(
                 erros.append(mensagem)
 
     for pagina in range(2, limite + 1):
-        registros = resultados.get(pagina, [])
-        todos.extend(registros)
-        # Se não existe total informado, uma página curta encerra a busca.
-        # As páginas posteriores já podem ter sido solicitadas em paralelo; neste
-        # caso elas são ignoradas para evitar acrescentar páginas fora do conjunto.
-        if total is None and len(registros) < tamanho_pagina:
-            break
+        todos.extend(resultados.get(pagina, []))
 
-    paginas_efetivas = max(1, min(limite, len(resultados) + 1))
-    return (todos, paginas_efetivas, total, erros)
-
+    return (todos, limite, total, erros)
 
 
 def consultar(
@@ -1432,134 +1438,6 @@ def calcular_risco(
     }
 
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def calcular_riscos_lote(
-    registros: Tuple[Dict[str, Any], ...],
-    tipo: str,
-) -> List[Dict[str, Any]]:
-    """Calcula riscos em lote e em cache, evitando recomputação a cada rerun."""
-    dados = list(registros)
-    contexto = pd.DataFrame(dados)
-    if contexto.empty:
-        return []
-
-    # O limite IQR e a concentração de fornecedor são calculados uma única vez.
-    _, limite_superior, _ = limites_iqr(
-        contexto["valor_num"] if "valor_num" in contexto.columns else pd.Series(dtype="float64")
-    )
-
-    contagem_fornecedor: Dict[str, int] = {}
-    if "cnpj_fornecedor" in contexto.columns:
-        serie = contexto["cnpj_fornecedor"].fillna("").astype(str).str.strip()
-        contagem_fornecedor = serie[serie != ""].value_counts().to_dict()
-
-    limite_concentracao = max(3, int(len(contexto) * 0.10))
-    resultados = []
-
-    for registro in dados:
-        # Mantém a mesma regra do motor original, mas evita repetir IQR e contagem.
-        pontos = 0
-        motivos: List[str] = []
-        testes: List[str] = []
-        valor = registro.get("valor_num")
-        modalidade = texto(registro.get("modalidade"), "").lower()
-        objeto = texto(registro.get("objeto"), "").lower()
-
-        faltantes = [
-            label for campo, label in (("objeto", "objeto"), ("controle", "controle PNCP"), ("data", "data"))
-            if texto(registro.get(campo), "") in {"", "N/D"}
-        ]
-        if faltantes:
-            pontos += min(12, 4 * len(faltantes))
-            motivos.append("Campos incompletos: " + ", ".join(faltantes))
-            testes.append("Atenção na completude cadastral")
-
-        if "dispensa" in modalidade or "inexig" in modalidade:
-            pontos += 20
-            motivos.append("Contratação por exceção")
-            testes.append("Revisar fundamento legal")
-        elif "emerg" in objeto or "emerg" in modalidade:
-            pontos += 25
-            motivos.append("Indício emergencial")
-            testes.append("Revisar caracterização e prazo emergencial")
-
-        if valor is not None:
-            if valor >= 5_000_000:
-                pontos += 60
-                motivos.append("Materialidade extrema (> R$ 5 milhões)")
-            elif valor >= 1_000_000:
-                pontos += 30
-                motivos.append("Valor muito elevado (> R$ 1 milhão)")
-            elif valor >= 500_000:
-                pontos += 10
-                motivos.append("Valor elevado (> R$ 500 mil)")
-            elif valor >= 150_000:
-                pontos += 5
-                motivos.append("Valor relevante (> R$ 150 mil)")
-
-        outlier = bool(valor is not None and limite_superior is not None and valor > limite_superior)
-        if outlier:
-            pontos += 25
-            motivos.append("Valor anômalo acima do limite IQR")
-            testes.append("Avaliar formação de preços e pesquisa de mercado")
-
-        dias_venc = registro.get("dias_para_vencer")
-        if dias_venc is not None:
-            if 0 <= dias_venc <= 30:
-                pontos += 15
-                motivos.append(f"⏳ Vencimento crítico ({dias_venc} dias restantes)")
-                testes.append("Verificar abertura tempestiva de nova licitação ou prorrogação")
-            elif 30 < dias_venc <= 90:
-                pontos += 5
-                motivos.append(f"⏳ Vencimento próximo ({dias_venc} dias restantes)")
-                testes.append("Acompanhar planejamento do encerramento da vigência")
-
-        if tipo == "Contratos":
-            perc_adit = registro.get("perc_aditivo")
-            eh_adit = registro.get("eh_aditivo", False)
-            qtd_termos = registro.get("qtd_termos_aditivos", 0)
-
-            if perc_adit is not None:
-                if perc_adit > 50.0:
-                    pontos += 30
-                    motivos.append(f"⚠️ Aditivo financeiro expressivo (+{perc_adit:.1f}%), acima de 50%")
-                    testes.append("Auditar termo aditivo: extrapolação do teto legal de 50% para reformas/edifícios")
-                elif perc_adit > 25.0:
-                    pontos += 15
-                    motivos.append(f"⚠️ Aditivo financeiro relevante (+{perc_adit:.1f}%), acima de 25%")
-                    testes.append("Auditar termo aditivo: verificar enquadramento legal e justificativa técnica (> 25%)")
-                elif perc_adit > 0:
-                    pontos += 5
-                    motivos.append(f"Contrato com aditamento financeiro (+{perc_adit:.1f}%)")
-
-            if eh_adit or qtd_termos > 0:
-                pontos += 5
-                motivos.append(f"Termo Aditivo formal identificado ({qtd_termos} aditivo(s) no PNCP)")
-                testes.append("Revisar motivação formal e anexos do termo aditivo")
-
-        cnpj_fornecedor = texto(registro.get("cnpj_fornecedor"), "").strip()
-        qtd = contagem_fornecedor.get(cnpj_fornecedor, 0)
-        if cnpj_fornecedor and qtd >= limite_concentracao:
-            pontos += 10
-            motivos.append(f"Fornecedor concentrado ({qtd} ocorrências)")
-            testes.append("Avaliar concentração e eventual direcionamento")
-
-        pontos = max(0, min(100, int(pontos)))
-        nivel = "🔴 ALTO" if pontos >= 60 else ("🟡 MÉDIO" if pontos >= 30 else "🟢 BAIXO")
-        if not motivos:
-            motivos = ["Sem alertas automáticos."]
-
-        resultados.append({
-            "pontos": pontos,
-            "nivel": nivel,
-            "motivos": motivos,
-            "testes": testes,
-            "outlier": outlier,
-        })
-
-    return resultados
-
-
 # ============================================================
 # NLP / SIMILARIDADE SEMÂNTICA OTIMIZADA
 # ============================================================
@@ -1607,9 +1485,8 @@ def texto_nlp(valor: Any) -> str:
 
 
 # Decorador de cache removido para evitar overhead ao instanciar strings muito grandes.
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def calcular_modelo_tfidf(textos: Tuple[str, ...]):
-    """Cria e mantém em cache a matriz TF-IDF do segmento atual."""
+    """Cria a matriz TF-IDF baseada no núcleo semântico dos objetos."""
     if not SKLEARN_OK or TfidfVectorizer is None or len(textos) < 2:
         return None
 
@@ -1630,7 +1507,6 @@ def calcular_modelo_tfidf(textos: Tuple[str, ...]):
     except ValueError as exc:
         LOGGER.warning("Não foi possível criar modelo TF-IDF: %s", exc)
         return None
-
 
 
 def similares(
@@ -2025,7 +1901,7 @@ def consultar_editais(
     fim: Any,
     progress_callback: Any = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Consulta modalidades do PNCP em paralelo para reduzir o tempo total."""
+    """Consulta editais/contratações por modalidade."""
     params_base = {
         "dataInicial": inicio.strftime("%Y%m%d"),
         "dataFinal": fim.strftime("%Y%m%d"),
@@ -2033,13 +1909,17 @@ def consultar_editais(
         "tamanhoPagina": PAGE_EDITAIS,
     }
 
-    resultados_por_modalidade: Dict[int, List[Dict[str, Any]]] = {}
+    todos_registros: List[Dict[str, Any]] = []
     erros: List[str] = []
     total_modalidades = len(MODALIDADES_PNCP)
 
-    def consultar_modalidade(modalidade: int) -> Tuple[int, List[Dict[str, Any]], List[str]]:
+    for posicao, modalidade in enumerate(MODALIDADES_PNCP, start=1):
+        if progress_callback:
+            progress_callback(posicao / total_modalidades, modalidade)
+
         params = dict(params_base)
         params["codigoModalidadeContratacao"] = modalidade
+
         try:
             registros, paginas, total, erros_pagina = consultar(
                 f"{BASE_CONSULTA}/contratacoes/publicacao",
@@ -2049,46 +1929,17 @@ def consultar_editais(
             _registrar_limite_paginacao(
                 erros_pagina, paginas, total, f"Modalidade {modalidade}"
             )
-            return modalidade, registros, erros_pagina
+            if registros:
+                todos_registros.extend(registros)
+            if erros_pagina:
+                erros.extend([f"Modalidade {modalidade}: {erro}" for erro in erros_pagina])
+
         except Exception as exc:
-            return modalidade, [], [f"Modalidade {modalidade}: {exc}"]
+            mensagem = f"Modalidade {modalidade}: {exc}"
+            LOGGER.warning(mensagem)
+            erros.append(mensagem)
 
-    workers = min(MAX_WORKERS, total_modalidades)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futuros = {
-            executor.submit(consultar_modalidade, modalidade): modalidade
-            for modalidade in MODALIDADES_PNCP
-        }
-
-        concluido = 0
-        for futuro in as_completed(futuros):
-            modalidade = futuros[futuro]
-            try:
-                modalidade_resultado, registros, erros_modalidade = futuro.result()
-                resultados_por_modalidade[modalidade_resultado] = registros
-                if registros:
-                    LOGGER.info(
-                        "Modalidade %s: %s registro(s)",
-                        modalidade_resultado,
-                        len(registros),
-                    )
-                if erros_modalidade:
-                    erros.extend(erros_modalidade)
-            except Exception as exc:
-                mensagem = f"Modalidade {modalidade}: {exc}"
-                LOGGER.warning(mensagem)
-                erros.append(mensagem)
-
-            concluido += 1
-            if progress_callback:
-                progress_callback(concluido / total_modalidades, modalidade)
-
-    todos_registros: List[Dict[str, Any]] = []
-    for modalidade in MODALIDADES_PNCP:
-        todos_registros.extend(resultados_por_modalidade.get(modalidade, []))
-
-    return todos_registros, erros
-
+    return (todos_registros, erros)
 
 
 # ============================================================
@@ -2111,7 +1962,6 @@ def inicializar_estado() -> None:
         "tipo": TIPOS[0],
         "inicio": dt_date(hoje.year, 1, 1),
         "fim": hoje,
-        "consultar_aditivos_auto": True,
     }
 
     for chave, valor in defaults.items():
@@ -2207,18 +2057,6 @@ def main() -> None:
         if erro_periodo:
             st.error(erro_periodo)
 
-        consultar_aditivos_auto = st.checkbox(
-            "⚡ Consultar termos aditivos durante a carga",
-            value=st.session_state.get("consultar_aditivos_auto", True),
-            help=(
-                "Desative para acelerar consultas amplas. Nesse modo os contratos "
-                "são carregados sem consultar individualmente o endpoint de termos; "
-                "o diagnóstico de aditivos ficará como 'Não consultado'."
-            ),
-        )
-
-        st.session_state.consultar_aditivos_auto = consultar_aditivos_auto
-
         buscar_btn = st.button(
             "🔎 Carregar dados",
             type="primary",
@@ -2231,19 +2069,6 @@ def main() -> None:
         st.caption(f"Município: {MUNICIPIO}")
         st.caption(f"CNPJ: {CNPJ}")
         st.caption(f"IBGE: {IBGE}")
-        st.caption(f"Máx. páginas por consulta: {MAX_PAGINAS}")
-        st.caption(f"Cache: {CACHE_TTL // 60} min | Termos aditivos: {CACHE_TERMOS_TTL // 60} min | Workers: {MAX_WORKERS}")
-
-        if st.button(
-            "♻️ Atualizar dados ignorando cache",
-            use_container_width=True,
-            help="Limpa o cache local do app. Use quando precisar forçar uma nova leitura do PNCP.",
-        ):
-            st.cache_data.clear()
-            st.session_state.df = None
-            st.session_state.dados_totais = None
-            st.session_state.consulta_meta = None
-            st.success("Cache limpo. Clique em Carregar dados para consultar novamente.")
 
         if not SKLEARN_OK:
             st.warning(
@@ -2254,7 +2079,6 @@ def main() -> None:
     # Consulta
     if buscar_btn:
         try:
-            inicio_consulta_perf = time.perf_counter()
             todas_regs: List[Dict[str, Any]] = []
             erros_consulta: List[str] = []
 
@@ -2297,9 +2121,7 @@ def main() -> None:
 
             # Estrutura e enriquece os registros somente no momento da carga.
             # Isso evita que filtros, abas e widgets disparem novas chamadas ao PNCP.
-            dados_estruturados = estruturar_dados_registros(
-                df, tipo_consulta, consultar_aditivos=consultar_aditivos_auto
-            )
+            dados_estruturados = estruturar_dados_registros(df, tipo_consulta)
 
             st.session_state.df = df
             st.session_state.dados_totais = dados_estruturados
@@ -2311,8 +2133,6 @@ def main() -> None:
                 "avisos": len(erros_consulta),
                 "erros": list(erros_consulta),
                 "carregado_em": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                "duracao_segundos": round(time.perf_counter() - inicio_consulta_perf, 2),
-                "consultar_aditivos": consultar_aditivos_auto,
             }
 
             st.rerun()
@@ -2367,7 +2187,7 @@ def main() -> None:
     if dados_totais is None or len(dados_totais) != len(df_bruto):
         # Compatibilidade com sessões abertas antes de uma atualização do código.
         with st.spinner("Estruturando os registros carregados..."):
-            dados_totais = estruturar_dados_registros(df_bruto, tipo_atual, consultar_aditivos=consultar_aditivos_auto)
+            dados_totais = estruturar_dados_registros(df_bruto, tipo_atual)
         st.session_state.dados_totais = dados_totais
 
     if not dados_totais:
@@ -2379,8 +2199,7 @@ def main() -> None:
         st.caption(
             f"Última carga: {meta.get('carregado_em', 'N/D')} • "
             f"{meta.get('registros', len(df_bruto))} registro(s) • "
-            f"{meta.get('avisos', 0)} aviso(s) • "
-            f"{meta.get('duracao_segundos', 'N/D')} s"
+            f"{meta.get('avisos', 0)} aviso(s) de consulta"
         )
 
         erros_persistidos = meta.get("erros") or []
@@ -2454,7 +2273,10 @@ def main() -> None:
     dados_processados = [dados_totais[i] for i in indices_ativos]
     contexto = pd.DataFrame(dados_processados)
 
-    riscos = calcular_riscos_lote(tuple(dados_processados), tipo_atual)
+    riscos = [
+        calcular_risco(registro, contexto, tipo_atual)
+        for registro in dados_processados
+    ]
 
     # Indicadores Gerais
     altos = sum(r["nivel"] == "🔴 ALTO" for r in riscos)
