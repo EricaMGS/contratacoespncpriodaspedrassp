@@ -1315,119 +1315,218 @@ def calcular_risco(
     contexto: pd.DataFrame,
     tipo: str,
 ) -> Dict[str, Any]:
-    """Calcula um score heurístico de risco enriquecido com vigência e aditivos."""
+    """Classificação de risco orientada a auditoria.
+
+    O score não trata, por si só, modalidade, valor ou aditivo como irregularidade.
+    Ele combina sinais de materialidade, anomalia, temporalidade, exceção,
+    aditamento e concentração. A classificação é uma priorização para análise
+    humana, não uma conclusão de irregularidade.
+    """
     pontos = 0
     motivos: List[str] = []
     testes: List[str] = []
+    dimensoes_ativas = 0
 
     valor = registro.get("valor_num")
     modalidade = texto(registro.get("modalidade"), "").lower()
     objeto = texto(registro.get("objeto"), "").lower()
 
-    # 1. Completude
-    campos_obrigatorios = (("objeto", "objeto"), ("controle", "controle PNCP"), ("data", "data"))
-    faltantes = [
-        label for campo, label in campos_obrigatorios
-        if texto(registro.get(campo), "") in {"", "N/D"}
-    ]
-    if faltantes:
-        pontos += min(12, 4 * len(faltantes))
-        motivos.append("Campos incompletos: " + ", ".join(faltantes))
-        testes.append("Atenção na completude cadastral")
+    # --------------------------------------------------------
+    # 1. Materialidade: preferência por posição relativa no conjunto.
+    # Evita que valores absolutos arbitrários dominem todo o score.
+    # --------------------------------------------------------
+    if valor is not None and valor > 0:
+        dimensoes_ativas += 1
+        valores = pd.to_numeric(
+            contexto.get("valor_num", pd.Series(dtype="float64")),
+            errors="coerce",
+        ).dropna()
 
-    # 2. Modalidade / Exceção
-    if "dispensa" in modalidade or "inexig" in modalidade:
-        pontos += 20
-        motivos.append("Contratação por exceção")
-        testes.append("Revisar fundamento legal")
-    elif "emerg" in objeto or "emerg" in modalidade:
-        pontos += 25
-        motivos.append("Indício emergencial")
-        testes.append("Revisar caracterização e prazo emergencial")
+        if len(valores) >= 5:
+            q50 = float(valores.median())
+            q75 = float(valores.quantile(0.75))
+            q90 = float(valores.quantile(0.90))
 
-    # 3. Valor (Materialidade Absoluta)
-    if valor is not None:
-        if valor >= 5_000_000:
-            pontos += 60
-            motivos.append("Materialidade extrema (> R$ 5 milhões)")
-        elif valor >= 1_000_000:
-            pontos += 30
-            motivos.append("Valor muito elevado (> R$ 1 milhão)")
-        elif valor >= 500_000:
-            pontos += 10
-            motivos.append("Valor elevado (> R$ 500 mil)")
-        elif valor >= 150_000:
-            pontos += 5
-            motivos.append("Valor relevante (> R$ 150 mil)")
+            if q90 > 0 and valor >= q90:
+                pontos += 15
+                motivos.append("Alta materialidade relativa no conjunto analisado")
+                testes.append("Priorizar conferência do valor, pesquisa de preços e execução")
+            elif q75 > 0 and valor >= q75:
+                pontos += 8
+                motivos.append("Materialidade acima do padrão do conjunto")
 
-    # 4. Outlier
+            # Complemento absoluto apenas para valores realmente muito altos.
+            if valor >= 5_000_000:
+                pontos += 10
+                motivos.append("Materialidade absoluta muito elevada (> R$ 5 milhões)")
+            elif valor >= 1_000_000:
+                pontos += 5
+                motivos.append("Materialidade absoluta elevada (> R$ 1 milhão)")
+        else:
+            # Amostra pequena: usa somente faixas conservadoras.
+            if valor >= 5_000_000:
+                pontos += 15
+                motivos.append("Materialidade absoluta muito elevada (> R$ 5 milhões)")
+            elif valor >= 1_000_000:
+                pontos += 8
+                motivos.append("Materialidade absoluta elevada (> R$ 1 milhão)")
+
+    # --------------------------------------------------------
+    # 2. Anomalia financeira: sinal independente de materialidade.
+    # --------------------------------------------------------
     serie_valores = contexto["valor_num"] if "valor_num" in contexto.columns else pd.Series(dtype="float64")
     _, limite_superior, _ = limites_iqr(serie_valores)
     outlier = False
     if valor is not None and limite_superior is not None and valor > limite_superior:
         outlier = True
-        pontos += 25
-        motivos.append("Valor anômalo acima do limite IQR")
-        testes.append("Avaliar formação de preços e pesquisa de mercado")
+        dimensoes_ativas += 1
+        pontos += 20
+        motivos.append("Valor anômalo acima do limite estatístico IQR")
+        testes.append("Avaliar formação de preços, pesquisa de mercado e justificativa do valor")
 
-    # 5. Monitoramento de Vigência
+    # --------------------------------------------------------
+    # 3. Modalidade / contratação direta.
+    # Contratação direta é fator de atenção, não evidência de irregularidade.
+    # --------------------------------------------------------
+    if "dispensa" in modalidade or "inexig" in modalidade:
+        dimensoes_ativas += 1
+        pontos += 12
+        motivos.append("Contratação direta — requer verificação do fundamento legal")
+        testes.append("Conferir hipótese legal, justificativa, pesquisa de preços e documentos")
+
+    # Emergência recebe peso maior por exigir análise específica de pressupostos.
+    if "emerg" in objeto or "emerg" in modalidade:
+        dimensoes_ativas += 1
+        pontos += 18
+        motivos.append("Indício de contratação emergencial")
+        testes.append("Verificar caracterização da emergência, prazo, objeto e justificativa")
+
+    # --------------------------------------------------------
+    # 4. Vigência.
+    # Contrato já vencido passa a ser sinal de prioridade, que não existia
+    # adequadamente no modelo anterior.
+    # --------------------------------------------------------
     dias_venc = registro.get("dias_para_vencer")
     if dias_venc is not None:
-        if 0 <= dias_venc <= 30:
+        dimensoes_ativas += 1
+        if dias_venc < 0:
+            pontos += 20
+            motivos.append(f"Contrato com vigência encerrada há {abs(dias_venc)} dia(s)")
+            testes.append("Verificar situação atual, eventual prorrogação e continuidade da execução")
+        elif dias_venc <= 15:
             pontos += 15
-            motivos.append(f"⏳ Vencimento crítico ({dias_venc} dias restantes)")
-            testes.append("Verificar abertura tempestiva de nova licitação ou prorrogação")
-        elif 30 < dias_venc <= 90:
-            pontos += 5
-            motivos.append(f"⏳ Vencimento próximo ({dias_venc} dias restantes)")
-            testes.append("Acompanhar planejamento do encerramento da vigência")
+            motivos.append(f"Vencimento iminente ({dias_venc} dias restantes)")
+            testes.append("Verificar providências para encerramento ou prorrogação tempestiva")
+        elif dias_venc <= 30:
+            pontos += 10
+            motivos.append(f"Vencimento próximo ({dias_venc} dias restantes)")
+            testes.append("Acompanhar planejamento do encerramento ou eventual prorrogação")
+        elif dias_venc <= 90:
+            pontos += 4
+            motivos.append(f"Vigência próxima do encerramento ({dias_venc} dias restantes)")
 
-    # 6. Monitoramento de Aditamentos (Lei 14.133/21) - Apenas Contratos
+    # --------------------------------------------------------
+    # 5. Aditamentos — somente contratos.
+    # A existência de aditivo não é irregularidade. O foco é o percentual
+    # financeiro e a necessidade de validação do enquadramento jurídico.
+    # --------------------------------------------------------
     if tipo == "Contratos":
         perc_adit = registro.get("perc_aditivo")
         eh_adit = registro.get("eh_aditivo", False)
         qtd_termos = registro.get("qtd_termos_aditivos", 0)
 
-        if perc_adit is not None:
+        if perc_adit is not None and perc_adit > 0:
+            dimensoes_ativas += 1
             if perc_adit > 50.0:
-                pontos += 30
-                motivos.append(f"⚠️ Aditivo financeiro expressivo (+{perc_adit:.1f}%), acima de 50%")
-                testes.append("Auditar termo aditivo: extrapolação do teto legal de 50% para reformas/edifícios")
+                pontos += 25
+                motivos.append(f"Variação financeira superior a 50% (+{perc_adit:.1f}%)")
+                testes.append("Verificar natureza do objeto, hipótese legal, justificativa e limite aplicável")
             elif perc_adit > 25.0:
-                pontos += 15
-                motivos.append(f"⚠️ Aditivo financeiro relevante (+{perc_adit:.1f}%), acima de 25%")
-                testes.append("Auditar termo aditivo: verificar enquadramento legal e justificativa técnica (> 25%)")
-            elif perc_adit > 0:
-                pontos += 5
-                motivos.append(f"Contrato com aditamento financeiro (+{perc_adit:.1f}%)")
+                pontos += 16
+                motivos.append(f"Variação financeira superior a 25% (+{perc_adit:.1f}%)")
+                testes.append("Verificar enquadramento jurídico, justificativa e limite aplicável")
+            elif perc_adit > 10.0:
+                pontos += 7
+                motivos.append(f"Aditamento financeiro relevante (+{perc_adit:.1f}%)")
+                testes.append("Conferir justificativa, memória de cálculo e documentação do aditivo")
+            else:
+                pontos += 3
+                motivos.append(f"Aditamento financeiro identificado (+{perc_adit:.1f}%)")
 
         if eh_adit or qtd_termos > 0:
+            dimensoes_ativas += 1
             pontos += 5
-            motivos.append(f"Termo Aditivo formal identificado ({qtd_termos} aditivo(s) no PNCP)")
-            testes.append("Revisar motivação formal e anexos do termo aditivo")
+            if qtd_termos > 0:
+                motivos.append(f"Termo(s) aditivo(s) identificado(s) no PNCP ({qtd_termos})")
+            else:
+                motivos.append("Registro identificado como possível termo aditivo")
+            testes.append("Revisar motivação, formalização, vigência e anexos do termo aditivo")
 
-    # 7. Concentração de Fornecedor (Atualizado para buscar por CNPJ)
-    cnpj_fornecedor = texto(registro.get("cnpj_fornecedor"), "").strip()
+    # --------------------------------------------------------
+    # 6. Concentração de fornecedor.
+    # A regra anterior usava 10% do conjunto, o que podia marcar quase todos
+    # os fornecedores em amostras pequenas. Agora exige presença relevante
+    # e usa uma escala gradual.
+    # --------------------------------------------------------
+    cnpj_fornecedor = cnpj_limpo(registro.get("cnpj_fornecedor"))
     if cnpj_fornecedor and not contexto.empty and "cnpj_fornecedor" in contexto.columns:
-        cnpjs = contexto["cnpj_fornecedor"].fillna("").astype(str).str.strip()
+        cnpjs = contexto["cnpj_fornecedor"].map(cnpj_limpo)
         qtd = int((cnpjs == cnpj_fornecedor).sum())
-        limite_concentracao = max(3, int(len(contexto) * 0.10))
+        total_com_cnpj = int((cnpjs != "").sum())
 
-        if qtd >= limite_concentracao:
-            pontos += 10
-            motivos.append(f"Fornecedor concentrado ({qtd} ocorrências)")
-            testes.append("Avaliar concentração e eventual direcionamento")
+        if total_com_cnpj >= 5 and qtd >= 3:
+            proporcao = qtd / total_com_cnpj
+            dimensoes_ativas += 1
+            if proporcao >= 0.50:
+                pontos += 12
+                motivos.append(f"Alta concentração de fornecedor ({qtd}/{total_com_cnpj})")
+                testes.append("Avaliar concentração, competição e justificativa da contratação")
+            elif proporcao >= 0.25:
+                pontos += 7
+                motivos.append(f"Concentração relevante de fornecedor ({qtd}/{total_com_cnpj})")
+                testes.append("Avaliar distribuição das contratações e competição")
+            elif qtd >= 5:
+                pontos += 4
+                motivos.append(f"Fornecedor recorrente no conjunto ({qtd} ocorrências)")
 
+    # --------------------------------------------------------
+    # 7. Qualidade cadastral.
+    # Retirada do score: dado faltante é problema de qualidade de dados,
+    # não deve transformar automaticamente uma contratação em risco alto.
+    # --------------------------------------------------------
+    campos_obrigatorios = ("objeto", "controle", "data")
+    faltantes = [
+        campo for campo in campos_obrigatorios
+        if texto(registro.get(campo), "") in {"", "N/D"}
+    ]
+    if faltantes:
+        motivos.append("Qualidade dos dados: campos ausentes — " + ", ".join(faltantes))
+        testes.append("Conferir o cadastro original no PNCP antes da análise")
+
+    # --------------------------------------------------------
+    # Classificação.
+    # Limites mais exigentes para que poucos sinais isolados não gerem ALTO.
+    # --------------------------------------------------------
     pontos = max(0, min(100, int(pontos)))
+
     if pontos >= 60:
         nivel = "🔴 ALTO"
-    elif pontos >= 30:
+    elif pontos >= 35:
         nivel = "🟡 MÉDIO"
     else:
         nivel = "🟢 BAIXO"
 
     if not motivos:
-        motivos = ["Sem alertas automáticos."]
+        motivos = ["Sem sinais relevantes de risco identificados automaticamente."]
+
+    # Indicador de confiabilidade da classificação.
+    # Não altera o score; informa quando a amostra tem pouca informação.
+    if len(contexto) < 5:
+        confianca = "BAIXA — amostra pequena"
+    elif dimensoes_ativas <= 1:
+        confianca = "MODERADA — poucos sinais independentes"
+    else:
+        confianca = "BOA — múltiplos sinais analisados"
 
     return {
         "pontos": pontos,
@@ -1435,6 +1534,7 @@ def calcular_risco(
         "motivos": motivos,
         "testes": testes,
         "outlier": outlier,
+        "confianca": confianca,
     }
 
 
@@ -2334,6 +2434,7 @@ def main() -> None:
             "Aditivo": adit_status,
             "Objeto": registro["objeto"],
             "Gatilhos": "; ".join(risco["motivos"]),
+            "Confiança": risco.get("confianca", "N/D"),
             "Link PNCP": registro.get("link_pncp", "https://pncp.gov.br"),
         })
 
@@ -2369,6 +2470,7 @@ def main() -> None:
             c for c in (
                 "Risco",
                 "Score",
+                "Confiança",
                 "Número",
                 "Tipo",
                 "Modalidade",
@@ -2734,9 +2836,10 @@ def main() -> None:
             "Interquartil (IQR) para identificar discrepâncias financeiras. Um alerta é gerado quando o "
             "valor foge significativamente do padrão dos demais itens do mesmo segmento (outlier). Indica a "
             "necessidade de revisar a formação de preços e pesquisa de mercado.\n\n"
-            "**• Fornecedor concentrado:** Ocorre quando uma mesma empresa acumula um volume alto de "
-            "contratações (acima de 10% do total analisado). O alerta sugere avaliar se há dependência "
-            "econômica do fornecedor, riscos à continuidade do fornecimento ou indícios de direcionamento."
+            "**• Fornecedor concentrado:** O alerta é graduado e considera somente fornecedores com CNPJ identificado "
+            "em pelo menos 5 registros do conjunto. A pontuação aumenta conforme a participação do fornecedor "
+            "atinge 25% ou 50% da amostra. O sinal não indica direcionamento por si só: requer análise de competição, "
+            "recorrência e justificativas das contratações."
         )
 
         st.markdown("### Aprofundamento por Registro")
@@ -2841,6 +2944,91 @@ def main() -> None:
                     st.info("Não foi possível identificar vizinhança semântica relevante (contratos com objetos similares) para este item.")
                 else:
                     st.dataframe(sim, use_container_width=True, hide_index=True, column_config=config_coluna_link)
+
+    # ========================================================
+    # METODOLOGIA DA CLASSIFICAÇÃO DE RISCO
+    # ========================================================
+    st.markdown("---")
+    st.subheader("📘 Metodologia da Classificação de Risco")
+    st.markdown(
+        "A classificação abaixo foi desenvolvida como **instrumento de priorização do Controle Interno**. "
+        "Ela combina sinais objetivos dos registros carregados e não representa probabilidade de fraude, "
+        "irregularidade ou culpabilidade. Um nível de risco maior significa apenas que o registro merece "
+        "maior prioridade para conferência humana."
+    )
+
+    met_col1, met_col2 = st.columns(2)
+
+    with met_col1:
+        st.markdown("**1. Materialidade — até 25 pontos**")
+        st.markdown(
+            "O valor é comparado com o conjunto analisado. Registros no quartil superior (Q75) recebem "
+            "**8 pontos** e registros no percentil 90 (Q90) recebem **15 pontos**. Há ainda um complemento "
+            "conservador para valores absolutos muito elevados: **+5 pontos acima de R$ 1 milhão** ou "
+            "**+10 pontos acima de R$ 5 milhões**. Em amostras menores que 5 registros, somente as faixas "
+            "absolutas conservadoras são utilizadas."
+        )
+
+        st.markdown("**2. Anomalia financeira — 20 pontos**")
+        st.markdown(
+            "É aplicado o **IQR (Intervalo Interquartil)**. Quando o valor supera o limite superior estatístico "
+            "do conjunto, o registro é marcado como outlier e recebe **20 pontos**. Isso indica necessidade "
+            "de conferir pesquisa de preços, formação do valor e justificativas."
+        )
+
+        st.markdown("**3. Modalidade e situação emergencial — até 30 pontos**")
+        st.markdown(
+            "Dispensa ou inexigibilidade geram **12 pontos** como fator de atenção, pois exigem conferência "
+            "do fundamento legal. Um indício de emergência acrescenta **18 pontos**. Esses sinais não significam "
+            "irregularidade e podem ocorrer simultaneamente."
+        )
+
+        st.markdown("**4. Vigência — até 20 pontos**")
+        st.markdown(
+            "Contrato vencido: **20 pontos**; vencimento em até 15 dias: **15 pontos**; até 30 dias: "
+            "**10 pontos**; entre 31 e 90 dias: **4 pontos**. O objetivo é priorizar situações que exigem "
+            "acompanhamento de encerramento, prorrogação ou continuidade da execução."
+        )
+
+    with met_col2:
+        st.markdown("**5. Aditamentos em contratos — até 30 pontos**")
+        st.markdown(
+            "A existência de aditivo não é tratada como irregularidade. A pontuação considera a variação "
+            "financeira identificada: **+3 pontos** até 10%; **+7 pontos** acima de 10%; **+16 pontos** acima "
+            "de 25%; **+25 pontos** acima de 50%. A identificação de termo aditivo acrescenta **5 pontos**. "
+            "Os percentuais são gatilhos de auditoria e devem ser confrontados com a natureza do objeto, "
+            "a hipótese jurídica, a justificativa e o limite efetivamente aplicável ao caso concreto."
+        )
+
+        st.markdown("**6. Concentração de fornecedor — até 12 pontos**")
+        st.markdown(
+            "O sistema exige pelo menos **5 registros com CNPJ identificado** e presença mínima de 3 ocorrências "
+            "do fornecedor. Participação de **25% ou mais** gera **7 pontos**; **50% ou mais**, **12 pontos**. "
+            "O indicador serve para priorizar análise de competição, recorrência e dependência, não para afirmar "
+            "direcionamento."
+        )
+
+        st.markdown("**7. Qualidade dos dados — não altera o score**")
+        st.markdown(
+            "Campos ausentes, como objeto, controle PNCP ou data, aparecem como alerta de qualidade cadastral, "
+            "mas **não aumentam a pontuação de risco**. Assim, problema de dado não é confundido com risco "
+            "substantivo da contratação."
+        )
+
+        st.markdown("**8. Faixas finais e confiança**")
+        st.markdown(
+            "**🔴 ALTO:** 60 pontos ou mais · **🟡 MÉDIO:** 35 a 59 pontos · **🟢 BAIXO:** abaixo de 35 pontos. "
+            "A confiança é informativa e não altera o score: amostras com menos de 5 registros são classificadas "
+            "como **baixa confiança**; poucos sinais independentes geram confiança moderada; múltiplos sinais "
+            "independentes geram confiança boa."
+        )
+
+    st.info(
+        "⚠️ **Como interpretar:** o score é uma regra heurística de priorização. Ele não substitui exame do "
+        "processo administrativo, documentos, pesquisa de preços, justificativas, execução contratual ou análise "
+        "jurídica. Um registro de baixo risco pode exigir auditoria e um registro de alto risco não significa, "
+        "por si só, que exista irregularidade."
+    )
 
     # Rodapé
     st.markdown("---")
